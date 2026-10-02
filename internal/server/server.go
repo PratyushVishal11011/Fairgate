@@ -7,6 +7,7 @@ import (
 	"FairGate/internal/wire"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
@@ -55,6 +56,17 @@ func Run(addr string, logger *slog.Logger) error {
 	if err != nil {
 		return err
 	}
+
+	//Restore previous events
+	for _, event := range events {
+		if !queues.Enqueue(event) {
+			return fmt.Errorf("queue enqueue failed: producer_id = %s, event_sequence = %d", event.ProducerId, event.Seq)
+		}
+	}
+
+	logger.Info("WAL events restored",
+		"restored_events", len(events),
+	)
 
 	//create a scheduler object with a quantum of 8 events
 	scheduler := sched.NewDRRScheduler(8)
