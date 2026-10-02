@@ -2,6 +2,7 @@ package server
 
 import (
 	"FairGate/internal/admit"
+	"FairGate/internal/sched"
 	"FairGate/internal/wire"
 	"errors"
 	"io"
@@ -21,6 +22,16 @@ func Run(addr string, logger *slog.Logger) error {
 
 	logger.Info("server listening on ", "address", addr)
 	admission, err := admit.NewManager(100, 200)
+	if err != nil {
+		return err
+	}
+
+	//create one shared queue manager
+	//for testing, each producer can buffer upto 256 events
+	queues, err := sched.NewQueues(256)
+	if err != nil {
+		return err
+	}
 
 	for {
 		//wait for a client to connect and return a net.Conn for that client.
@@ -31,11 +42,11 @@ func Run(addr string, logger *slog.Logger) error {
 		}
 
 		//Start a goroutine, so that one client request doesn't block the others
-		go handleConn(conn, logger, admission)
+		go handleConn(conn, logger, admission, queues)
 	}
 }
 
-func handleConn(conn net.Conn, logger *slog.Logger, admission *admit.Manager) {
+func handleConn(conn net.Conn, logger *slog.Logger, admission *admit.Manager, queues *sched.Queues) {
 	//close the connection when the client exits
 	defer conn.Close()
 
@@ -87,6 +98,19 @@ func handleConn(conn net.Conn, logger *slog.Logger, admission *admit.Manager) {
 			)
 			continue
 		}
+
+		//Try to enqueue event and log if it fails
+		if !queues.Enqueue(event) {
+			logger.Warn("Event rejected: producer queue full",
+				"producer_id", event.ProducerId,
+			)
+			continue
+		}
+
+		logger.Info("Event enqueued",
+			"producer_id", event.ProducerId,
+			"seq", event.Seq,
+		)
 
 		logger.Info("Event admitted",
 			"remote_addr", remoteAddr,
