@@ -96,12 +96,12 @@ func Run(addr string, logger *slog.Logger) error {
 		}
 
 		//Start a goroutine, so that one client request doesn't block the others
-		go handleConn(conn, logger, admission, queues)
+		go handleConn(conn, logger, admission, queues, walLog)
 
 	}
 }
 
-func handleConn(conn net.Conn, logger *slog.Logger, admission *admit.Manager, queues *sched.Queues) {
+func handleConn(conn net.Conn, logger *slog.Logger, admission *admit.Manager, queues *sched.Queues, walLog *wal.WAL) {
 	//close the connection when the client exits
 	defer conn.Close()
 
@@ -151,6 +151,11 @@ func handleConn(conn net.Conn, logger *slog.Logger, admission *admit.Manager, qu
 				"producer_id", event.ProducerId,
 				"seq", event.Seq,
 			)
+			continue
+		}
+
+		if err := walLog.Append(event); err != nil {
+			logger.Error("Failed to append to WAL", "producer_id", event.ProducerId, "sequence", event.Seq, "error", err)
 			continue
 		}
 
