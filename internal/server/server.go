@@ -4,6 +4,7 @@ import (
 	"FairGate/internal/admit"
 	"FairGate/internal/sched"
 	"FairGate/internal/wire"
+	"context"
 	"errors"
 	"io"
 	"log/slog"
@@ -33,6 +34,25 @@ func Run(addr string, logger *slog.Logger) error {
 		return err
 	}
 
+	//create a scheduler object with a quantum of 8 events
+	scheduler := sched.NewDRRScheduler(8)
+	//context.WithCancel gives us a way to stop the scheduler
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go func() {
+		err := scheduler.Run(ctx, queues, func(event wire.Event) error {
+			logger.Info("Event processed by DRR",
+				"producer_id", event.ProducerId,
+				"seq", event.Seq,
+			)
+			return nil
+		})
+		if err != nil && !errors.Is(err, context.Canceled) {
+			logger.Error("DRR scheduler stopped", "error", err)
+		}
+	}()
+
 	for {
 		//wait for a client to connect and return a net.Conn for that client.
 		conn, err := listener.Accept()
@@ -43,6 +63,7 @@ func Run(addr string, logger *slog.Logger) error {
 
 		//Start a goroutine, so that one client request doesn't block the others
 		go handleConn(conn, logger, admission, queues)
+
 	}
 }
 
