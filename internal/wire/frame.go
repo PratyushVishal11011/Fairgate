@@ -7,8 +7,9 @@ import (
 )
 
 const (
-	HeaderSize   = 6
-	MaxFrameSize = 1 << 20 //Set Max Frame Size to 1 MiB
+	HeaderSize           = 6
+	MaxFrameSize         = 1 << 20 //Set Max Frame Size to 1 MiB
+	FrameTypeEvent uint8 = 1
 )
 
 type Frame struct {
