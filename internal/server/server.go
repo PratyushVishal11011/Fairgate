@@ -3,12 +3,14 @@ package server
 import (
 	"FairGate/internal/admit"
 	"FairGate/internal/sched"
+	"FairGate/internal/wal"
 	"FairGate/internal/wire"
 	"context"
 	"errors"
 	"io"
 	"log/slog"
 	"net"
+	"os"
 )
 
 func Run(addr string, logger *slog.Logger) error {
@@ -20,6 +22,26 @@ func Run(addr string, logger *slog.Logger) error {
 	}
 
 	defer listener.Close()
+
+	if err := os.MkdirAll("data", 0700); err != nil {
+		return err
+	}
+	walPath := "data/fairgate.wal"
+
+	events, err := wal.Recover(walPath)
+	if err != nil {
+		return err
+	}
+
+	logger.Info("WAL recovery complete",
+		"recovered_events", len(events),
+	)
+
+	walLog, err := wal.Open(walPath)
+	if err != nil {
+		return err
+	}
+	defer walLog.Close()
 
 	logger.Info("server listening on ", "address", addr)
 	admission, err := admit.NewManager(100, 200)
