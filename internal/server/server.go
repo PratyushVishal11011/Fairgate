@@ -1,6 +1,7 @@
 package server
 
 import (
+	"FairGate/internal/admit"
 	"FairGate/internal/wire"
 	"errors"
 	"io"
@@ -19,6 +20,7 @@ func Run(addr string, logger *slog.Logger) error {
 	defer listener.Close()
 
 	logger.Info("server listening on ", "address", addr)
+	admission, err := admit.NewManager(100, 200)
 
 	for {
 		//wait for a client to connect and return a net.Conn for that client.
@@ -29,11 +31,11 @@ func Run(addr string, logger *slog.Logger) error {
 		}
 
 		//Start a goroutine, so that one client request doesn't block the others
-		go handleConn(conn, logger)
+		go handleConn(conn, logger, admission)
 	}
 }
 
-func handleConn(conn net.Conn, logger *slog.Logger) {
+func handleConn(conn net.Conn, logger *slog.Logger, admission *admit.Manager) {
 	//close the connection when the client exits
 	defer conn.Close()
 
@@ -73,6 +75,23 @@ func handleConn(conn net.Conn, logger *slog.Logger) {
 			"event_time", event.EventTime,
 			"seq", event.Seq,
 			"idx", event.Idx,
+			"event_type", event.EventType,
+		)
+
+		//If event is not allowed, log and continue
+		if !admission.Allow(event.ProducerId) {
+			logger.Warn("Event rejected by admission control",
+				"remote_addr", remoteAddr,
+				"producer_id", event.ProducerId,
+				"seq", event.Seq,
+			)
+			continue
+		}
+
+		logger.Info("Event admitted",
+			"remote_addr", remoteAddr,
+			"producer_id", event.ProducerId,
+			"seq", event.Seq,
 			"event_type", event.EventType,
 		)
 	}
