@@ -58,22 +58,13 @@ func Run(addr string, logger *slog.Logger) error {
 		return err
 	}
 
-	//Restore previous events
-	for _, event := range events {
-		if !queues.Enqueue(event) {
-			return fmt.Errorf("queue enqueue failed: producer_id = %s, event_sequence = %d", event.ProducerId, event.Seq)
-		}
-	}
-
-	logger.Info("WAL events restored",
-		"restored_events", len(events),
-	)
+	//context.WithCancel gives us a way to stop the scheduler
+	//helps us control the scheduler's lifecycle
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
 	//create a scheduler object with a quantum of 8 events
 	scheduler := sched.NewDRRScheduler(8)
-	//context.WithCancel gives us a way to stop the scheduler
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
 
 	go func() {
 		err := scheduler.Run(ctx, queues, func(event wire.Event) error {
@@ -87,6 +78,17 @@ func Run(addr string, logger *slog.Logger) error {
 			logger.Error("DRR scheduler stopped", "error", err)
 		}
 	}()
+
+	//Restore previous events
+	for _, event := range events {
+		if !queues.Enqueue(event) {
+			return fmt.Errorf("queue enqueue failed: producer_id = %s, event_sequence = %d", event.ProducerId, event.Seq)
+		}
+	}
+
+	logger.Info("WAL events restored",
+		"restored_events", len(events),
+	)
 
 	for {
 		//wait for a client to connect and return a net.Conn for that client.
