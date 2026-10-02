@@ -66,6 +66,9 @@ func Run(addr string, logger *slog.Logger) error {
 	//create a scheduler object with a quantum of 8 events
 	scheduler := sched.NewDRRScheduler(8)
 
+	//Create a channel that helps us report scheduler errors
+	schedulerErr := make(chan error, 1)
+
 	go func() {
 		err := scheduler.Run(ctx, queues, func(event wire.Event) error {
 			logger.Info("Event processed by DRR",
@@ -75,6 +78,10 @@ func Run(addr string, logger *slog.Logger) error {
 			return nil
 		})
 		if err != nil && !errors.Is(err, context.Canceled) {
+			schedulerErr <- err
+
+			//Stop the server from accepting new connections
+			listener.Close()
 			logger.Error("DRR scheduler stopped", "error", err)
 		}
 	}()
@@ -95,6 +102,11 @@ func Run(addr string, logger *slog.Logger) error {
 		conn, err := listener.Accept()
 
 		if err != nil {
+			//Check whether the scheduler caused the listener to close
+			select {
+			case schedulerError := <-schedulerErr:
+				return fmt.Errorf("scheduler error: %v", schedulerError)
+			}
 			return err
 		}
 
