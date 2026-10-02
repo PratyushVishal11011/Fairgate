@@ -3,6 +3,7 @@ package sched
 import (
 	"FairGate/internal/wire"
 	"errors"
+	"sort"
 	"sync"
 )
 
@@ -66,11 +67,27 @@ func (q *Queues) Enqueue(event wire.Event) bool {
 	}
 }
 
-// returns the queue (channel) belonging to a specific producer.
-// If the producer doesn't have a queue yet, it creates one.
 func (q *Queues) Queue(producerId string) <-chan wire.Event {
+	// returns the queue (channel) belonging to a specific producer.
+	// If the producer doesn't have a queue yet, it creates one.
 	if producerId == "" {
 		return nil
 	}
 	return q.getOrCreate(producerId)
+}
+
+func (q *Queues) ProducerIds() []string {
+	// returns a sorted snapshot of producer IDs.
+	// Not necessary but sorting makes the processing order deterministic
+	// This makes it easier to debug and im too lazy to break my head later
+	q.mu.Lock()
+	defer q.mu.Unlock()
+
+	ids := make([]string, 0, len(q.queues))
+
+	for id := range q.queues {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	return ids
 }
