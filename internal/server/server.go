@@ -51,5 +51,29 @@ func handleConn(conn net.Conn, logger *slog.Logger) {
 			return
 		}
 		logger.Info("Frame received", "remoteAddr", remoteAddr, "type", frame.Type, "payload_bytes", len(frame.Payload))
+
+		//Type 1 represents an event frame
+		//Only type 1 events are treated as events, the rest are logged and skip (for now - might add support for more later)
+		if frame.Type != 1 {
+			logger.Warn("Unsupported Frame Type", "Remote Address", remoteAddr, "type", frame.Type)
+			continue
+		}
+
+		//Decode the event and look for errors in payload
+		event, err := wire.DecodeEvent(frame.Payload)
+		if err != nil {
+			logger.Warn("Invalid Event Payload", "remoteAddr", remoteAddr, "error", err)
+			continue
+		}
+
+		//Log the event
+		logger.Info("Event received",
+			"remote_addr", remoteAddr,
+			"producer_id", event.ProducerId,
+			"event_time", event.EventTime,
+			"seq", event.Seq,
+			"idx", event.Idx,
+			"event_type", event.EventType,
+		)
 	}
 }
