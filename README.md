@@ -218,14 +218,39 @@ The `message` field of an acknowledgment is optional.
 
 ## Wire protocol
 
-FairGate uses a length-prefixed frame format:
+FairGate uses a length-prefixed frame format. Fields are transmitted in the order shown.
 
-```text
-+----------------------+----------------+----------------+------------------+
-| Length (4 bytes)     | Type (1 byte)  | Flags (1 byte) | Payload          |
-| Big-endian           |                |                | Variable length  |
-+----------------------+----------------+----------------+------------------+
+```mermaid
+flowchart LR
+    subgraph FRAME["Frame"]
+        direction LR
+        L["<b>Length</b><br/>4 bytes<br/>big-endian"]
+        T["<b>Type</b><br/>1 byte"]
+        F["<b>Flags</b><br/>1 byte"]
+        PL["<b>Payload</b><br/>variable length"]
+        L --> T --> F --> PL
+    end
 ```
+
+| Field | Size | Description |
+|---|---|---|
+| Length | 4 bytes, big-endian | Frame length prefix used to delimit frames on the TCP stream. |
+| Type | 1 byte | Identifies the frame kind (see below). |
+| Flags | 1 byte | Per-frame flags. |
+| Payload | Variable | Frame body, interpreted according to the type. |
+
+How frames are demultiplexed on a connection:
+
+```mermaid
+flowchart TD
+    R["Read length prefix"] --> RB["Read type, flags, and payload"]
+    RB --> TY{"Frame type"}
+    TY -->|"1"| EV["Event frame<br/>decode and validate JSON event"]
+    TY -->|"2"| AK["ACK frame<br/>producer ID, seq, idx, status, message"]
+    TY -->|"Other"| UN["Unrecognized type<br/>handled per server implementation"]
+```
+
+Event frames flow from producer to server and ACK frames flow from server to producer.
 
 The current frame types are:
 
@@ -392,34 +417,21 @@ ORDER BY (producer_id, event_time, seq, idx);
 The roadmap lists planned work in dependency order. Items are subject to change.
 
 ```mermaid
-flowchart LR
-    subgraph DONE["Implemented"]
-        direction TB
-        D1["TCP ingestion and wire protocol"]
-        D2["Admission control"]
-        D3["Per-producer queues and DRR"]
-        D4["WAL append and recovery"]
-    end
+flowchart TD
+    P1["<b>Phase 1: Core ingestion (implemented)</b><br/>TCP server, wire protocol, admission control<br/>Per-producer queues, DRR scheduling, WAL append and recovery"]
+    P2["<b>Phase 2: Storage pipeline (planned)</b><br/>Segmented WAL, store interface, WAL shipper<br/>ClickHouse adapter, checkpoints, retry and backoff"]
+    P3["<b>Phase 3: Fairness and overload control (planned)</b><br/>Producer weights, backlog-aware overload handling<br/>Load shedding"]
+    P4["<b>Phase 4: Operability and hardening (planned)</b><br/>Metrics, profiling, dashboards<br/>Load, reconcile, and chaos tools, graceful shutdown"]
 
-    subgraph NEXT["Next"]
-        direction TB
-        N1["Store interface"]
-        N2["WAL shipper and batching"]
-        N3["ClickHouse adapter"]
-        N4["Checkpoints and retry"]
-    end
+    P1 --> P2 --> P3 --> P4
 
-    subgraph LATER["Later"]
-        direction TB
-        L1["Producer weights"]
-        L2["Overload control and load shedding"]
-        L3["Metrics and profiling"]
-        L4["Load, reconcile, and chaos tools"]
-        L5["Graceful shutdown and protocol hardening"]
-    end
-
-    DONE --> NEXT --> LATER
+    classDef done stroke-width:3px;
+    classDef planned stroke-dasharray: 5 5,stroke-width:2px;
+    class P1 done;
+    class P2,P3,P4 planned;
 ```
+
+A solid border marks implemented work. Dashed borders mark planned work.
 
 | Area | Status |
 |---|---|
@@ -508,4 +520,4 @@ When contributing:
 
 ## License
 
-A license has not yet been specified. Add a `LICENSE.txt` file before publishing the repository if you intend to grant permissions for reuse, modification, and redistribution.
+FairGate is released under the [MIT License](LICENSE).
