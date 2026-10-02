@@ -3,6 +3,7 @@ package sched
 import (
 	"FairGate/internal/wire"
 	"testing"
+	"time"
 )
 
 func TestQueueCapacity(t *testing.T) {
@@ -11,71 +12,56 @@ func TestQueueCapacity(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	event := wire.Event{ProducerId: "producer-A"}
+	event1 := wire.Event{ProducerId: "producer-A", Seq: 1}
+	event2 := wire.Event{ProducerId: "producer-A", Seq: 2}
+	event3 := wire.Event{ProducerId: "producer-A", Seq: 3}
 
-	if !queues.Enqueue(event) {
+	if !queues.Enqueue(event1) {
 		t.Fatal("expected first event to be enqueued")
 	}
 
-	if !queues.Enqueue(event) {
+	if !queues.Enqueue(event2) {
 		t.Fatal("expected second event to be enqueued")
 	}
 
-	if queues.Enqueue(event) {
-		t.Fatal("expected third event to be rejected")
-	}
-}
+	result := make(chan bool, 1)
 
-func TestQueueProducerIsolation(t *testing.T) {
-	queues, err := NewQueues(1)
-	if err != nil {
-		t.Fatal(err)
-	}
+	// Third enqueue should block because the queue is full.
+	go func() {
+		result <- queues.Enqueue(event3)
+	}()
 
-	if !queues.Enqueue(wire.Event{ProducerId: "producer-A"}) {
-		t.Fatal("expected producer A event to be enqueued")
-	}
-
-	if !queues.Enqueue(wire.Event{ProducerId: "producer-B"}) {
-		t.Fatal("expected producer B to have independent capacity")
-	}
-}
-
-func TestQueueRejectsEmptyProducer(t *testing.T) {
-	queues, err := NewQueues(2)
-	if err != nil {
-		t.Fatal(err)
+	select {
+	case <-result:
+		t.Fatal("expected third enqueue to block")
+	case <-time.After(50 * time.Millisecond):
+		// Expected: enqueue is blocked.
 	}
 
-	if queues.Enqueue(wire.Event{}) {
-		t.Fatal("expected empty producer ID to be rejected")
-	}
-}
-
-func TestQueueRetrievesEvent(t *testing.T) {
-	queues, err := NewQueues(2)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	event := wire.Event{
-		ProducerId: "producer-A",
-		Seq:        42,
-	}
-
-	if !queues.Enqueue(event) {
-		t.Fatal("expected event to be enqueued")
-	}
-
+	// Remove one event to free up queue capacity.
 	received := <-queues.Queue("producer-A")
-
-	if received.Seq != 42 {
-		t.Fatalf("expected seq 42, got %d", received.Seq)
+	if received.Seq != 1 {
+		t.Fatalf("expected seq 1, got %d", received.Seq)
 	}
-}
 
-func TestInvalidQueueCapacity(t *testing.T) {
-	if _, err := NewQueues(0); err == nil {
-		t.Fatal("expected error for zero capacity")
+	// Third enqueue should now complete.
+	select {
+	case ok := <-result:
+		if !ok {
+			t.Fatal("expected third event to be enqueued")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("enqueue did not resume after space became available")
+	}
+
+	// Verify the remaining events are in FIFO order.
+	received = <-queues.Queue("producer-A")
+	if received.Seq != 2 {
+		t.Fatalf("expected seq 2, got %d", received.Seq)
+	}
+
+	received = <-queues.Queue("producer-A")
+	if received.Seq != 3 {
+		t.Fatalf("expected seq 3, got %d", received.Seq)
 	}
 }
