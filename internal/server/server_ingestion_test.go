@@ -1,7 +1,10 @@
 package server
 
 import (
-	"encoding/binary"
+	"FairGate/internal/admit"
+	"FairGate/internal/sched"
+	"FairGate/internal/wal"
+	"FairGate/internal/wire"
 	"encoding/json"
 	"io"
 	"log/slog"
@@ -9,58 +12,57 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
-
-	"FairGate/internal/admit"
-	"FairGate/internal/sched"
-	"FairGate/internal/wal"
-	"FairGate/internal/wire"
 )
 
 func TestTCPIngestionPersistsEventsToWAL(t *testing.T) {
-	walPath := filepath.Join(t.TempDir(), "fairgate.wal")
+	walPath := filepath.Join(t.TempDir(), "test.wal")
 
 	walLog, err := wal.Open(walPath)
 	if err != nil {
-		t.Fatalf("failed to open WAL: %v", err)
-	}
-
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		_ = walLog.Close()
-		t.Fatalf("failed to start TCP listener: %v", err)
-	}
-	defer listener.Close()
-
-	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-
-	admission, err := admit.NewManager(100, 200)
-	if err != nil {
-		_ = walLog.Close()
-		t.Fatalf("failed to create admission manager: %v", err)
+		t.Fatal(err)
 	}
 
 	queues, err := sched.NewQueues(256)
 	if err != nil {
-		_ = walLog.Close()
-		t.Fatalf("failed to create queues: %v", err)
+		walLog.Close()
+		t.Fatal(err)
 	}
 
-	handlerDone := make(chan struct{})
+	admission, _ := admit.NewManager(100, 200)
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		walLog.Close()
+		t.Fatal(err)
+	}
+	defer listener.Close()
+
+	serverDone := make(chan struct{})
 
 	go func() {
-		conn, acceptErr := listener.Accept()
-		if acceptErr != nil {
+		defer close(serverDone)
+
+		conn, err := listener.Accept()
+		if err != nil {
 			return
 		}
 
 		handleConn(conn, logger, admission, queues, walLog)
-		close(handlerDone)
 	}()
 
-	client, err := net.DialTimeout("tcp", listener.Addr().String(), 5*time.Second)
+	clientConn, err := net.Dial("tcp", listener.Addr().String())
 	if err != nil {
-		_ = walLog.Close()
-		t.Fatalf("failed to connect to server: %v", err)
+		walLog.Close()
+		t.Fatal(err)
+	}
+
+	// Prevent the test from hanging indefinitely if the server
+	// does not send an acknowledgment.
+	if err := clientConn.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		clientConn.Close()
+		walLog.Close()
+		t.Fatal(err)
 	}
 
 	events := []wire.Event{
@@ -69,7 +71,7 @@ func TestTCPIngestionPersistsEventsToWAL(t *testing.T) {
 			EventTime:  time.Now().UTC(),
 			Seq:        1,
 			Idx:        0,
-			EventType:  "bearing_fault",
+			EventType:  "test_event",
 			Payload:    "sample-event-1",
 		},
 		{
@@ -77,7 +79,7 @@ func TestTCPIngestionPersistsEventsToWAL(t *testing.T) {
 			EventTime:  time.Now().UTC(),
 			Seq:        2,
 			Idx:        0,
-			EventType:  "bearing_fault",
+			EventType:  "test_event",
 			Payload:    "sample-event-2",
 		},
 		{
@@ -85,51 +87,99 @@ func TestTCPIngestionPersistsEventsToWAL(t *testing.T) {
 			EventTime:  time.Now().UTC(),
 			Seq:        1,
 			Idx:        0,
-			EventType:  "bearing_fault",
+			EventType:  "test_event",
 			Payload:    "sample-event-3",
 		},
 	}
 
 	for _, event := range events {
-		payload, marshalErr := json.Marshal(event)
-		if marshalErr != nil {
-			_ = client.Close()
-			_ = walLog.Close()
-			t.Fatalf("failed to marshal event: %v", marshalErr)
+		payload, err := json.Marshal(event)
+		if err != nil {
+			clientConn.Close()
+			walLog.Close()
+			t.Fatal(err)
 		}
 
-		// Frame format: 4-byte length, 1-byte type,
-		// 1-byte flags, followed by JSON payload.
-		body := make([]byte, 2+len(payload))
-		body[0] = 1
-		body[1] = 0
-		copy(body[2:], payload)
-
-		frame := make([]byte, 4+len(body))
-		binary.BigEndian.PutUint32(frame[:4], uint32(len(body)))
-		copy(frame[4:], body)
-
-		if _, err := client.Write(frame); err != nil {
-			_ = client.Close()
-			_ = walLog.Close()
+		// Send the event frame.
+		err = wire.WriteFrame(clientConn, wire.Frame{
+			Type:    wire.FrameTypeEvent,
+			Payload: payload,
+		})
+		if err != nil {
+			clientConn.Close()
+			walLog.Close()
 			t.Fatalf("failed to send event: %v", err)
 		}
+
+		// Read the acknowledgment.
+		ackFrame, err := wire.ReadFrame(clientConn)
+		if err != nil {
+			clientConn.Close()
+			walLog.Close()
+			t.Fatalf("failed to read ACK: %v", err)
+		}
+
+		if ackFrame.Type != wire.FrameTypeAck {
+			clientConn.Close()
+			walLog.Close()
+			t.Fatalf(
+				"expected ACK frame type %d, got %d",
+				wire.FrameTypeAck,
+				ackFrame.Type,
+			)
+		}
+
+		var ack wire.Ack
+		if err := json.Unmarshal(ackFrame.Payload, &ack); err != nil {
+			clientConn.Close()
+			walLog.Close()
+			t.Fatalf("failed to decode ACK: %v", err)
+		}
+
+		if ack.Status != "accepted" {
+			clientConn.Close()
+			walLog.Close()
+			t.Fatalf("expected accepted status, got %q", ack.Status)
+		}
+
+		if ack.ProducerId != event.ProducerId {
+			clientConn.Close()
+			walLog.Close()
+			t.Fatalf(
+				"expected producer ID %q, got %q",
+				event.ProducerId,
+				ack.ProducerId,
+			)
+		}
+
+		if ack.Seq != event.Seq {
+			clientConn.Close()
+			walLog.Close()
+			t.Fatalf(
+				"expected sequence %d, got %d",
+				event.Seq,
+				ack.Seq,
+			)
+		}
+
+		if ack.Idx != event.Idx {
+			clientConn.Close()
+			walLog.Close()
+			t.Fatalf(
+				"expected index %d, got %d",
+				event.Idx,
+				ack.Idx,
+			)
+		}
 	}
 
-	if err := client.Close(); err != nil {
-		_ = walLog.Close()
-		t.Fatalf("failed to close client connection: %v", err)
-	}
+	// Closing the client allows handleConn to exit.
+	clientConn.Close()
+	<-serverDone
 
-	select {
-	case <-handlerDone:
-	case <-time.After(5 * time.Second):
-		_ = walLog.Close()
-		t.Fatal("timed out waiting for connection handler to finish")
-	}
-
+	// Close the WAL before recovering it.
 	if err := walLog.Close(); err != nil {
-		t.Fatalf("failed to close WAL: %v", err)
+		t.Fatal(err)
 	}
 
 	recovered, err := wal.Recover(walPath)
@@ -138,9 +188,14 @@ func TestTCPIngestionPersistsEventsToWAL(t *testing.T) {
 	}
 
 	if len(recovered) != len(events) {
-		t.Fatalf("expected %d recovered events, got %d", len(events), len(recovered))
+		t.Fatalf(
+			"expected %d recovered events, got %d",
+			len(events),
+			len(recovered),
+		)
 	}
 
+	// Verify that all expected events were persisted.
 	for i, expected := range events {
 		actual := recovered[i]
 
@@ -155,15 +210,38 @@ func TestTCPIngestionPersistsEventsToWAL(t *testing.T) {
 
 		if actual.Seq != expected.Seq {
 			t.Errorf(
-				"event %d: expected sequence %v, got %v",
+				"event %d: expected seq %d, got %d",
 				i,
 				expected.Seq,
 				actual.Seq,
 			)
 		}
 
-		if !actual.EventTime.Equal(expected.EventTime) {
-			t.Errorf("event %d: event time does not match", i)
+		if actual.Idx != expected.Idx {
+			t.Errorf(
+				"event %d: expected idx %d, got %d",
+				i,
+				expected.Idx,
+				actual.Idx,
+			)
+		}
+
+		if actual.EventType != expected.EventType {
+			t.Errorf(
+				"event %d: expected event type %q, got %q",
+				i,
+				expected.EventType,
+				actual.EventType,
+			)
+		}
+
+		if actual.Payload != expected.Payload {
+			t.Errorf(
+				"event %d: expected payload %q, got %q",
+				i,
+				expected.Payload,
+				actual.Payload,
+			)
 		}
 	}
 }

@@ -6,6 +6,7 @@ import (
 	"FairGate/internal/wal"
 	"FairGate/internal/wire"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -165,6 +166,36 @@ func handleConn(conn net.Conn, logger *slog.Logger, admission *admit.Manager, qu
 				"producer_id", event.ProducerId,
 			)
 			continue
+		}
+
+		//Create acknowledgement object
+		ack := wire.Ack{
+			ProducerId: event.ProducerId,
+			Seq:        event.Seq,
+			Idx:        event.Idx,
+			Status:     "accepted",
+			Message:    "Event successfully enqueued",
+		}
+
+		//convert ack into a json object
+		payload, err := json.Marshal(ack)
+		if err != nil {
+			logger.Error("Failed to encode ACK", "error", err)
+			return
+		}
+
+		//Sends the acknowledgement
+		if err := wire.WriteFrame(conn, wire.Frame{
+			Type:    wire.FrameTypeAck,
+			Flags:   0,
+			Payload: payload,
+		}); err != nil {
+			logger.Error("Failed to send ACK",
+				"producer_id", event.ProducerId,
+				"seq", event.Seq,
+				"error", err,
+			)
+			return
 		}
 
 		logger.Info("Event enqueued",
