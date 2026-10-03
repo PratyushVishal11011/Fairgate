@@ -225,7 +225,7 @@ func RunContext(ctx context.Context, addr string, logger *slog.Logger) error {
 	_ = listener.Close()
 
 	// Allow active handlers to finish while the scheduler continues
-	// draining the queues.
+	// i.e. draining the queues.
 	handlersDone := make(chan struct{})
 
 	go func() {

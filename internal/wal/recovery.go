@@ -11,20 +11,50 @@ import (
 )
 
 func Recover(path string) ([]wire.Event, error) {
-
 	//Open the wal file
-	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0600)
+	base, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0600)
 
+	if err != nil {
+		return nil, err
+	}
+	if err := base.Close(); err != nil {
+		return nil, err
+	}
+
+	segments, err := listSegments(path)
 	if err != nil {
 		return nil, err
 	}
 
 	//close the file on return
-	defer file.Close()
+	//defer file.Close()
 
 	var events []wire.Event
-	var offset int64
+	for i, seg := range segments {
+		isLast := i == len(segments)-1
+		file, err := os.OpenFile(seg.path, os.O_RDWR, 0600)
+		if err != nil {
+			return nil, err
+		}
+		recovered, err := recoverSegment(file, isLast)
+		closeErr := file.Close()
 
+		if err != nil {
+			return nil, err
+		}
+
+		if closeErr != nil {
+			return nil, closeErr
+		}
+		events = append(events, recovered...)
+	}
+
+	return events, nil
+}
+
+func recoverSegment(file *os.File, isLast bool) ([]wire.Event, error) {
+	var offset int64
+	var events []wire.Event
 	//continues reading records until it reaches the end of the file, encounters an incomplete record, or encounters an error.
 	for {
 		//every record begins with an 8 bit header
@@ -101,4 +131,12 @@ func Recover(path string) ([]wire.Event, error) {
 		offset += int64(len(header)) + int64(length)
 	}
 	return events, nil
+
+}
+
+func truncateTail(file *os.File, offset int64) error {
+	if err := file.Truncate(offset); err != nil {
+		return err
+	}
+	return file.Sync()
 }
