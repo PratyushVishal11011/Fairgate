@@ -7,18 +7,20 @@ FairGate is a modular event-ingestion gateway. It accepts framed event streams o
 The project explores fair resource sharing in event-ingestion systems: keeping producers isolated from one another through bounded buffering, admission limits, and fair scheduling. FairGate is being developed as an open-source foundation that can be extended with different storage backends and downstream processing components.
 
 > [!IMPORTANT]
-> **Beta status.** FairGate is under active development. The current implementation provides TCP ingestion, event decoding and validation, admission control, per-producer bounded queues, DRR scheduling, WAL append and recovery, and acknowledgments. The ClickHouse shipper, checkpointing, advanced overload control, and production observability described in the roadmap are not yet integrated into the current ingestion path.
+> **Beta status.** FairGate is under active development. The current implementation provides TCP ingestion, event decoding and validation, admission control, per-producer bounded queues, DRR scheduling, WAL append and recovery, acknowledgments, and context-aware graceful shutdown. The ClickHouse shipper, checkpointing, advanced overload control, and production observability described in the roadmap are not yet integrated into the current ingestion path.
 
 ## Table of Contents
 
 - [Design goals](#design-goals)
 - [Features](#features)
+- [Recent updates](#recent-updates)
 - [Architecture](#architecture)
 - [Event lifecycle](#event-lifecycle)
 - [Event model](#event-model)
 - [Wire protocol](#wire-protocol)
 - [Write-Ahead Log](#write-ahead-log)
 - [Backpressure and scheduling](#backpressure-and-scheduling)
+- [Server lifecycle and graceful shutdown](#server-lifecycle-and-graceful-shutdown)
 - [Delivery semantics](#delivery-semantics)
 - [Configuration](#configuration)
 - [Planned storage integration](#planned-storage-integration)
@@ -50,9 +52,13 @@ The project explores fair resource sharing in event-ingestion systems: keeping p
 - **Per-producer queues.** Keeps producer events in separate bounded channels.
 - **DRR scheduling.** Selects queued events in producer rounds using a configurable quantum.
 - **Write-Ahead Log.** Appends events with length and CRC metadata and synchronizes records to disk.
-- **WAL recovery.** Scans persisted records on startup and handles incomplete trailing records.
+- **WAL recovery.** Scans persisted records on startup, handles incomplete trailing records, and replays recovered events into the producer queues.
 - **Acknowledgments.** Sends an accepted acknowledgment after the event has been appended to the WAL and enqueued.
-- **Concurrent connections.** Handles client connections in separate goroutines.
+- **Concurrent connections.** Handles client connections in separate goroutines and tracks them for coordinated shutdown.
+- **Context-aware lifecycle.** `RunContext` lets the caller control server lifetime through a `context.Context`.
+- **Graceful shutdown.** Stops accepting clients, waits for active handlers within a grace period, forces closure of blocked connections afterward, and stops the scheduler before cleanup.
+- **Cancelable enqueueing.** A handler blocked on a full producer queue can be interrupted during shutdown.
+- **Scheduler error propagation.** An unexpected scheduler failure is reported to the caller instead of being silently lost.
 - **Tests.** Includes unit and integration tests for core behavior.
 
 ### Planned
@@ -64,9 +70,27 @@ The project explores fair resource sharing in event-ingestion systems: keeping p
 - Backlog-aware overload handling and load shedding
 - Prometheus metrics, profiling endpoints, and dashboards
 - Load-generation, reconciliation, and chaos-testing tools
-- Graceful coordinated shutdown and additional protocol hardening
+- Additional protocol hardening
+- Explicit queue-drain confirmation during shutdown
 
 Planned capabilities are not implied to be available in this beta.
+
+## Recent updates
+
+### 03rd October, 2026: Graceful shutdown and context-aware event handling
+
+Earlier versions accepted connections and processed events concurrently, but had no coordinated way to stop accepting clients, let in-flight handlers finish, and release resources safely. The latest changes add a controlled shutdown sequence built on `context`, `sync.WaitGroup`, `sync.Mutex`, and channels.
+
+- **`RunContext`.** A new context-aware entry point gives the caller control over server lifetime. `Run` remains as a thin wrapper that uses a background context, so existing callers are unaffected.
+- **Connection tracking.** Active connections are registered in a mutex-protected map and counted with a `WaitGroup`, so the server knows which handlers are running and can wait for them.
+- **Listener watcher.** A watcher goroutine closes the TCP listener when the context is canceled, which unblocks `Accept` and begins shutdown. It exits cleanly if the accept loop ends first.
+- **Cancelable enqueueing.** `EnqueueContext` replaces the blocking enqueue in the connection handler, so a handler stuck on a full queue can stop waiting when shutdown is forced.
+- **Separate handler and scheduler contexts.** Handlers can be canceled independently, which lets the scheduler keep processing queued events while handlers drain.
+- **Scheduler lifecycle.** The server waits for the scheduler goroutine to exit before returning, and an unexpected scheduler failure closes the listener and is returned to the caller.
+- **Five-second grace period.** After the accept loop stops, handlers get a fixed grace period. If it expires, active connections are closed and the handler context is canceled to interrupt blocked reads and enqueues.
+- **WAL safety.** The WAL is not closed until every tracked handler has exited, so a handler cannot append to a closed log.
+
+See [Server lifecycle and graceful shutdown](#server-lifecycle-and-graceful-shutdown) for diagrams, behavior details, and limitations.
 
 ## Architecture
 
@@ -92,12 +116,15 @@ flowchart TD
         W --> Q
         Q --> D
         D --> C
+        W -.->|"recovered events at startup"| Q
     end
 
     Q -.->|"accepted ACK"| P
 ```
 
 Accepted events are appended to the WAL before they are enqueued and acknowledged to the client. The current scheduler callback logs the selected event's producer ID and sequence number. A pluggable event-processing interface and storage adapters are part of the planned modular architecture.
+
+The server's goroutine and context structure, including the shutdown path, is described in [Server lifecycle and graceful shutdown](#server-lifecycle-and-graceful-shutdown).
 
 ### Planned extension
 
@@ -126,10 +153,10 @@ flowchart LR
 
 | Package | Responsibility |
 |---|---|
-| `internal/server` | TCP listener, per-connection goroutines, frame handling, acknowledgment delivery. |
+| `internal/server` | TCP listener, per-connection goroutines, connection tracking, frame handling, acknowledgment delivery, server lifecycle (`RunContext`), and graceful shutdown. |
 | `internal/wire` | Frame codec, event and acknowledgment types, validation. |
 | `internal/admit` | Token-bucket admission control. |
-| `internal/sched` | Per-producer bounded queues and the DRR scheduler. |
+| `internal/sched` | Per-producer bounded queues (including context-aware `EnqueueContext`) and the DRR scheduler. |
 | `internal/wal` | WAL append, synchronization, and recovery. |
 
 ## Event lifecycle
@@ -154,7 +181,7 @@ sequenceDiagram
         A-->>S: Allow
         S->>W: Append record and synchronize
         W-->>S: Durable
-        S->>Q: Enqueue (blocks if queue is full)
+        S->>Q: EnqueueContext (waits for space or cancellation)
         Q-->>S: Enqueued
         S-->>P: ACK with status accepted
         D->>Q: Dequeue within quantum
@@ -167,6 +194,8 @@ sequenceDiagram
 ```
 
 An `accepted` ACK reflects WAL durability and queue admission. It does not reflect downstream storage. See [Delivery semantics](#delivery-semantics).
+
+If shutdown cancels the handler while it is waiting for queue space, the event has already been appended to the WAL but is not acknowledged. It remains available for recovery on the next startup.
 
 ## Event model
 
@@ -224,10 +253,10 @@ FairGate uses a length-prefixed frame format. Fields are transmitted in the orde
 flowchart LR
     subgraph FRAME["Frame"]
         direction LR
-        L["<b>Length</b><br/>4 bytes<br/>big-endian"]
-        T["<b>Type</b><br/>1 byte"]
-        F["<b>Flags</b><br/>1 byte"]
-        PL["<b>Payload</b><br/>variable length"]
+        L["Length<br/>4 bytes<br/>big-endian"]
+        T["Type<br/>1 byte"]
+        F["Flags<br/>1 byte"]
+        PL["Payload<br/>variable length"]
         L --> T --> F --> PL
     end
 ```
@@ -291,11 +320,11 @@ flowchart TD
     I --> C
 ```
 
-The current implementation uses a single WAL file and recovers its events during startup. Segmented WAL files, group commit, shipper checkpoints, and automated segment reclamation are planned extensions.
+The current implementation uses a single WAL file and recovers its events during startup. Recovered events are replayed into the producer queues. The scheduler is started before replay so that it consumes events while the queues fill, which avoids a startup deadlock when a producer has more recovered events than its queue capacity. Segmented WAL files, group commit, shipper checkpoints, and automated segment reclamation are planned extensions.
 
 ## Backpressure and scheduling
 
-Each producer has its own bounded queue. The queue capacity is configured when the queue manager is created, and the server currently uses 256 events per producer. Enqueueing blocks when a producer's queue is full, applying backpressure to the caller instead of allowing the queue to grow without bound.
+Each producer has its own bounded queue. The queue capacity is configured when the queue manager is created, and the server currently uses 256 events per producer. Enqueueing blocks when a producer's queue is full, applying backpressure to the caller instead of allowing the queue to grow without bound. In the connection handler the wait is context-aware (`EnqueueContext`), so a blocked handler can stop waiting if shutdown is forced.
 
 The DRR scheduler visits producer queues and processes available events up to its configured quantum (currently 8 in the server). The scheduler is independent of event meaning, and its callback is responsible for downstream handling. At this beta stage, the callback only logs events.
 
@@ -329,6 +358,80 @@ flowchart LR
 
 Because each queue is separate and bounded, a high-rate producer fills only its own queue. Other producers continue to be served in each scheduling round.
 
+## Server lifecycle and graceful shutdown
+
+`RunContext(ctx, addr, logger)` owns the server's lifetime. Cancelling `ctx` starts an orderly shutdown. `Run(addr, logger)` is retained as a wrapper that calls `RunContext` with `context.Background()`.
+
+### Goroutines and contexts
+
+```mermaid
+flowchart TD
+    CALLER["Caller<br/>RunContext(ctx, addr, logger)"]
+    WATCH["Watcher goroutine<br/>closes listener on ctx.Done()"]
+    ACC["Accept loop"]
+    H["Handler goroutines<br/>one per connection<br/>controlled by handlerCtx"]
+    SCH["Scheduler goroutine<br/>controlled by schedulerCtx"]
+    TRK["Tracking state<br/>handlerWG and activeConns<br/>guarded by connMu"]
+
+    CALLER --> WATCH
+    CALLER --> ACC
+    CALLER --> SCH
+    ACC -->|"registers and spawns"| H
+    ACC --> TRK
+    H -->|"deregisters on exit"| TRK
+    SCH -.->|"unexpected error:<br/>closes listener"| ACC
+```
+
+| Mechanism | Purpose |
+|---|---|
+| `handlerWG` | Counts active handler goroutines so the server can wait for them. |
+| `activeConns` and `connMu` | Track live connections so they can be closed if handlers do not finish in time. |
+| `handlerCtx` | Cancelled only when the grace period expires, to interrupt blocked enqueues. |
+| `schedulerCtx` | Cancelled after handlers exit, so queued events keep being processed while handlers drain. |
+| `schedulerDone` and `schedulerErr` | Signal scheduler exit and report unexpected scheduler failures without blocking. |
+| Watcher and `watchStop` | Close the listener on cancellation, and let the watcher exit if the accept loop ends first. |
+
+### Shutdown sequence
+
+```mermaid
+flowchart TD
+    A["1. Context canceled"] --> B["2. Watcher closes the listener"]
+    B --> C["3. Accept loop exits<br/>no new connections"]
+    C --> D{"4. Handlers finish within<br/>the 5-second grace period?"}
+    D -->|"Yes"| F["5. All handlers have exited"]
+    D -->|"No"| E["Close active connections<br/>and cancel handler context"]
+    E --> F
+    F --> G["6. Cancel scheduler<br/>and wait for it to exit"]
+    G --> H["7. Return from RunContext<br/>deferred cleanup closes the WAL and listener"]
+```
+
+The ordering is deliberate. The WAL is closed only after every tracked handler has exited, so no handler can append to a closed log. The scheduler keeps running during the grace period so queued events continue to be processed while handlers drain.
+
+### Behavior details
+
+- **Closing a connection interrupts a blocked read.** Handlers waiting in `wire.ReadFrame()` exit once their connection is closed, instead of waiting indefinitely for the client.
+- **Accept-loop errors are classified.** A closed listener or a canceled context is treated as normal shutdown. Any other listener error, or a scheduler failure, is returned to the caller.
+- **Scheduler failure is fatal.** If the scheduler stops unexpectedly, the listener is closed and the error is returned from `RunContext`.
+- **Select ordering.** If a queue send and context cancellation are ready at the same moment, Go's `select` may pick either. A handler may therefore enqueue one more event after cancellation.
+
+### Embedding the server
+
+From within the module, for example in a `cmd/` entry point:
+
+```go
+ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+defer stop()
+
+if err := server.RunContext(ctx, ":9000", logger); err != nil {
+    logger.Error("server stopped", "error", err)
+}
+```
+
+### Limitations
+
+- The five-second grace period bounds the wait before forced connection closure. It does not guarantee that shutdown completes within five seconds, because a handler blocked in an operation that responds to neither connection closure nor context cancellation could still delay it.
+- There is no explicit queue-drain confirmation. The scheduler callback only logs events, so shutdown does not prove that every queued event was delivered downstream. Events appended to the WAL remain recoverable on the next startup.
+
 ## Delivery semantics
 
 | Property | Current beta |
@@ -337,6 +440,9 @@ Because each queue is separate and bounded, a high-rate producer fills only its 
 | Acknowledgment sent after enqueue | Yes |
 | Per-producer memory bounded | Yes, by queue capacity |
 | Persisted records scanned on restart | Yes |
+| Recovered events replayed into queues on restart | Yes |
+| WAL kept open until all handlers exit during shutdown | Yes |
+| Explicit queue-drain confirmation on shutdown | No |
 | Events shipped to a database | No (planned) |
 | Acknowledgment implies database storage | No |
 | End-to-end exactly-once delivery | No |
@@ -351,6 +457,7 @@ The following values are currently fixed in the server and are expected to becom
 |---|---|---|
 | Queue capacity | 256 events per producer | Bound on each producer's queue. |
 | DRR quantum | 8 | Maximum events served from a producer queue per visit. |
+| Shutdown grace period | 5 seconds | Time active handlers have to finish before connections are forcibly closed. |
 
 ## Planned storage integration
 
@@ -418,10 +525,10 @@ The roadmap lists planned work in dependency order. Items are subject to change.
 
 ```mermaid
 flowchart TD
-    P1["<b>Phase 1: Core ingestion (implemented)</b><br/>TCP server, wire protocol, admission control<br/>Per-producer queues, DRR scheduling, WAL append and recovery"]
-    P2["<b>Phase 2: Storage pipeline (planned)</b><br/>Segmented WAL, store interface, WAL shipper<br/>ClickHouse adapter, checkpoints, retry and backoff"]
-    P3["<b>Phase 3: Fairness and overload control (planned)</b><br/>Producer weights, backlog-aware overload handling<br/>Load shedding"]
-    P4["<b>Phase 4: Operability and hardening (planned)</b><br/>Metrics, profiling, dashboards<br/>Load, reconcile, and chaos tools, graceful shutdown"]
+    P1["Phase 1: Core ingestion (implemented)<br/>TCP server, wire protocol, admission control<br/>Per-producer queues, DRR scheduling, WAL append and recovery<br/>Context-aware lifecycle and graceful shutdown"]
+    P2["Phase 2: Storage pipeline (planned)<br/>Segmented WAL, store interface, WAL shipper<br/>ClickHouse adapter, checkpoints, retry and backoff"]
+    P3["Phase 3: Fairness and overload control (planned)<br/>Producer weights, backlog-aware overload handling<br/>Load shedding"]
+    P4["Phase 4: Operability and hardening (planned)<br/>Metrics, profiling, dashboards<br/>Load, reconcile, and chaos tools, protocol hardening"]
 
     P1 --> P2 --> P3 --> P4
 
@@ -438,6 +545,8 @@ A solid border marks implemented work. Dashed borders mark planned work.
 | Ingestion, validation, admission control | Implemented |
 | Per-producer queues, DRR scheduling | Implemented |
 | WAL append and recovery | Implemented |
+| Context-aware lifecycle, connection tracking, graceful shutdown | Implemented |
+| Cancelable enqueueing and scheduler error propagation | Implemented |
 | WAL segmentation and group commit | Planned |
 | Shipper, store abstraction, ClickHouse adapter | Planned |
 | Checkpoints, retry, backoff | Planned |
@@ -445,7 +554,8 @@ A solid border marks implemented work. Dashed borders mark planned work.
 | Backlog-aware overload handling | Planned |
 | Metrics, profiling, dashboards | Planned |
 | Load generator, reconciliation, chaos tooling | Planned |
-| Graceful shutdown, protocol hardening | Planned |
+| Explicit queue-drain confirmation on shutdown | Planned |
+| Protocol hardening | Planned |
 
 ## Project structure
 
@@ -502,9 +612,10 @@ Known limitations of the current beta:
 
 - Events are not delivered to any database. The scheduler callback only logs events.
 - The WAL is a single file with no segmentation, group commit, or automated reclamation.
-- Queue capacity and DRR quantum are fixed in the server and not yet configurable.
+- Queue capacity, DRR quantum, and the shutdown grace period are fixed in the server and not yet configurable.
 - All producers receive equal scheduling treatment. Weights are not yet supported.
-- Enqueueing blocks on a full queue, and no load-shedding policy exists yet.
+- Enqueueing blocks on a full queue (cancelable during shutdown), and no load-shedding policy exists yet.
+- Shutdown has no explicit queue-drain confirmation, and a handler stuck in an operation that ignores connection closure and context cancellation can delay it beyond the grace period.
 - No metrics, profiling endpoints, or dashboards are provided.
 
 ## Contributing

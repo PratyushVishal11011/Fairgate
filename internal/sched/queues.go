@@ -2,6 +2,7 @@ package sched
 
 import (
 	"FairGate/internal/wire"
+	"context"
 	"errors"
 	"sort"
 	"sync"
@@ -53,7 +54,7 @@ func (q *Queues) getOrCreate(producerId string) chan wire.Event {
 	return queue
 }
 
-func (q *Queues) Enqueue(event wire.Event) bool {
+func (q *Queues) EnqueueContext(ctx context.Context, event wire.Event) bool {
 	if event.ProducerId == "" {
 		return false
 	}
@@ -65,8 +66,21 @@ func (q *Queues) Enqueue(event wire.Event) bool {
 	//Ensures no processes are rejected due to a full queue
 	//TODO: Implement Idempotency + Overflow Buffer + Non blocking queue to mitigate this issue to some extent
 	//Might come up with a better solution later so haven't implemented for now
-	queue <- event
-	return true
+
+	//Implemented a non-blocking procedure to ensure graceful shutdowns
+	select {
+	case queue <- event:
+		return true
+	//channel that gets closed when the context is canceled or its deadline expires.
+	//context is canceled while the function is waiting to enqueue an event, this case becomes ready and the function can return false without waiting for queue space.
+	//If a handler is blocked trying to enqueue an event and the server cancels its handler context, the handler can stop waiting and exit.
+	case <-ctx.Done():
+		return false
+	}
+}
+
+func (q *Queues) Enqueue(event wire.Event) bool {
+	return q.EnqueueContext(context.Background(), event)
 }
 
 func (q *Queues) Queue(producerId string) <-chan wire.Event {
