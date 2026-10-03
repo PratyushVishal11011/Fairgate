@@ -2,12 +2,12 @@
 
 **A fair-share event ingestion gateway written in Go.**
 
-FairGate is a modular event-ingestion gateway. It accepts framed event streams over TCP, applies admission control, persists accepted events in a Write-Ahead Log (WAL), and schedules events from per-producer queues using Deficit Round Robin (DRR).
+FairGate is a modular event-ingestion gateway. It accepts framed event streams over TCP, applies admission control, persists accepted events in a segmented Write-Ahead Log (WAL) with group commit, and schedules events from per-producer queues using Deficit Round Robin (DRR).
 
 The project explores fair resource sharing in event-ingestion systems: keeping producers isolated from one another through bounded buffering, admission limits, and fair scheduling. FairGate is being developed as an open-source foundation that can be extended with different storage backends and downstream processing components.
 
 > [!IMPORTANT]
-> **Beta status.** FairGate is under active development. The current implementation provides TCP ingestion, event decoding and validation, admission control, per-producer bounded queues, DRR scheduling, WAL append and recovery, acknowledgments, and context-aware graceful shutdown. The ClickHouse shipper, checkpointing, advanced overload control, and production observability described in the roadmap are not yet integrated into the current ingestion path.
+> **Beta status.** FairGate is under active development. The current implementation provides TCP ingestion, event decoding and validation, admission control, per-producer bounded queues, DRR scheduling, a segmented WAL with group commit and ordered recovery, acknowledgments, and context-aware graceful shutdown. The ClickHouse shipper, checkpointing, advanced overload control, and production observability described in the roadmap are not yet integrated into the current ingestion path.
 
 ## Table of Contents
 
@@ -38,7 +38,7 @@ The project explores fair resource sharing in event-ingestion systems: keeping p
 | Producer isolation | Each producer has its own bounded queue, so one producer cannot consume another producer's buffer space. |
 | Fair service | DRR scheduling visits producer queues in rounds and serves a bounded amount from each. |
 | Bounded resource usage | Every queue has an explicit capacity, and a full queue applies backpressure instead of growing. |
-| Durability before acknowledgment | Events are appended to the WAL and synchronized to disk before an acknowledgment is sent. |
+| Durability before acknowledgment | Events are appended to the WAL and synchronized to disk (via group commit) before an acknowledgment is sent. |
 | Extensibility | Core ingestion and scheduling are independent of event meaning. Storage and processing attach through well-defined seams. |
 
 ## Features
@@ -51,8 +51,10 @@ The project explores fair resource sharing in event-ingestion systems: keeping p
 - **Admission control.** Applies token-bucket-based limits to incoming events.
 - **Per-producer queues.** Keeps producer events in separate bounded channels.
 - **DRR scheduling.** Selects queued events in producer rounds using a configurable quantum.
-- **Write-Ahead Log.** Appends events with length and CRC metadata and synchronizes records to disk.
-- **WAL recovery.** Scans persisted records on startup, handles incomplete trailing records, and replays recovered events into the producer queues.
+- **Segmented Write-Ahead Log.** Appends events with length and CRC metadata across multiple segment files, rotating to a new segment when the configured segment size would be exceeded.
+- **Group commit.** A dedicated writer goroutine batches concurrent append requests and issues a single `Sync()` per batch, bounded by a maximum request count and a short collection delay.
+- **WAL recovery.** Discovers segments, scans them in order on startup, handles an incomplete trailing record in the final segment, and replays recovered events into the producer queues.
+- **WAL fatal error handling.** Write, rotation, and synchronization failures are recorded as fatal; affected requests receive an error and later batches are rejected.
 - **Acknowledgments.** Sends an accepted acknowledgment after the event has been appended to the WAL and enqueued.
 - **Concurrent connections.** Handles client connections in separate goroutines and tracks them for coordinated shutdown.
 - **Context-aware lifecycle.** `RunContext` lets the caller control server lifetime through a `context.Context`.
@@ -65,7 +67,7 @@ The project explores fair resource sharing in event-ingestion systems: keeping p
 
 - Asynchronous WAL shipper and batch delivery
 - Pluggable storage interface and ClickHouse adapter
-- Durable shipper checkpoints, retry and backoff, and WAL segment lifecycle
+- Durable shipper checkpoints, retry and backoff, and WAL segment reclamation
 - Configurable producer weights and richer fairness controls
 - Backlog-aware overload handling and load shedding
 - Prometheus metrics, profiling endpoints, and dashboards
@@ -76,6 +78,25 @@ The project explores fair resource sharing in event-ingestion systems: keeping p
 Planned capabilities are not implied to be available in this beta.
 
 ## Recent updates
+
+### 03rd October, 2026: Segmented WAL and group commit
+
+Earlier versions of the WAL stored all events in a single file and performed a disk synchronization (`Sync()`) for every appended event. The latest changes introduce WAL segmentation and group commit to manage log growth and reduce the overhead of frequent disk synchronization.
+
+- **Segmented WAL.** The WAL is now split into multiple files, with a configurable segment size. When the active segment reaches its size limit, the writer rotates to a new segment instead of continuing to grow a single file.
+- **Ordered recovery.** Recovery discovers WAL segments and processes them in order, reconstructing events across multiple files while preserving the existing record format.
+- **Incomplete record handling.** Recovery can truncate an incomplete trailing record in the final segment to the last valid record boundary, while treating corruption in completed records as an error.
+- **Dedicated writer goroutine.** A separate `writerLoop` now owns WAL file operations. Instead of each `Append()` call writing directly to disk, requests are submitted to a shared channel and processed by the writer.
+- **Group commit.** Multiple append requests are collected into batches, allowing the WAL to perform a single `Sync()` for the batch rather than synchronizing after every event.
+- **Bounded batching.** Batches are limited by a maximum request count and a short collection delay, allowing the writer to balance synchronization overhead with append latency.
+- **Asynchronous request submission.** Concurrent handlers can submit append requests to the writer goroutine, while each caller waits for confirmation that its batch has been written and synchronized.
+- **Segment rotation during batching.** The writer checks each record's size before writing and rotates the active segment when the next record would exceed the configured segment limit.
+- **Fatal error handling.** Write, rotation, and synchronization failures are recorded as fatal WAL errors. Affected requests receive an error, and subsequent batches are rejected rather than being reported as successfully persisted.
+- **Graceful WAL closure.** Closing the WAL stops new submissions, allows queued requests to be processed, and then synchronizes and closes the active segment before the writer exits.
+
+These changes establish a WAL that supports multiple segments and batched disk synchronization while retaining the existing record framing and recovery format. Queue-drain confirmation during server shutdown and ClickHouse persistence are still separate upcoming steps.
+
+See [Write-Ahead Log](#write-ahead-log) for the writer flow and recovery behavior.
 
 ### 03rd October, 2026: Graceful shutdown and context-aware event handling
 
@@ -106,7 +127,7 @@ flowchart TD
         direction TB
         S["TCP server<br/>frame decoding and event validation"]
         A["Admission control<br/>token-bucket limits"]
-        W[("Write-Ahead Log<br/>length + CRC32, synchronized to disk")]
+        W[("Segmented Write-Ahead Log<br/>length + CRC32, group commit")]
         Q["Per-producer bounded queues"]
         D["DRR scheduler<br/>configurable quantum"]
         C["Event callback<br/>currently logs producer ID and sequence"]
@@ -157,7 +178,7 @@ flowchart LR
 | `internal/wire` | Frame codec, event and acknowledgment types, validation. |
 | `internal/admit` | Token-bucket admission control. |
 | `internal/sched` | Per-producer bounded queues (including context-aware `EnqueueContext`) and the DRR scheduler. |
-| `internal/wal` | WAL append, synchronization, and recovery. |
+| `internal/wal` | Segmented WAL, writer goroutine with group commit, segment rotation, synchronization, and ordered recovery. |
 
 ## Event lifecycle
 
@@ -179,8 +200,8 @@ sequenceDiagram
     S->>A: Admit event for producer
     alt Event admitted
         A-->>S: Allow
-        S->>W: Append record and synchronize
-        W-->>S: Durable
+        S->>W: Submit append request (batched with others)
+        W-->>S: Durable (after batch sync)
         S->>Q: EnqueueContext (waits for space or cancellation)
         Q-->>S: Enqueued
         S-->>P: ACK with status accepted
@@ -294,7 +315,7 @@ Refer to the `wire` package for the current protocol implementation and exact en
 
 ## Write-Ahead Log
 
-The WAL stores serialized event records with a length field and a CRC32 checksum. The layout below is conceptual. Refer to the `wal` package for the exact encoding.
+The WAL stores serialized event records with a length field and a CRC32 checksum. The layout below is conceptual and is unchanged by segmentation and group commit. Refer to the `wal` package for the exact encoding.
 
 ```text
 +----------------+----------------+---------------------------+
@@ -302,17 +323,48 @@ The WAL stores serialized event records with a length field and a CRC32 checksum
 +----------------+----------------+---------------------------+
 ```
 
-### Recovery
+### Segments
 
-On startup the WAL is scanned record by record. Incomplete trailing records are truncated to the last valid record boundary. Corrupt records and checksum mismatches are reported as errors.
+The log is stored as multiple segment files rather than one growing file. Each segment holds a sequence of records in the format above. The segment size is configurable. Before writing a record, the writer checks whether it would push the active segment past the limit, and if so rotates to a new segment first.
+
+### Writer and group commit
+
+A dedicated `writerLoop` goroutine owns all WAL file operations. Callers of `Append()` submit a request to a shared channel and wait for the result, rather than writing to disk themselves. The writer collects requests into a batch, bounded by a maximum request count and a short collection delay, writes the records, and performs one `Sync()` for the whole batch. Every caller in the batch is then released, so no `Append()` returns before its record has been synchronized.
 
 ```mermaid
 flowchart TD
-    A["Start recovery"] --> B["Open WAL file"]
-    B --> C{"Another record<br/>available?"}
-    C -->|"No: end of file"| H["Recovery complete"]
+    H["Handler goroutines<br/>Append()"] -->|"submit request"| CH["Shared request channel"]
+    CH --> WL["writerLoop"]
+    WL --> BT["Collect batch<br/>max requests or short delay"]
+    BT --> SZ{"Next record fits<br/>in active segment?"}
+    SZ -->|"No"| RT["Rotate to new segment"]
+    SZ -->|"Yes"| WR["Write record"]
+    RT --> WR
+    WR --> MORE{"More records<br/>in batch?"}
+    MORE -->|"Yes"| SZ
+    MORE -->|"No"| SY["Sync once for the batch"]
+    SY --> RES["Return result to each caller"]
+    RES --> WL
+```
+
+If a write, rotation, or sync fails, the error is recorded as fatal. Requests in the affected batch receive an error, and later batches are rejected instead of being reported as persisted.
+
+Closing the WAL stops new submissions, lets queued requests finish, then synchronizes and closes the active segment before the writer exits.
+
+### Recovery
+
+On startup the WAL discovers its segments and scans them in order, record by record. An incomplete trailing record in the final segment is truncated to the last valid record boundary. Corrupt records and checksum mismatches in completed records are reported as errors.
+
+```mermaid
+flowchart TD
+    A["Start recovery"] --> B["Discover segments<br/>and order them"]
+    B --> B2["Open next segment"]
+    B2 --> C{"Another record<br/>available?"}
+    C -->|"No: end of segment"| L{"More segments?"}
+    L -->|"Yes"| B2
+    L -->|"No"| H["Recovery complete"]
     C -->|"Yes"| D{"Record complete?"}
-    D -->|"No: incomplete tail"| E["Truncate to last<br/>valid record boundary"]
+    D -->|"No: incomplete tail<br/>in final segment"| E["Truncate to last<br/>valid record boundary"]
     E --> H
     D -->|"Yes"| F{"CRC32 matches?"}
     F -->|"No"| G["Report error"]
@@ -320,7 +372,7 @@ flowchart TD
     I --> C
 ```
 
-The current implementation uses a single WAL file and recovers its events during startup. Recovered events are replayed into the producer queues. The scheduler is started before replay so that it consumes events while the queues fill, which avoids a startup deadlock when a producer has more recovered events than its queue capacity. Segmented WAL files, group commit, shipper checkpoints, and automated segment reclamation are planned extensions.
+Recovered events are replayed into the producer queues. The scheduler is started before replay so that it consumes events while the queues fill, which avoids a startup deadlock when a producer has more recovered events than its queue capacity. Shipper checkpoints and automated segment reclamation are planned extensions, so completed segments are currently retained.
 
 ## Backpressure and scheduling
 
@@ -405,7 +457,7 @@ flowchart TD
     G --> H["7. Return from RunContext<br/>deferred cleanup closes the WAL and listener"]
 ```
 
-The ordering is deliberate. The WAL is closed only after every tracked handler has exited, so no handler can append to a closed log. The scheduler keeps running during the grace period so queued events continue to be processed while handlers drain.
+The ordering is deliberate. The WAL is closed only after every tracked handler has exited, so no handler can append to a closed log. Closing the WAL then drains queued append requests and synchronizes the active segment before the writer exits. The scheduler keeps running during the grace period so queued events continue to be processed while handlers drain.
 
 ### Behavior details
 
@@ -437,10 +489,13 @@ if err := server.RunContext(ctx, ":9000", logger); err != nil {
 | Property | Current beta |
 |---|---|
 | Event persisted to the WAL before acknowledgment | Yes |
+| Disk synchronization completed (per batch) before acknowledgment | Yes |
 | Acknowledgment sent after enqueue | Yes |
 | Per-producer memory bounded | Yes, by queue capacity |
-| Persisted records scanned on restart | Yes |
+| WAL split into segments with rotation | Yes |
+| Persisted records scanned across segments on restart | Yes |
 | Recovered events replayed into queues on restart | Yes |
+| WAL write or sync failure surfaced to callers | Yes |
 | WAL kept open until all handlers exit during shutdown | Yes |
 | Explicit queue-drain confirmation on shutdown | No |
 | Events shipped to a database | No (planned) |
@@ -458,6 +513,8 @@ The following values are currently fixed in the server and are expected to becom
 | Queue capacity | 256 events per producer | Bound on each producer's queue. |
 | DRR quantum | 8 | Maximum events served from a producer queue per visit. |
 | Shutdown grace period | 5 seconds | Time active handlers have to finish before connections are forcibly closed. |
+
+The WAL segment size is configurable. Group commit batching is bounded by a maximum request count and a short collection delay; refer to the `wal` package for the current options and defaults.
 
 ## Planned storage integration
 
@@ -525,8 +582,8 @@ The roadmap lists planned work in dependency order. Items are subject to change.
 
 ```mermaid
 flowchart TD
-    P1["Phase 1: Core ingestion (implemented)<br/>TCP server, wire protocol, admission control<br/>Per-producer queues, DRR scheduling, WAL append and recovery<br/>Context-aware lifecycle and graceful shutdown"]
-    P2["Phase 2: Storage pipeline (planned)<br/>Segmented WAL, store interface, WAL shipper<br/>ClickHouse adapter, checkpoints, retry and backoff"]
+    P1["Phase 1: Core ingestion (implemented)<br/>TCP server, wire protocol, admission control<br/>Per-producer queues, DRR scheduling<br/>Segmented WAL with group commit and ordered recovery<br/>Context-aware lifecycle and graceful shutdown"]
+    P2["Phase 2: Storage pipeline (planned)<br/>Store interface, WAL shipper<br/>ClickHouse adapter, checkpoints, retry and backoff<br/>WAL segment reclamation"]
     P3["Phase 3: Fairness and overload control (planned)<br/>Producer weights, backlog-aware overload handling<br/>Load shedding"]
     P4["Phase 4: Operability and hardening (planned)<br/>Metrics, profiling, dashboards<br/>Load, reconcile, and chaos tools, protocol hardening"]
 
@@ -545,11 +602,12 @@ A solid border marks implemented work. Dashed borders mark planned work.
 | Ingestion, validation, admission control | Implemented |
 | Per-producer queues, DRR scheduling | Implemented |
 | WAL append and recovery | Implemented |
+| WAL segmentation and group commit | Implemented |
 | Context-aware lifecycle, connection tracking, graceful shutdown | Implemented |
 | Cancelable enqueueing and scheduler error propagation | Implemented |
-| WAL segmentation and group commit | Planned |
 | Shipper, store abstraction, ClickHouse adapter | Planned |
 | Checkpoints, retry, backoff | Planned |
+| WAL segment reclamation | Planned |
 | Producer weights and richer fairness controls | Planned |
 | Backlog-aware overload handling | Planned |
 | Metrics, profiling, dashboards | Planned |
@@ -565,7 +623,7 @@ FairGate/
 │   ├── admit/       # Admission control
 │   ├── sched/       # Producer queues and DRR scheduler
 │   ├── server/      # TCP listener and connection handling
-│   ├── wal/         # WAL append and recovery
+│   ├── wal/         # Segmented WAL, group commit, and recovery
 │   └── wire/        # Frame codec, event and ACK types
 ├── data/            # Local WAL data (runtime; do not commit)
 ├── go.mod
@@ -611,10 +669,11 @@ FairGate is an experimental beta. Interfaces, protocol details, configuration, a
 Known limitations of the current beta:
 
 - Events are not delivered to any database. The scheduler callback only logs events.
-- The WAL is a single file with no segmentation, group commit, or automated reclamation.
+- The WAL is segmented with group commit, but completed segments are not reclaimed automatically; reclamation depends on the planned shipper checkpoints.
 - Queue capacity, DRR quantum, and the shutdown grace period are fixed in the server and not yet configurable.
 - All producers receive equal scheduling treatment. Weights are not yet supported.
 - Enqueueing blocks on a full queue (cancelable during shutdown), and no load-shedding policy exists yet.
+- A WAL write, rotation, or sync failure is fatal: later appends are rejected until the WAL is reopened.
 - Shutdown has no explicit queue-drain confirmation, and a handler stuck in an operation that ignores connection closure and context cancellation can delay it beyond the grace period.
 - No metrics, profiling endpoints, or dashboards are provided.
 
