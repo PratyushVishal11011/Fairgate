@@ -7,7 +7,7 @@ FairGate is a modular event-ingestion gateway. It accepts framed event streams o
 The project explores fair resource sharing in event-ingestion systems: keeping producers isolated from one another through bounded buffering, admission limits, and fair scheduling. FairGate is being developed as an open-source foundation that can be extended with different storage backends and downstream processing components.
 
 > [!IMPORTANT]
-> **Beta status.** FairGate is under active development. The current implementation provides TCP ingestion, event decoding and validation, admission control, per-producer bounded queues, DRR scheduling, a segmented WAL with group commit and ordered recovery, acknowledgments, and context-aware graceful shutdown. The ClickHouse shipper, checkpointing, advanced overload control, and production observability described in the roadmap are not yet integrated into the current ingestion path.
+> **Beta status.** FairGate is under active development. The current implementation provides TCP ingestion, event decoding and validation, admission control, per-producer bounded queues, DRR scheduling, a segmented WAL with group commit and ordered recovery, acknowledgments, and context-aware graceful shutdown. An asynchronous shipper, a `Store` interface, and a ClickHouse adapter are also available as building blocks. Durable checkpointing, retry and backoff, advanced overload control, and production observability described in the roadmap are not yet implemented.
 
 ## Table of Contents
 
@@ -55,6 +55,10 @@ The project explores fair resource sharing in event-ingestion systems: keeping p
 - **Group commit.** A dedicated writer goroutine batches concurrent append requests and issues a single `Sync()` per batch, bounded by a maximum request count and a short collection delay.
 - **WAL recovery.** Discovers segments, scans them in order on startup, handles an incomplete trailing record in the final segment, and replays recovered events into the producer queues.
 - **WAL fatal error handling.** Write, rotation, and synchronization failures are recorded as fatal; affected requests receive an error and later batches are rejected.
+- **Asynchronous shipper.** Buffers events in a bounded in-memory channel and flushes them in batches, controlled by `BatchSize`, `FlushInterval`, and `QueueSize`. `Submit(ctx, event)` is context-aware.
+- **Store interface.** `InsertBatch(ctx, events)` and `Close()` separate storage from the processing pipeline.
+- **ClickHouse adapter.** Official Go client with configurable authentication, `Ping` health checks, batched inserts through `PrepareBatch` and `Send`, and graceful cleanup.
+- **Optional ClickHouse integration test.** Environment-gated test covering connectivity, batch insertion, and retrieval.
 - **Acknowledgments.** Sends an accepted acknowledgment after the event has been appended to the WAL and enqueued.
 - **Concurrent connections.** Handles client connections in separate goroutines and tracks them for coordinated shutdown.
 - **Context-aware lifecycle.** `RunContext` lets the caller control server lifetime through a `context.Context`.
@@ -65,8 +69,7 @@ The project explores fair resource sharing in event-ingestion systems: keeping p
 
 ### Planned
 
-- Asynchronous WAL shipper and batch delivery
-- Pluggable storage interface and ClickHouse adapter
+- WAL-driven shipping that reads from the last durable checkpoint
 - Durable shipper checkpoints, retry and backoff, and WAL segment reclamation
 - Configurable producer weights and richer fairness controls
 - Backlog-aware overload handling and load shedding
@@ -78,6 +81,20 @@ The project explores fair resource sharing in event-ingestion systems: keeping p
 Planned capabilities are not implied to be available in this beta.
 
 ## Recent updates
+
+### 03rd October, 2026: Asynchronous shipper, Store interface, and ClickHouse adapter
+
+Earlier versions stopped at the scheduler, whose callback only logged events, and had no way to hand events to a database. The latest changes add an asynchronous shipping layer and a storage abstraction, with ClickHouse as the first backend, so event scheduling is decoupled from database insertion.
+
+- **Asynchronous shipper.** A bounded in-memory channel buffers incoming events, so callers are not blocked on database inserts. `BatchSize`, `FlushInterval`, and `QueueSize` control batch formation, flushing frequency, and buffer capacity.
+- **Context-aware submission.** `Submit(ctx, event)` hands an event to the shipper and respects cancellation, so a caller waiting on a full buffer can stop waiting.
+- **`Store` interface.** Storage operations are separated from the event processing pipeline behind `InsertBatch(ctx, events)` and `Close()`. Different backends can be implemented without modifying the shipper.
+- **ClickHouse adapter.** Built on the official Go client, with connection initialization, configurable authentication, connection health checks through `Ping`, and graceful connection cleanup.
+- **Batched insertion.** The adapter uses `PrepareBatch` and `Send` to reduce per-event insertion overhead.
+- **`fairgate.events` persistence.** Events are stored with their producer ID, event timestamp, sequence number, index, event type, and payload. The adapter follows the existing ClickHouse schema, including `ReplacingMergeTree`, monthly partitioning, and a 30-day TTL.
+- **Optional integration test.** An environment-gated ClickHouse test validates connectivity, batch insertion, and retrieval of persisted events. It does not run unless ClickHouse is configured.
+
+These changes provide the shipping and storage building blocks. Durable checkpoints, retry and backoff, and WAL segment reclamation are still separate upcoming steps, so database delivery guarantees are not yet documented. See [Planned storage integration](#planned-storage-integration).
 
 ### 03rd October, 2026: Segmented WAL and group commit
 
@@ -149,7 +166,7 @@ The server's goroutine and context structure, including the shutdown path, is de
 
 ### Planned extension
 
-The shipper, store abstraction, and ClickHouse adapter are not yet part of the ingestion path. Dashed elements below are planned.
+The asynchronous shipper, `Store` interface, and ClickHouse adapter now exist as components. The diagram below shows the intended end-to-end design, in which the shipper reads from the WAL and gates segment reclamation on a durable checkpoint. Dashed elements are planned.
 
 ```mermaid
 flowchart LR
@@ -167,7 +184,7 @@ flowchart LR
     CK -.->|"gates"| R
 
     classDef planned stroke-dasharray: 5 5,stroke-width:2px;
-    class SH,ST,CH,CK,R planned;
+    class CK,R planned;
 ```
 
 ### Component responsibilities
@@ -498,7 +515,8 @@ if err := server.RunContext(ctx, ":9000", logger); err != nil {
 | WAL write or sync failure surfaced to callers | Yes |
 | WAL kept open until all handlers exit during shutdown | Yes |
 | Explicit queue-drain confirmation on shutdown | No |
-| Events shipped to a database | No (planned) |
+| Shipper and ClickHouse adapter available | Yes |
+| Shipping survives a crash (checkpoint, retry, WAL-driven replay) | No (planned) |
 | Acknowledgment implies database storage | No |
 | End-to-end exactly-once delivery | No |
 
@@ -518,10 +536,19 @@ The WAL segment size is configurable. Group commit batching is bounded by a maxi
 
 ## Planned storage integration
 
-ClickHouse is the intended initial storage backend. The project plan includes a `Store` abstraction and a ClickHouse adapter, with an asynchronous shipper that reads from the WAL, batches records, retries failed inserts, and persists checkpoints.
+ClickHouse is the initial storage backend. The `Store` interface and ClickHouse adapter are implemented, along with an asynchronous shipper that batches events for insertion. The remaining planned work is a shipper that reads from the WAL, retries failed inserts, and persists checkpoints.
+
+### Current building blocks
+
+| Component | Behavior |
+|---|---|
+| Shipper | Bounded in-memory channel with configurable `BatchSize`, `FlushInterval`, and `QueueSize`. `Submit(ctx, event)` is context-aware. |
+| `Store` interface | `InsertBatch(ctx, events)` and `Close()`. Backends plug in without changes to the shipper. |
+| ClickHouse adapter | Official Go client, configurable authentication, `Ping` health check, batched inserts with `PrepareBatch` and `Send`, graceful close. |
+| Integration test | Optional and environment-gated. Validates connectivity, batch insertion, and retrieval. |
 
 > [!NOTE]
-> **The current beta does not yet ship WAL events to ClickHouse automatically.** Having a ClickHouse database or table available does not by itself connect it to the current event path.
+> **Database delivery guarantees are not yet documented.** The shipper buffers events in memory, and checkpointing, retry and backoff, and WAL-driven recovery of unshipped events are not implemented. Having a ClickHouse database or table available does not by itself make delivery durable or exactly-once.
 
 ### Intended shipper ordering
 
@@ -556,25 +583,9 @@ sequenceDiagram
 
 A crash between a successful insert and the checkpoint write would cause the same batch to be inserted again after restart. The planned design addresses this with an idempotent table definition keyed on a unique event identity, so repeated inserts converge to a single row. Exact-count queries would need to account for merge timing until deduplication completes. Batch delivery, retry behavior, checkpoint ordering, and duplicate handling must be implemented and validated before database delivery guarantees are documented.
 
-### Target schema (planned)
+### Schema
 
-The existing `fairgate.events` schema can be maintained as the target schema for the adapter. The definition below is illustrative of the intended direction and may change.
-
-```sql
-CREATE TABLE IF NOT EXISTS fairgate.events (
-    producer_id  LowCardinality(String),
-    seq          UInt64,
-    idx          UInt32,
-    event_time   DateTime64(3, 'UTC'),
-    ingest_time  DateTime64(3, 'UTC'),
-    event_type   LowCardinality(String),
-    payload      String CODEC(ZSTD(3)),
-    wal_segment  UInt64,
-    wal_offset   UInt64
-) ENGINE = ReplacingMergeTree
-PARTITION BY toDate(ingest_time)
-ORDER BY (producer_id, event_time, seq, idx);
-```
+The adapter persists events into the existing `fairgate.events` table, which uses `ReplacingMergeTree`, monthly partitioning, and a 30-day TTL. Persisted fields include the producer ID, event timestamp, sequence number, index, event type, and payload. Refer to the schema definition in the repository for the exact columns, partition expression, and TTL clause.
 
 ## Roadmap
 
@@ -582,8 +593,8 @@ The roadmap lists planned work in dependency order. Items are subject to change.
 
 ```mermaid
 flowchart TD
-    P1["Phase 1: Core ingestion (implemented)<br/>TCP server, wire protocol, admission control<br/>Per-producer queues, DRR scheduling<br/>Segmented WAL with group commit and ordered recovery<br/>Context-aware lifecycle and graceful shutdown"]
-    P2["Phase 2: Storage pipeline (planned)<br/>Store interface, WAL shipper<br/>ClickHouse adapter, checkpoints, retry and backoff<br/>WAL segment reclamation"]
+    P1["Phase 1: Core ingestion (implemented)<br/>TCP server, wire protocol, admission control<br/>Per-producer queues, DRR scheduling<br/>Segmented WAL with group commit and ordered recovery<br/>Context-aware lifecycle and graceful shutdown<br/>Async shipper, Store interface, ClickHouse adapter"]
+    P2["Phase 2: Durable delivery (planned)<br/>WAL-driven shipping, checkpoints<br/>Retry and backoff<br/>WAL segment reclamation"]
     P3["Phase 3: Fairness and overload control (planned)<br/>Producer weights, backlog-aware overload handling<br/>Load shedding"]
     P4["Phase 4: Operability and hardening (planned)<br/>Metrics, profiling, dashboards<br/>Load, reconcile, and chaos tools, protocol hardening"]
 
@@ -605,7 +616,9 @@ A solid border marks implemented work. Dashed borders mark planned work.
 | WAL segmentation and group commit | Implemented |
 | Context-aware lifecycle, connection tracking, graceful shutdown | Implemented |
 | Cancelable enqueueing and scheduler error propagation | Implemented |
-| Shipper, store abstraction, ClickHouse adapter | Planned |
+| Asynchronous shipper, `Store` interface, ClickHouse adapter | Implemented |
+| Optional ClickHouse integration test | Implemented |
+| WAL-driven shipping | Planned |
 | Checkpoints, retry, backoff | Planned |
 | WAL segment reclamation | Planned |
 | Producer weights and richer fairness controls | Planned |
@@ -668,7 +681,8 @@ FairGate is an experimental beta. Interfaces, protocol details, configuration, a
 
 Known limitations of the current beta:
 
-- Events are not delivered to any database. The scheduler callback only logs events.
+- The shipper buffers events in memory and has no checkpointing, retry and backoff, or WAL-driven replay, so events not yet inserted can be lost from the database path on a crash. They remain in the WAL, but nothing re-ships them yet.
+- The ClickHouse integration test is optional and runs only when the environment is configured for it.
 - The WAL is segmented with group commit, but completed segments are not reclaimed automatically; reclamation depends on the planned shipper checkpoints.
 - Queue capacity, DRR quantum, and the shutdown grace period are fixed in the server and not yet configurable.
 - All producers receive equal scheduling treatment. Weights are not yet supported.
