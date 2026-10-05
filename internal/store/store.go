@@ -6,6 +6,7 @@ import (
 )
 
 type Store interface {
-	insertBatch(ctx context.Context, event []wire.Event) error
+	// InsertBatch modified the function to be exported outside the store package
+	InsertBatch(ctx context.Context, event []wire.Event) error
 	Close() error
 }
