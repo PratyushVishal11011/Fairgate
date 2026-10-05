@@ -43,6 +43,11 @@ type WAL struct {
 	done     chan struct{}
 	closeErr error
 
+	//protects durableEnd
+	//separate mutex because the write goroutine updates durableEnd while future WAL will need to read it
+	stateMu    sync.RWMutex
+	durableEnd Position
+
 	//owned exclusively by the writer goroutine
 	file           *os.File
 	path           string
@@ -97,6 +102,12 @@ func openWithSegmentSize(path string, segmentSize int64) (*WAL, error) {
 		maxSegmentSize: segmentSize,
 		requests:       make(chan appendRequest, maxRecordSize),
 		done:           make(chan struct{}),
+
+		//update for new fields added
+		durableEnd: Position{
+			segmentId: segmentId,
+			offset:    info.Size(),
+		},
 	}
 
 	go w.writerLoop()
@@ -217,9 +228,8 @@ func (w *WAL) writerLoop() {
 // function does not need a mutex to protect file operations.
 func (w *WAL) writeBatch(batch []appendRequest) {
 
-	// If a previous write or Sync() failed, the WAL is considered
-	// unusable for further appends. Notify every request in this batch
-	// of the existing error without attempting additional writes.
+	//If a previous write or Sync() failed, the WAL is considered unusable for further appends.
+	//Notify every request in this batch of the existing error without attempting additional writes.
 	if w.fatalError != nil {
 		for _, req := range batch {
 			req.done <- w.fatalError
@@ -334,9 +344,15 @@ func (w *WAL) writeBatch(batch []appendRequest) {
 	// durable before the callers receive successful acknowledgements.
 	if w.fatalError == nil {
 		if err := w.file.Sync(); err != nil {
-			// A Sync() failure means the durability of the batch
-			// cannot be confirmed. Treat the WAL as failed.
+			//A Sync() failure means the durability of the batch cannot be confirmed. Treat the WAL as failed.
 			w.fatalError = err
+		} else {
+			w.stateMu.Lock()
+			w.durableEnd = Position{
+				segmentId: w.segmentId,
+				offset:    w.size,
+			}
+			w.stateMu.Unlock()
 		}
 	}
 
@@ -448,6 +464,7 @@ func (w *WAL) Close() error {
 	w.closed = true
 	//close the requests channel
 	close(w.requests)
+	w.submitMu.Unlock()
 
 	//wait for the writer to finish pending requests, sync the active segment, and close the file.
 	<-w.done
@@ -471,4 +488,12 @@ func writeFull(file *os.File, data []byte) error {
 		data = data[n:]
 	}
 	return nil
+}
+
+func (w *WAL) DurableEnd() Position {
+	//getter function
+	w.stateMu.RLock()
+	defer w.stateMu.RUnlock()
+
+	return w.durableEnd
 }
