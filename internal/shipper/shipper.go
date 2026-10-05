@@ -2,9 +2,11 @@ package shipper
 
 import (
 	"FairGate/internal/store"
+	"FairGate/internal/wal"
 	"FairGate/internal/wire"
 	"context"
 	"errors"
+	"io"
 	"time"
 )
 
@@ -24,13 +26,31 @@ type Shipper struct {
 	//keeps shipper independent of clickhouse
 	store  store.Store
 	config Config
-	//Buffered channel that temporarily holds events submitted to the shipper before they are written to storage.
-	events chan wire.Event
+	//REMOVED: Buffered channel that temporarily holds events submitted to the shipper before they are written to storage.
+	//Now implemented as WAL -> Reader -> Shipper
+	wal        *wal.WAL
+	checkpoint *CheckpointStore
+	backoff    *Backoff
 }
 
-func New(storage store.Store, config Config) (*Shipper, error) {
+func New(
+	storage store.Store,
+	w *wal.WAL,
+	checkpoint *CheckpointStore,
+	backoff *Backoff,
+	config Config,
+) (*Shipper, error) {
 	if storage == nil {
 		return nil, errors.New("the storage cannot be nil")
+	}
+	if w == nil {
+		return nil, errors.New("the WAL cannot be nil")
+	}
+	if checkpoint == nil {
+		return nil, errors.New("the checkpoint store cannot be nil")
+	}
+	if backoff == nil {
+		return nil, errors.New("the backoff cannot be nil")
 	}
 	if config.BatchSize <= 0 {
 		return nil, errors.New("the batch size must be greater than zero")
@@ -38,27 +58,115 @@ func New(storage store.Store, config Config) (*Shipper, error) {
 	if config.FlushInterval <= 0 {
 		return nil, errors.New("the flush interval must be greater than zero")
 	}
-	if config.QueueSize <= 0 {
-		return nil, errors.New("the queue size must be greater than zero")
-	}
 
 	return &Shipper{
-		store:  storage,
-		config: config,
-		events: make(chan wire.Event, config.QueueSize),
+		store:      storage,
+		wal:        w,
+		checkpoint: checkpoint,
+		backoff:    backoff,
+		config:     config,
 	}, nil
 }
 
-// Submit sends an event to the shipper.
-// It blocks when the internal buffer is full, unless the context is canceled.
-func (s *Shipper) Submit(ctx context.Context, event wire.Event) error {
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	//Attempts to send the event to the shipper's events channel.
-	//If the channel has available buffer space, the event is queued and the function returns nil
-	//If the buffer is full, the send blocks until space becomes available or the context is canceled.
-	case s.events <- event:
-		return nil
+func checkpointPosition(checkpoint Checkpoint) wal.Position {
+	return wal.Position{
+		SegmentId: checkpoint.Segment,
+		Offset:    checkpoint.Offset,
+	}
+}
+
+func positionCheckpoint(position wal.Position) Checkpoint {
+	return Checkpoint{
+		Segment: position.SegmentId,
+		Offset:  position.Offset,
+	}
+}
+
+func (s *Shipper) Run(ctx context.Context) error {
+	checkpoint, err := s.checkpoint.Load()
+	if err != nil {
+		return err
+	}
+
+	position := checkpointPosition(checkpoint)
+	reader := wal.NewReader(s.wal, position)
+
+	for {
+		batch, end, err := s.readBatch(ctx, reader)
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				return nil
+			}
+			return err
+		}
+
+		if len(batch) == 0 {
+			continue
+		}
+
+		if err := s.writeBatch(ctx, batch); err != nil {
+			return err
+		}
+
+		if err := s.checkpoint.Commit(positionCheckpoint(end)); err != nil {
+			return err
+		}
+
+		position = end
+	}
+}
+
+func (s *Shipper) readBatch(
+	ctx context.Context,
+	reader *wal.Reader,
+) ([]wire.Event, wal.Position, error) {
+	batch := make([]wire.Event, 0, s.config.BatchSize)
+
+	var end wal.Position
+
+	for len(batch) < s.config.BatchSize {
+		select {
+		case <-ctx.Done():
+			return nil, end, ctx.Err()
+		default:
+		}
+
+		record, err := reader.Next()
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				if len(batch) == 0 {
+					return nil, end, io.EOF
+				}
+
+				return batch, end, nil
+			}
+
+			return nil, end, err
+		}
+
+		batch = append(batch, record.Event)
+		end = record.End
+	}
+
+	return batch, end, nil
+}
+
+func (s *Shipper) writeBatch(
+	ctx context.Context,
+	batch []wire.Event,
+) error {
+	for attempt := 0; ; attempt++ {
+		err := s.store.InsertBatch(ctx, batch)
+		if err == nil {
+			return nil
+		}
+
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+
+		if err := s.backoff.Wait(ctx, attempt); err != nil {
+			return err
+		}
 	}
 }

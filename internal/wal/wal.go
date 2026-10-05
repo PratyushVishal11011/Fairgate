@@ -105,8 +105,8 @@ func openWithSegmentSize(path string, segmentSize int64) (*WAL, error) {
 
 		//update for new fields added
 		durableEnd: Position{
-			segmentId: segmentId,
-			offset:    info.Size(),
+			SegmentId: segmentId,
+			Offset:    info.Size(),
 		},
 	}
 
@@ -349,8 +349,8 @@ func (w *WAL) writeBatch(batch []appendRequest) {
 		} else {
 			w.stateMu.Lock()
 			w.durableEnd = Position{
-				segmentId: w.segmentId,
-				offset:    w.size,
+				SegmentId: w.segmentId,
+				Offset:    w.size,
 			}
 			w.stateMu.Unlock()
 		}

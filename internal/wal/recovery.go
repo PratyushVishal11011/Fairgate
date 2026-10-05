@@ -87,7 +87,7 @@ func recoverSegment(file *os.File, isLast bool) ([]wire.Event, error) {
 
 		//validation also prevents the function from allocating an excessively large payload buffer due to a corrupted length field.
 		if length == 0 || length > maxRecordSize {
-			return nil, fmt.Errorf("invalid record length at offset: %d", offset)
+			return nil, fmt.Errorf("invalid record length at Offset: %d", offset)
 		}
 
 		//creates a byte slice large enough to hold the JSON payload.
@@ -100,7 +100,7 @@ func recoverSegment(file *os.File, isLast bool) ([]wire.Event, error) {
 			// Checks if the payload is incomplete
 			if !isLast {
 				return nil, fmt.Errorf(
-					"incomplete record in non-final WAL segment at offset: %d",
+					"incomplete record in non-final WAL segment at Offset: %d",
 					offset,
 				)
 			}
@@ -123,18 +123,18 @@ func recoverSegment(file *os.File, isLast bool) ([]wire.Event, error) {
 		//calculated checksum is compared to the stored checksum
 		//mismatch = data corruption
 		if crc32.ChecksumIEEE(payload) != checksum {
-			return nil, fmt.Errorf("invalid checksum at offset: %d", offset)
+			return nil, fmt.Errorf("invalid checksum at Offset: %d", offset)
 		}
 
 		//converts the JSON bytes into event object
 		var event wire.Event
 		if err := json.Unmarshal(payload, &event); err != nil {
-			return nil, fmt.Errorf("invalid WAL event at offset: %d", offset)
+			return nil, fmt.Errorf("invalid WAL event at Offset: %d", offset)
 		}
 
 		//Add the successfully decoded event to the events slice.
 		events = append(events, event)
-		//update the offset
+		//update the Offset
 		offset += int64(len(header)) + int64(length)
 	}
 	return events, nil

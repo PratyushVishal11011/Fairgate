@@ -13,8 +13,8 @@ import (
 
 type Position struct {
 	//to identify a location in a WAL
-	segmentId uint64
-	offset    int64
+	SegmentId uint64
+	Offset    int64
 }
 
 type Record struct {
@@ -49,7 +49,7 @@ func (reader *Reader) closeFile() error {
 }
 
 func (reader *Reader) openSegment() error {
-	if reader.file != nil && reader.segmentId == reader.position.segmentId {
+	if reader.file != nil && reader.segmentId == reader.position.SegmentId {
 		return nil
 	}
 	if err := reader.closeFile(); err != nil {
@@ -58,8 +58,8 @@ func (reader *Reader) openSegment() error {
 
 	path := reader.wal.path
 
-	if reader.position.segmentId > 0 {
-		path = segmentPath(reader.wal.path, reader.position.segmentId)
+	if reader.position.SegmentId > 0 {
+		path = segmentPath(reader.wal.path, reader.position.SegmentId)
 	}
 
 	file, err := os.Open(path)
@@ -68,14 +68,14 @@ func (reader *Reader) openSegment() error {
 	}
 
 	reader.file = file
-	reader.segmentId = reader.position.segmentId
+	reader.segmentId = reader.position.SegmentId
 
 	return nil
 }
 
 func (reader *Reader) Next() (Record, error) {
 	//modifying this function to make sure that when the current segment has no more durable data and there is a later durable segment,
-	//close the current file, advance segmentId, reset offset to 0, and continue reading.
+	//close the current file, advance SegmentId, reset Offset to 0, and continue reading.
 	for {
 		if err := reader.openSegment(); err != nil {
 			return Record{}, err
@@ -86,16 +86,16 @@ func (reader *Reader) Next() (Record, error) {
 		//TODO: Come up with a better solution for this
 		fileInfo, err := reader.file.Stat()
 
-		if reader.position.offset+8 > fileInfo.Size() {
+		if reader.position.Offset+8 > fileInfo.Size() {
 			durable := reader.wal.DurableEnd()
-			if reader.position.segmentId < durable.segmentId {
+			if reader.position.SegmentId < durable.SegmentId {
 				if err := reader.closeFile(); err != nil {
 					return Record{}, err
 				}
 
 				reader.position = Position{
-					segmentId: reader.position.segmentId + 1,
-					offset:    0,
+					SegmentId: reader.position.SegmentId + 1,
+					Offset:    0,
 				}
 				continue
 			}
@@ -103,7 +103,7 @@ func (reader *Reader) Next() (Record, error) {
 		}
 
 		header := make([]byte, 8)
-		_, err = reader.file.ReadAt(header, reader.position.offset)
+		_, err = reader.file.ReadAt(header, reader.position.Offset)
 		if err != nil {
 			if errors.Is(err, io.EOF) {
 				return Record{}, io.EOF
@@ -115,9 +115,9 @@ func (reader *Reader) Next() (Record, error) {
 
 		if payloadLength > maxRecordSize {
 			return Record{}, fmt.Errorf(
-				"WAL record too large at segment %d offset %d",
-				reader.position.segmentId,
-				reader.position.offset,
+				"WAL record too large at segment %d Offset %d",
+				reader.position.SegmentId,
+				reader.position.Offset,
 			)
 		}
 
@@ -130,16 +130,16 @@ func (reader *Reader) Next() (Record, error) {
 		expectedCRC := binary.BigEndian.Uint32(header[4:8])
 
 		payload := make([]byte, payloadLength)
-		payloadOffset := reader.position.offset + 8
+		payloadOffset := reader.position.Offset + 8
 
 		_, err = reader.file.ReadAt(payload, payloadOffset)
 
 		if err != nil {
 			if errors.Is(err, io.EOF) {
 				return Record{}, fmt.Errorf(
-					"incomplete WAL record at segment %d offset %d",
-					reader.position.segmentId,
-					reader.position.offset,
+					"incomplete WAL record at segment %d Offset %d",
+					reader.position.SegmentId,
+					reader.position.Offset,
 				)
 			}
 			return Record{}, err
@@ -148,25 +148,25 @@ func (reader *Reader) Next() (Record, error) {
 		actualCRC := crc32.ChecksumIEEE(payload)
 		if actualCRC != expectedCRC {
 			return Record{}, fmt.Errorf(
-				"WAL checksum mismatch at segment %d offset %d",
-				reader.position.segmentId,
-				reader.position.offset,
+				"WAL checksum mismatch at segment %d Offset %d",
+				reader.position.SegmentId,
+				reader.position.Offset,
 			)
 		}
 
 		var event wire.Event
 		if err := json.Unmarshal(payload, &event); err != nil {
 			return Record{}, fmt.Errorf(
-				"invalid WAL event at segment %d offset %d: %w",
-				reader.position.segmentId,
-				reader.position.offset,
+				"invalid WAL event at segment %d Offset %d: %w",
+				reader.position.SegmentId,
+				reader.position.Offset,
 				err,
 			)
 		}
 
 		end := Position{
-			segmentId: reader.position.segmentId,
-			offset:    reader.position.offset + 8 + int64(payloadLength),
+			SegmentId: reader.position.SegmentId,
+			Offset:    reader.position.Offset + 8 + int64(payloadLength),
 		}
 
 		reader.position = end
@@ -182,13 +182,13 @@ func (reader *Reader) Next() (Record, error) {
 func (reader *Reader) canRead(size int64) bool {
 	durable := reader.wal.DurableEnd()
 
-	if reader.position.segmentId < durable.segmentId {
+	if reader.position.SegmentId < durable.SegmentId {
 		return true
 	}
 
-	if reader.position.segmentId > durable.segmentId {
+	if reader.position.SegmentId > durable.SegmentId {
 		return false
 	}
 
-	return reader.position.offset+size <= durable.offset
+	return reader.position.Offset+size <= durable.Offset
 }

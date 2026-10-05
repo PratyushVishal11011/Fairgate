@@ -7,7 +7,7 @@ FairGate is a modular event-ingestion gateway. It accepts framed event streams o
 The project explores fair resource sharing in event-ingestion systems: keeping producers isolated from one another through bounded buffering, admission limits, and fair scheduling. FairGate is being developed as an open-source foundation that can be extended with different storage backends and downstream processing components.
 
 > [!IMPORTANT]
-> **Beta status.** FairGate is under active development. The current implementation provides TCP ingestion, event decoding and validation, admission control, per-producer bounded queues, DRR scheduling, a segmented WAL with group commit and ordered recovery, acknowledgments, and context-aware graceful shutdown. An asynchronous shipper, a `Store` interface, and a ClickHouse adapter are also available as building blocks. Durable checkpointing, retry and backoff, advanced overload control, and production observability described in the roadmap are not yet implemented.
+> **Beta status.** FairGate is under active development. The current implementation provides TCP ingestion, event decoding and validation, admission control, per-producer bounded queues, DRR scheduling, a segmented WAL with group commit and ordered recovery, acknowledgments, and context-aware graceful shutdown. The shipper can read durable WAL records from a persisted checkpoint, batch them for a `Store`, retry failed inserts with capped exponential backoff and jitter, and atomically persist progress after successful inserts. The gateway command does not currently wire this shipper into its runtime, and WAL segment reclamation, advanced overload control, and production observability are not implemented.
 
 ## Table of Contents
 
@@ -23,7 +23,7 @@ The project explores fair resource sharing in event-ingestion systems: keeping p
 - [Server lifecycle and graceful shutdown](#server-lifecycle-and-graceful-shutdown)
 - [Delivery semantics](#delivery-semantics)
 - [Configuration](#configuration)
-- [Planned storage integration](#planned-storage-integration)
+- [Storage integration](#storage-integration)
 - [Roadmap](#roadmap)
 - [Project structure](#project-structure)
 - [Getting started](#getting-started)
@@ -53,9 +53,12 @@ The project explores fair resource sharing in event-ingestion systems: keeping p
 - **DRR scheduling.** Selects queued events in producer rounds using a configurable quantum.
 - **Segmented Write-Ahead Log.** Appends events with length and CRC metadata across multiple segment files, rotating to a new segment when the configured segment size would be exceeded.
 - **Group commit.** A dedicated writer goroutine batches concurrent append requests and issues a single `Sync()` per batch, bounded by a maximum request count and a short collection delay.
-- **WAL recovery.** Discovers segments, scans them in order on startup, handles an incomplete trailing record in the final segment, and replays recovered events into the producer queues.
+- **WAL recovery.** Discovers segments, scans them in order on startup, truncates an incomplete trailing record in the final segment only, rejects incomplete records in earlier segments, and replays recovered events into the producer queues.
 - **WAL fatal error handling.** Write, rotation, and synchronization failures are recorded as fatal; affected requests receive an error and later batches are rejected.
-- **Asynchronous shipper.** Buffers events in a bounded in-memory channel and flushes them in batches, controlled by `BatchSize`, `FlushInterval`, and `QueueSize`. `Submit(ctx, event)` is context-aware.
+- **Durable WAL reader.** Reads records only up to the WAL's synchronized durable end, verifies length, CRC32, and JSON, returns each event with its start and end positions, and advances across segment boundaries from any saved position.
+- **WAL-backed batch shipper.** `Shipper.Run(ctx)` loads the checkpoint, reads durable records in order up to `BatchSize`, and sends each batch to the configured `Store`. It returns when it reaches the current durable WAL end.
+- **Retry with backoff.** Retries failed batch inserts with capped exponential delay, configurable jitter, and context-aware waiting. The same batch is retried until it succeeds or the context is canceled.
+- **Durable checkpoints.** Stores the last successfully inserted record position as a segment and offset. Checkpoints are written through a synced temporary file followed by an atomic rename; a missing checkpoint starts reading at the beginning of the WAL, and invalid JSON or negative offsets are rejected.
 - **Store interface.** `InsertBatch(ctx, events)` and `Close()` separate storage from the processing pipeline.
 - **ClickHouse adapter.** Official Go client with configurable authentication, `Ping` health checks, batched inserts through `PrepareBatch` and `Send`, and graceful cleanup.
 - **Optional ClickHouse integration test.** Environment-gated test covering connectivity, batch insertion, and retrieval.
@@ -69,8 +72,8 @@ The project explores fair resource sharing in event-ingestion systems: keeping p
 
 ### Planned
 
-- WAL-driven shipping that reads from the last durable checkpoint
-- Durable shipper checkpoints, retry and backoff, and WAL segment reclamation
+- Wiring the WAL shipper into the gateway runtime and defining its lifecycle/configuration
+- WAL segment reclamation after safely shipped segments are no longer needed
 - Configurable producer weights and richer fairness controls
 - Backlog-aware overload handling and load shedding
 - Prometheus metrics, profiling endpoints, and dashboards
@@ -81,6 +84,22 @@ The project explores fair resource sharing in event-ingestion systems: keeping p
 Planned capabilities are not implied to be available in this beta.
 
 ## Recent updates
+
+### 05th October, 2026: WAL shipping, durable checkpoints, and retry backoff
+
+The latest changes connect the storage building blocks to a WAL-reading shipper. They add record-position tracking across segments, persistent progress, and retry handling for failed storage writes.
+
+- **Durable WAL reader.** Reads only records up to the WAL's synchronized durable end, verifies record length, CRC32, and JSON, and returns each event with its start and end positions. It advances across segment boundaries and can start from a saved position.
+- **Checkpoint-based resume.** The checkpoint records a segment ID and byte offset. A missing checkpoint starts at the beginning of the WAL; invalid JSON and negative offsets are rejected.
+- **Atomic checkpoint commit.** Each successful batch advances the checkpoint by writing and syncing a temporary JSON file, then renaming it over the checkpoint path.
+- **WAL-backed batch shipping.** `Shipper.Run(ctx)` loads the checkpoint, reads events in WAL order up to `BatchSize`, calls `Store.InsertBatch`, and commits the batch end position only after insertion succeeds. It returns when it reaches the current durable WAL end.
+- **Retry and backoff.** Failed inserts retry the same batch using exponential delays capped at a maximum delay, with optional symmetric jitter. Waiting respects context cancellation; retries otherwise continue until success.
+- **Cross-segment recovery validation.** Recovery now rejects incomplete records in non-final segments instead of truncating them; only an incomplete tail in the final segment can be truncated.
+- **Storage interface export.** `Store.InsertBatch` is exported so the shipper can call storage implementations across package boundaries.
+
+The shipper is a component and is not started by the current gateway command. `Run` reaches EOF at the current durable end rather than following future appends, and there is no automatic WAL segment reclamation. A crash after a successful insert but before the checkpoint commit can replay that batch, so these changes do not provide exactly-once delivery.
+
+See [Storage integration](#storage-integration) for the shipper flow and [Write-Ahead Log](#write-ahead-log) for recovery behavior.
 
 ### 03rd October, 2026: Asynchronous shipper, Store interface, and ClickHouse adapter
 
@@ -94,7 +113,7 @@ Earlier versions stopped at the scheduler, whose callback only logged events, an
 - **`fairgate.events` persistence.** Events are stored with their producer ID, event timestamp, sequence number, index, event type, and payload. The adapter follows the existing ClickHouse schema, including `ReplacingMergeTree`, monthly partitioning, and a 30-day TTL.
 - **Optional integration test.** An environment-gated ClickHouse test validates connectivity, batch insertion, and retrieval of persisted events. It does not run unless ClickHouse is configured.
 
-These changes provide the shipping and storage building blocks. Durable checkpoints, retry and backoff, and WAL segment reclamation are still separate upcoming steps, so database delivery guarantees are not yet documented. See [Planned storage integration](#planned-storage-integration).
+These changes provide the shipping and storage building blocks. Durable checkpoints, retry and backoff, and WAL segment reclamation are still separate upcoming steps, so database delivery guarantees are not yet documented. See [Storage integration](#storage-integration).
 
 ### 03rd October, 2026: Segmented WAL and group commit
 
@@ -160,18 +179,18 @@ flowchart TD
     Q -.->|"accepted ACK"| P
 ```
 
-Accepted events are appended to the WAL before they are enqueued and acknowledged to the client. The current scheduler callback logs the selected event's producer ID and sequence number. A pluggable event-processing interface and storage adapters are part of the planned modular architecture.
+Accepted events are appended to the WAL before they are enqueued and acknowledged to the client. The current scheduler callback logs the selected event's producer ID and sequence number. The WAL shipper exists as a separate component, but the server does not yet connect its runtime lifecycle to that shipper.
 
 The server's goroutine and context structure, including the shutdown path, is described in [Server lifecycle and graceful shutdown](#server-lifecycle-and-graceful-shutdown).
 
-### Planned extension
+### WAL shipping component
 
-The asynchronous shipper, `Store` interface, and ClickHouse adapter now exist as components. The diagram below shows the intended end-to-end design, in which the shipper reads from the WAL and gates segment reclamation on a durable checkpoint. Dashed elements are planned.
+The shipper reads durable WAL records from its checkpoint, inserts each batch through the `Store` interface, and commits the checkpoint only after insertion succeeds. The gateway command does not currently start this component. Segment reclamation remains planned.
 
 ```mermaid
 flowchart LR
     W[("Write-Ahead Log")]
-    SH["Shipper<br/>batching, retry, backoff"]
+    SH["Shipper<br/>WAL reader, batching, retry, backoff"]
     ST["Store interface"]
     CH[("ClickHouse")]
     CK["Durable checkpoint"]
@@ -184,7 +203,7 @@ flowchart LR
     CK -.->|"gates"| R
 
     classDef planned stroke-dasharray: 5 5,stroke-width:2px;
-    class CK,R planned;
+    class R planned;
 ```
 
 ### Component responsibilities
@@ -195,7 +214,9 @@ flowchart LR
 | `internal/wire` | Frame codec, event and acknowledgment types, validation. |
 | `internal/admit` | Token-bucket admission control. |
 | `internal/sched` | Per-producer bounded queues (including context-aware `EnqueueContext`) and the DRR scheduler. |
-| `internal/wal` | Segmented WAL, writer goroutine with group commit, segment rotation, synchronization, and ordered recovery. |
+| `internal/wal` | Segmented WAL, writer goroutine with group commit, segment rotation, synchronization, and ordered recovery with cross-segment validation. |
+| `internal/shipper` | Durable WAL reader, checkpoint load and atomic commit, batching, and retry with capped exponential backoff and jitter. |
+| `internal/store` | `Store` interface and the ClickHouse adapter. |
 
 ## Event lifecycle
 
@@ -344,6 +365,8 @@ The WAL stores serialized event records with a length field and a CRC32 checksum
 
 The log is stored as multiple segment files rather than one growing file. Each segment holds a sequence of records in the format above. The segment size is configurable. Before writing a record, the writer checks whether it would push the active segment past the limit, and if so rotates to a new segment first.
 
+A position in the log is identified by a segment ID and a byte offset within that segment. The shipper uses these positions for its checkpoint.
+
 ### Writer and group commit
 
 A dedicated `writerLoop` goroutine owns all WAL file operations. Callers of `Append()` submit a request to a shared channel and wait for the result, rather than writing to disk themselves. The writer collects requests into a batch, bounded by a maximum request count and a short collection delay, writes the records, and performs one `Sync()` for the whole batch. Every caller in the batch is then released, so no `Append()` returns before its record has been synchronized.
@@ -370,7 +393,7 @@ Closing the WAL stops new submissions, lets queued requests finish, then synchro
 
 ### Recovery
 
-On startup the WAL discovers its segments and scans them in order, record by record. An incomplete trailing record in the final segment is truncated to the last valid record boundary. Corrupt records and checksum mismatches in completed records are reported as errors.
+On startup the WAL discovers its segments and scans them in order, record by record. An incomplete trailing record in the **final** segment is truncated to the last valid record boundary. An incomplete record in any earlier segment is rejected as an error rather than truncated, because a completed segment should never end mid-record. Corrupt records and checksum mismatches in completed records are also reported as errors.
 
 ```mermaid
 flowchart TD
@@ -381,15 +404,21 @@ flowchart TD
     L -->|"Yes"| B2
     L -->|"No"| H["Recovery complete"]
     C -->|"Yes"| D{"Record complete?"}
-    D -->|"No: incomplete tail<br/>in final segment"| E["Truncate to last<br/>valid record boundary"]
+    D -->|"No: incomplete record"| FS{"Final segment?"}
+    FS -->|"Yes: incomplete tail"| E["Truncate to last<br/>valid record boundary"]
     E --> H
+    FS -->|"No"| G2["Report error"]
     D -->|"Yes"| F{"CRC32 matches?"}
     F -->|"No"| G["Report error"]
     F -->|"Yes"| I["Accept record"]
     I --> C
 ```
 
-Recovered events are replayed into the producer queues. The scheduler is started before replay so that it consumes events while the queues fill, which avoids a startup deadlock when a producer has more recovered events than its queue capacity. Shipper checkpoints and automated segment reclamation are planned extensions, so completed segments are currently retained.
+Recovered events are replayed into the producer queues. The scheduler is started before replay so that it consumes events while the queues fill, which avoids a startup deadlock when a producer has more recovered events than its queue capacity. Automated segment reclamation is a planned extension, so completed segments are currently retained even after the shipper has checkpointed past them.
+
+### Durable reader
+
+The shipper reads the WAL through a reader that stops at the WAL's synchronized durable end, so it never returns a record that has not been synced. For each record it verifies the length, CRC32, and JSON, and returns the event together with its start and end positions. It moves across segment boundaries automatically and can begin at any saved position.
 
 ## Backpressure and scheduling
 
@@ -500,6 +529,7 @@ if err := server.RunContext(ctx, ":9000", logger); err != nil {
 
 - The five-second grace period bounds the wait before forced connection closure. It does not guarantee that shutdown completes within five seconds, because a handler blocked in an operation that responds to neither connection closure nor context cancellation could still delay it.
 - There is no explicit queue-drain confirmation. The scheduler callback only logs events, so shutdown does not prove that every queued event was delivered downstream. Events appended to the WAL remain recoverable on the next startup.
+- The shipper is not part of this lifecycle. The server does not start, stop, or wait for it.
 
 ## Delivery semantics
 
@@ -511,12 +541,20 @@ if err := server.RunContext(ctx, ":9000", logger); err != nil {
 | Per-producer memory bounded | Yes, by queue capacity |
 | WAL split into segments with rotation | Yes |
 | Persisted records scanned across segments on restart | Yes |
+| Incomplete record in a non-final segment rejected on restart | Yes |
 | Recovered events replayed into queues on restart | Yes |
 | WAL write or sync failure surfaced to callers | Yes |
 | WAL kept open until all handlers exit during shutdown | Yes |
 | Explicit queue-drain confirmation on shutdown | No |
 | Shipper and ClickHouse adapter available | Yes |
-| Shipping survives a crash (checkpoint, retry, WAL-driven replay) | No (planned) |
+| Shipper reads only synchronized (durable) WAL records | Yes |
+| Shipper resumes from a durable WAL checkpoint after restart | Yes, when the shipper is run |
+| Checkpoint written atomically after a successful insert | Yes |
+| Failed storage batches retried with backoff | Yes, until success or context cancellation |
+| Batch may be inserted again after a crash before checkpoint commit | Yes (duplicates possible) |
+| Shipper automatically started by the gateway command | No |
+| Shipper follows new WAL appends continuously | No (`Run` returns at the current durable end) |
+| WAL segments reclaimed after shipping | No |
 | Acknowledgment implies database storage | No |
 | End-to-end exactly-once delivery | No |
 
@@ -534,25 +572,29 @@ The following values are currently fixed in the server and are expected to becom
 
 The WAL segment size is configurable. Group commit batching is bounded by a maximum request count and a short collection delay; refer to the `wal` package for the current options and defaults.
 
-## Planned storage integration
+The shipper is configured separately from the server. It takes a `BatchSize`, a checkpoint path, a `Store`, and a retry policy with a capped exponential delay and optional symmetric jitter. Because the gateway command does not start the shipper, these options are set by whatever code embeds it. Refer to the `shipper` package for the current options and defaults.
 
-ClickHouse is the initial storage backend. The `Store` interface and ClickHouse adapter are implemented, along with an asynchronous shipper that batches events for insertion. The remaining planned work is a shipper that reads from the WAL, retries failed inserts, and persists checkpoints.
+## Storage integration
+
+ClickHouse is the initial storage backend. The `Store` interface, ClickHouse adapter, and WAL-backed shipper are implemented. The remaining work is to wire the shipper into the gateway runtime, define its operational configuration and lifecycle, and reclaim segments only after they are no longer needed.
 
 ### Current building blocks
 
 | Component | Behavior |
 |---|---|
-| Shipper | Bounded in-memory channel with configurable `BatchSize`, `FlushInterval`, and `QueueSize`. `Submit(ctx, event)` is context-aware. |
+| Shipper | Reads from the WAL at the saved position, forms batches up to `BatchSize`, and inserts them through the `Store`. `Run(ctx)` processes currently available durable WAL records and returns at the durable end. |
+| Retry policy | Retries insertion errors with exponential backoff capped at a maximum delay, optional symmetric jitter, and context-aware cancellation. |
+| Checkpoint | JSON segment and byte offset. Missing files mean the beginning of the WAL; writes sync a temporary file and atomically rename it after each successful batch. |
 | `Store` interface | `InsertBatch(ctx, events)` and `Close()`. Backends plug in without changes to the shipper. |
 | ClickHouse adapter | Official Go client, configurable authentication, `Ping` health check, batched inserts with `PrepareBatch` and `Send`, graceful close. |
 | Integration test | Optional and environment-gated. Validates connectivity, batch insertion, and retrieval. |
 
 > [!NOTE]
-> **Database delivery guarantees are not yet documented.** The shipper buffers events in memory, and checkpointing, retry and backoff, and WAL-driven recovery of unshipped events are not implemented. Having a ClickHouse database or table available does not by itself make delivery durable or exactly-once.
+> **Database delivery guarantees remain limited.** The shipper can resume from its checkpoint and retries insertion failures, but the gateway command does not start it. A process crash after a successful insert but before checkpoint commit can result in the batch being inserted again. Exactly-once delivery is not provided, and completed WAL segments are not reclaimed.
 
-### Intended shipper ordering
+### Shipper ordering
 
-The intended design decouples producer acknowledgments from database availability: producers are acknowledged on WAL durability, and the shipper delivers to the database asynchronously. The checkpoint is written only after a batch insert succeeds.
+Producer acknowledgments remain based on WAL durability. When run separately, the shipper loads its checkpoint, reads batches from that position up to the durable WAL end, and delivers each batch to the store. It writes the checkpoint only after a batch insert succeeds.
 
 ```mermaid
 sequenceDiagram
@@ -562,26 +604,27 @@ sequenceDiagram
     participant DB as ClickHouse
     participant CK as Checkpoint
 
-    loop Until shutdown
-        SH->>W: Read next batch from last checkpoint
-        W-->>SH: Batch of records
-        loop Until insert succeeds
+    SH->>CK: Load checkpoint (start of WAL if missing)
+    loop Until durable WAL end is reached
+        SH->>W: Read next batch from current position
+        W-->>SH: Durable records (up to batch size or WAL end)
+        loop Until insert succeeds or context is canceled
             SH->>DB: Insert batch
             alt Insert fails
                 DB-->>SH: Error
-                SH->>SH: Backoff and retry same batch
+                SH->>SH: Wait with exponential backoff and jitter
             else Insert succeeds
                 DB-->>SH: OK
             end
         end
-        SH->>CK: Persist checkpoint
-        SH->>W: Release fully shipped segments
+        SH->>CK: Atomically persist batch end position
     end
+    SH-->>SH: Run returns at the durable end
 ```
 
 ### Duplicate handling
 
-A crash between a successful insert and the checkpoint write would cause the same batch to be inserted again after restart. The planned design addresses this with an idempotent table definition keyed on a unique event identity, so repeated inserts converge to a single row. Exact-count queries would need to account for merge timing until deduplication completes. Batch delivery, retry behavior, checkpoint ordering, and duplicate handling must be implemented and validated before database delivery guarantees are documented.
+A crash between a successful insert and the checkpoint write can cause the same batch to be inserted again after restart. The current schema uses `ReplacingMergeTree`, but deduplication is subject to ClickHouse merge behavior and does not make insertion exactly once. The shipper also processes only the durable records available when `Run` reaches the WAL end; callers must manage its lifecycle if they need to pick up later appends.
 
 ### Schema
 
@@ -593,20 +636,22 @@ The roadmap lists planned work in dependency order. Items are subject to change.
 
 ```mermaid
 flowchart TD
-    P1["Phase 1: Core ingestion (implemented)<br/>TCP server, wire protocol, admission control<br/>Per-producer queues, DRR scheduling<br/>Segmented WAL with group commit and ordered recovery<br/>Context-aware lifecycle and graceful shutdown<br/>Async shipper, Store interface, ClickHouse adapter"]
-    P2["Phase 2: Durable delivery (planned)<br/>WAL-driven shipping, checkpoints<br/>Retry and backoff<br/>WAL segment reclamation"]
+    P1["Phase 1: Core ingestion (implemented)<br/>TCP server, wire protocol, admission control<br/>Per-producer queues, DRR scheduling<br/>Segmented WAL with group commit and ordered recovery<br/>Context-aware lifecycle and graceful shutdown<br/>Store interface, ClickHouse adapter"]
+    P2["Phase 2: Durable delivery (in progress)<br/>WAL shipping, checkpoints, retry and backoff implemented<br/>Runtime wiring and WAL segment reclamation planned"]
     P3["Phase 3: Fairness and overload control (planned)<br/>Producer weights, backlog-aware overload handling<br/>Load shedding"]
     P4["Phase 4: Operability and hardening (planned)<br/>Metrics, profiling, dashboards<br/>Load, reconcile, and chaos tools, protocol hardening"]
 
     P1 --> P2 --> P3 --> P4
 
     classDef done stroke-width:3px;
+    classDef active stroke-dasharray: 2 2,stroke-width:3px;
     classDef planned stroke-dasharray: 5 5,stroke-width:2px;
     class P1 done;
-    class P2,P3,P4 planned;
+    class P2 active;
+    class P3,P4 planned;
 ```
 
-A solid border marks implemented work. Dashed borders mark planned work.
+A solid border marks implemented work, a finely dashed thick border marks work in progress, and a coarsely dashed border marks planned work.
 
 | Area | Status |
 |---|---|
@@ -614,12 +659,14 @@ A solid border marks implemented work. Dashed borders mark planned work.
 | Per-producer queues, DRR scheduling | Implemented |
 | WAL append and recovery | Implemented |
 | WAL segmentation and group commit | Implemented |
+| Cross-segment recovery validation | Implemented |
 | Context-aware lifecycle, connection tracking, graceful shutdown | Implemented |
 | Cancelable enqueueing and scheduler error propagation | Implemented |
-| Asynchronous shipper, `Store` interface, ClickHouse adapter | Implemented |
+| `Store` interface, ClickHouse adapter | Implemented |
 | Optional ClickHouse integration test | Implemented |
-| WAL-driven shipping | Planned |
-| Checkpoints, retry, backoff | Planned |
+| Durable WAL reader and checkpoint-based batch shipping component | Implemented (not wired into gateway runtime) |
+| Durable checkpoints and retry with backoff | Implemented |
+| Shipper runtime wiring and lifecycle | Planned |
 | WAL segment reclamation | Planned |
 | Producer weights and richer fairness controls | Planned |
 | Backlog-aware overload handling | Planned |
@@ -636,6 +683,8 @@ FairGate/
 │   ├── admit/       # Admission control
 │   ├── sched/       # Producer queues and DRR scheduler
 │   ├── server/      # TCP listener and connection handling
+│   ├── shipper/     # WAL reader loop, checkpoints, retry/backoff
+│   ├── store/       # Storage interface and ClickHouse adapter
 │   ├── wal/         # Segmented WAL, group commit, and recovery
 │   └── wire/        # Frame codec, event and ACK types
 ├── data/            # Local WAL data (runtime; do not commit)
@@ -681,13 +730,15 @@ FairGate is an experimental beta. Interfaces, protocol details, configuration, a
 
 Known limitations of the current beta:
 
-- The shipper buffers events in memory and has no checkpointing, retry and backoff, or WAL-driven replay, so events not yet inserted can be lost from the database path on a crash. They remain in the WAL, but nothing re-ships them yet.
+- The WAL-backed shipper is implemented but not started by the gateway command. Operators must run and manage it separately; it processes durable records through the current WAL end and does not continuously tail later appends.
+- A crash after a successful database insert but before checkpoint commit can replay that batch. Storage therefore needs to tolerate duplicates; end-to-end exactly-once delivery is not guaranteed.
 - The ClickHouse integration test is optional and runs only when the environment is configured for it.
-- The WAL is segmented with group commit, but completed segments are not reclaimed automatically; reclamation depends on the planned shipper checkpoints.
+- The WAL is segmented with group commit, but completed segments are not reclaimed automatically. Checkpoints exist, but reclamation is still unimplemented.
 - Queue capacity, DRR quantum, and the shutdown grace period are fixed in the server and not yet configurable.
 - All producers receive equal scheduling treatment. Weights are not yet supported.
 - Enqueueing blocks on a full queue (cancelable during shutdown), and no load-shedding policy exists yet.
 - A WAL write, rotation, or sync failure is fatal: later appends are rejected until the WAL is reopened.
+- Startup recovery fails on an incomplete record in any non-final segment, rather than repairing it.
 - Shutdown has no explicit queue-drain confirmation, and a handler stuck in an operation that ignores connection closure and context cancellation can delay it beyond the grace period.
 - No metrics, profiling endpoints, or dashboards are provided.
 

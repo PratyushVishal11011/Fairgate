@@ -76,7 +76,7 @@ func TestReaderNext(t *testing.T) {
 			}
 		}
 
-		if record.End.offset <= record.Start.offset {
+		if record.End.Offset <= record.Start.Offset {
 			t.Fatalf(
 				"record %d has invalid boundaries: start=%+v end=%+v",
 				i,
@@ -267,8 +267,8 @@ func TestReaderStartsFromPosition(t *testing.T) {
 	}
 
 	reader := NewReader(wal, Position{
-		segmentId: 1,
-		offset:    0,
+		SegmentId: 1,
+		Offset:    0,
 	})
 
 	record, err := reader.Next()
