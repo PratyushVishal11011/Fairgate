@@ -74,88 +74,109 @@ func (reader *Reader) openSegment() error {
 }
 
 func (reader *Reader) Next() (Record, error) {
-	if err := reader.openSegment(); err != nil {
-		return Record{}, err
-	}
-	start := reader.position
+	//modifying this function to make sure that when the current segment has no more durable data and there is a later durable segment,
+	//close the current file, advance segmentId, reset offset to 0, and continue reading.
+	for {
+		if err := reader.openSegment(); err != nil {
+			return Record{}, err
+		}
+		start := reader.position
 
-	if !reader.canRead(8) {
-		return Record{}, io.EOF
-	}
+		//debug ONLY
+		//TODO: Come up with a better solution for this
+		fileInfo, err := reader.file.Stat()
 
-	header := make([]byte, 8)
-	_, err := reader.file.ReadAt(header, reader.position.offset)
-	if err != nil {
-		if errors.Is(err, io.EOF) {
+		if reader.position.offset+8 > fileInfo.Size() {
+			durable := reader.wal.DurableEnd()
+			if reader.position.segmentId < durable.segmentId {
+				if err := reader.closeFile(); err != nil {
+					return Record{}, err
+				}
+
+				reader.position = Position{
+					segmentId: reader.position.segmentId + 1,
+					offset:    0,
+				}
+				continue
+			}
 			return Record{}, io.EOF
 		}
-		return Record{}, err
-	}
 
-	payloadLength := binary.BigEndian.Uint32(header[0:4])
+		header := make([]byte, 8)
+		_, err = reader.file.ReadAt(header, reader.position.offset)
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				return Record{}, io.EOF
+			}
+			return Record{}, err
+		}
 
-	if payloadLength > maxRecordSize {
-		return Record{}, fmt.Errorf(
-			"WAL record too large at segment %d offset %d",
-			reader.position.segmentId,
-			reader.position.offset,
-		)
-	}
+		payloadLength := binary.BigEndian.Uint32(header[0:4])
 
-	recordSize := int64(8 + payloadLength)
-	if !reader.canRead(recordSize) {
-		return Record{}, io.EOF
-	}
-
-	expectedCRC := binary.BigEndian.Uint32(header[4:8])
-
-	payload := make([]byte, payloadLength)
-	payloadOffset := reader.position.offset + 8
-
-	_, err = reader.file.ReadAt(payload, payloadOffset)
-
-	if err != nil {
-		if errors.Is(err, io.EOF) {
+		if payloadLength > maxRecordSize {
 			return Record{}, fmt.Errorf(
-				"incomplete WAL record at segment %d offset %d",
+				"WAL record too large at segment %d offset %d",
 				reader.position.segmentId,
 				reader.position.offset,
 			)
 		}
-		return Record{}, err
+
+		recordSize := int64(8 + payloadLength)
+
+		if !reader.canRead(recordSize) {
+			return Record{}, io.EOF
+		}
+
+		expectedCRC := binary.BigEndian.Uint32(header[4:8])
+
+		payload := make([]byte, payloadLength)
+		payloadOffset := reader.position.offset + 8
+
+		_, err = reader.file.ReadAt(payload, payloadOffset)
+
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				return Record{}, fmt.Errorf(
+					"incomplete WAL record at segment %d offset %d",
+					reader.position.segmentId,
+					reader.position.offset,
+				)
+			}
+			return Record{}, err
+		}
+
+		actualCRC := crc32.ChecksumIEEE(payload)
+		if actualCRC != expectedCRC {
+			return Record{}, fmt.Errorf(
+				"WAL checksum mismatch at segment %d offset %d",
+				reader.position.segmentId,
+				reader.position.offset,
+			)
+		}
+
+		var event wire.Event
+		if err := json.Unmarshal(payload, &event); err != nil {
+			return Record{}, fmt.Errorf(
+				"invalid WAL event at segment %d offset %d: %w",
+				reader.position.segmentId,
+				reader.position.offset,
+				err,
+			)
+		}
+
+		end := Position{
+			segmentId: reader.position.segmentId,
+			offset:    reader.position.offset + 8 + int64(payloadLength),
+		}
+
+		reader.position = end
+
+		return Record{
+			Event: event,
+			Start: start,
+			End:   end,
+		}, nil
 	}
-
-	actualCRC := crc32.ChecksumIEEE(payload)
-	if actualCRC != expectedCRC {
-		return Record{}, fmt.Errorf(
-			"WAL checksum mismatch at segment %d offset %d",
-			reader.position.segmentId,
-			reader.position.offset,
-		)
-	}
-
-	var event wire.Event
-	if err := json.Unmarshal(payload, &event); err != nil {
-		return Record{}, fmt.Errorf(
-			"invalid WAL event at segment %d offset %d: %w",
-			reader.position.segmentId,
-			reader.position.offset,
-			err,
-		)
-	}
-
-	end := Position{
-		segmentId: reader.position.segmentId,
-		offset:    reader.position.offset + 8 + int64(payloadLength),
-	}
-
-	reader.position = end
-
-	return Record{
-		Event: event,
-		Start: start,
-		End:   end,
-	}, nil
 }
 
 func (reader *Reader) canRead(size int64) bool {

@@ -198,6 +198,92 @@ func TestReaderDetectsChecksumMismatch(t *testing.T) {
 	}
 }
 
+func TestReaderAcrossSegments(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "events.wal")
+
+	wal, err := openWithSegmentSize(path, 200)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer wal.Close()
+
+	events := []wire.Event{
+		testReaderEvent("producer-1", 1, 1, "first event"),
+		testReaderEvent("producer-1", 2, 2, "second event"),
+		testReaderEvent("producer-1", 3, 3, "third event"),
+	}
+
+	for _, event := range events {
+		if err := wal.Append(event); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	reader := NewReader(wal, Position{})
+
+	for i, expected := range events {
+		record, err := reader.Next()
+		if err != nil {
+			t.Fatalf("reading event %d: %v", i, err)
+		}
+
+		if !reflect.DeepEqual(record.Event, expected) {
+			t.Fatalf(
+				"event %d mismatch: expected %+v, got %+v",
+				i,
+				expected,
+				record.Event,
+			)
+		}
+	}
+
+	_, err = reader.Next()
+	if !errors.Is(err, io.EOF) {
+		t.Fatalf("expected io.EOF, got %v", err)
+	}
+}
+
+func TestReaderStartsFromPosition(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "events.wal")
+
+	wal, err := openWithSegmentSize(path, 200)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer wal.Close()
+
+	events := []wire.Event{
+		testReaderEvent("producer-1", 1, 1, "first event"),
+		testReaderEvent("producer-1", 2, 2, "second event"),
+		testReaderEvent("producer-1", 3, 3, "third event"),
+	}
+
+	for _, event := range events {
+		if err := wal.Append(event); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	reader := NewReader(wal, Position{
+		segmentId: 1,
+		offset:    0,
+	})
+
+	record, err := reader.Next()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if !reflect.DeepEqual(record.Event, events[1]) {
+		t.Fatalf(
+			"expected second event, got %+v",
+			record.Event,
+		)
+	}
+}
+
 func contains(value, target string) bool {
 	return len(value) >= len(target) && value[:len(target)] == target
 }
