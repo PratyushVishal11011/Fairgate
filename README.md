@@ -7,7 +7,7 @@ FairGate is a modular event-ingestion gateway. It accepts framed event streams o
 The project explores fair resource sharing in event-ingestion systems: keeping producers isolated from one another through bounded buffering, admission limits, and fair scheduling. FairGate is being developed as an open-source foundation that can be extended with different storage backends and downstream processing components.
 
 > [!IMPORTANT]
-> **Beta status.** FairGate is under active development. The current implementation provides TCP ingestion, event decoding and validation, admission control, per-producer bounded queues, DRR scheduling, a segmented WAL with group commit and ordered recovery, acknowledgments, and context-aware graceful shutdown. The shipper can read durable WAL records from a persisted checkpoint, batch them for a `Store`, retry failed inserts with capped exponential backoff and jitter, and atomically persist progress after successful inserts. The gateway command does not currently wire this shipper into its runtime, and WAL segment reclamation, advanced overload control, and production observability are not implemented.
+> **Beta status.** FairGate is under active development. The current implementation provides TCP ingestion, event decoding and validation, admission control, per-producer bounded queues, DRR scheduling, a segmented WAL with group commit and ordered recovery, acknowledgments, and context-aware graceful shutdown. The shipper can read durable WAL records from a persisted checkpoint, batch them for a `Store`, retry failed inserts with capped exponential backoff and jitter, and atomically persist progress after successful inserts. The gateway runtime starts the shipper when `FAIRGATE_SHIPPER_ENABLED=true`, and a Docker Compose stack runs FairGate with ClickHouse. WAL segment reclamation, advanced overload control, and production observability are not implemented.
 
 ## Table of Contents
 
@@ -27,6 +27,7 @@ The project explores fair resource sharing in event-ingestion systems: keeping p
 - [Roadmap](#roadmap)
 - [Project structure](#project-structure)
 - [Getting started](#getting-started)
+- [Docker deployment](#docker-deployment)
 - [Development status and limitations](#development-status-and-limitations)
 - [Contributing](#contributing)
 - [License](#license)
@@ -56,12 +57,14 @@ The project explores fair resource sharing in event-ingestion systems: keeping p
 - **WAL recovery.** Discovers segments, scans them in order on startup, truncates an incomplete trailing record in the final segment only, rejects incomplete records in earlier segments, and replays recovered events into the producer queues.
 - **WAL fatal error handling.** Write, rotation, and synchronization failures are recorded as fatal; affected requests receive an error and later batches are rejected.
 - **Durable WAL reader.** Reads records only up to the WAL's synchronized durable end, verifies length, CRC32, and JSON, returns each event with its start and end positions, and advances across segment boundaries from any saved position.
-- **WAL-backed batch shipper.** `Shipper.Run(ctx)` loads the checkpoint, reads durable records in order up to `BatchSize`, and sends each batch to the configured `Store`. It returns when it reaches the current durable WAL end.
+- **WAL-backed batch shipper.** `Shipper.Run(ctx)` loads the checkpoint, reads durable records in order up to `BatchSize`, and sends each batch to the configured `Store`. At the durable WAL end it polls for new records and keeps running until its context is canceled.
+- **Gateway shipper runtime.** When `FAIRGATE_SHIPPER_ENABLED=true`, `RunContext` starts the shipper alongside the server, and shutdown stops and joins it before the store and WAL are closed.
 - **Retry with backoff.** Retries failed batch inserts with capped exponential delay, configurable jitter, and context-aware waiting. The same batch is retried until it succeeds or the context is canceled.
 - **Durable checkpoints.** Stores the last successfully inserted record position as a segment and offset. Checkpoints are written through a synced temporary file followed by an atomic rename; a missing checkpoint starts reading at the beginning of the WAL, and invalid JSON or negative offsets are rejected.
 - **Store interface.** `InsertBatch(ctx, events)` and `Close()` separate storage from the processing pipeline.
 - **ClickHouse adapter.** Official Go client with configurable authentication, `Ping` health checks, batched inserts through `PrepareBatch` and `Send`, and graceful cleanup.
 - **Optional ClickHouse integration test.** Environment-gated test covering connectivity, batch insertion, and retrieval.
+- **Docker deployment.** A `Dockerfile` and Compose stack run FairGate with ClickHouse, with the shipper enabled and FairGate started only after ClickHouse reports healthy. `install-docker-ubuntu.sh` installs Docker Engine and the Compose plugin on Ubuntu.
 - **Acknowledgments.** Sends an accepted acknowledgment after the event has been appended to the WAL and enqueued.
 - **Concurrent connections.** Handles client connections in separate goroutines and tracks them for coordinated shutdown.
 - **Context-aware lifecycle.** `RunContext` lets the caller control server lifetime through a `context.Context`.
@@ -72,7 +75,6 @@ The project explores fair resource sharing in event-ingestion systems: keeping p
 
 ### Planned
 
-- Wiring the WAL shipper into the gateway runtime and defining its lifecycle/configuration
 - WAL segment reclamation after safely shipped segments are no longer needed
 - Configurable producer weights and richer fairness controls
 - Backlog-aware overload handling and load shedding
@@ -84,6 +86,14 @@ The project explores fair resource sharing in event-ingestion systems: keeping p
 Planned capabilities are not implied to be available in this beta.
 
 ## Recent updates
+
+### 05th October, 2026: Gateway shipper runtime and Docker deployment
+
+The gateway can now start the WAL shipper as part of `RunContext` when `FAIRGATE_SHIPPER_ENABLED=true`. The shipper polls the durable WAL end for new records, retries ClickHouse insert failures, and persists its checkpoint after successful batches. Docker Compose passes the ClickHouse connection settings and waits for ClickHouse health before starting FairGate. The `install-docker-ubuntu.sh` script installs Docker Engine and the Compose plugin on Ubuntu.
+
+For remote access, publish TCP port `9001` on a non-loopback interface and allow inbound TCP `9001` through the host firewall.
+
+See [Docker deployment](#docker-deployment) and [Storage integration](#storage-integration).
 
 ### 05th October, 2026: WAL shipping, durable checkpoints, and retry backoff
 
@@ -97,7 +107,7 @@ The latest changes connect the storage building blocks to a WAL-reading shipper.
 - **Cross-segment recovery validation.** Recovery now rejects incomplete records in non-final segments instead of truncating them; only an incomplete tail in the final segment can be truncated.
 - **Storage interface export.** `Store.InsertBatch` is exported so the shipper can call storage implementations across package boundaries.
 
-The shipper is a component and is not started by the current gateway command. `Run` reaches EOF at the current durable end rather than following future appends, and there is no automatic WAL segment reclamation. A crash after a successful insert but before the checkpoint commit can replay that batch, so these changes do not provide exactly-once delivery.
+At this stage the shipper was a standalone component: it was not started by the gateway command, `Run` returned at the current durable end instead of following later appends, and there was no automatic WAL segment reclamation. The gateway runtime wiring and polling were added in the update above. A crash after a successful insert but before the checkpoint commit can replay that batch, so these changes do not provide exactly-once delivery.
 
 See [Storage integration](#storage-integration) for the shipper flow and [Write-Ahead Log](#write-ahead-log) for recovery behavior.
 
@@ -153,7 +163,7 @@ See [Server lifecycle and graceful shutdown](#server-lifecycle-and-graceful-shut
 
 ### Current implementation
 
-The diagram below shows the ingestion path as implemented today.
+The diagram below shows the ingestion path and the separate, opt-in WAL shipping path in the gateway runtime.
 
 ```mermaid
 flowchart TD
@@ -167,6 +177,7 @@ flowchart TD
         Q["Per-producer bounded queues"]
         D["DRR scheduler<br/>configurable quantum"]
         C["Event callback<br/>currently logs producer ID and sequence"]
+        SH["WAL shipper<br/>opt-in: FAIRGATE_SHIPPER_ENABLED"]
 
         S --> A
         A --> W
@@ -174,18 +185,20 @@ flowchart TD
         Q --> D
         D --> C
         W -.->|"recovered events at startup"| Q
+        W -.->|"durable records, polled"| SH
     end
 
     Q -.->|"accepted ACK"| P
+    SH -->|"batched inserts"| CHDB[("ClickHouse")]
 ```
 
-Accepted events are appended to the WAL before they are enqueued and acknowledged to the client. The current scheduler callback logs the selected event's producer ID and sequence number. The WAL shipper exists as a separate component, but the server does not yet connect its runtime lifecycle to that shipper.
+Accepted events are appended to the WAL before they are enqueued and acknowledged to the client. The scheduler callback logs selected events. When `FAIRGATE_SHIPPER_ENABLED=true`, the server starts a WAL shipper that writes batches to ClickHouse independently of the scheduler.
 
 The server's goroutine and context structure, including the shutdown path, is described in [Server lifecycle and graceful shutdown](#server-lifecycle-and-graceful-shutdown).
 
 ### WAL shipping component
 
-The shipper reads durable WAL records from its checkpoint, inserts each batch through the `Store` interface, and commits the checkpoint only after insertion succeeds. The gateway command does not currently start this component. Segment reclamation remains planned.
+The server starts the shipper when `FAIRGATE_SHIPPER_ENABLED=true`. It reads durable WAL records from its checkpoint, inserts each batch through the `Store` interface, and commits the checkpoint only after insertion succeeds. It polls at the WAL end for new durable records. Segment reclamation remains planned.
 
 ```mermaid
 flowchart LR
@@ -210,12 +223,12 @@ flowchart LR
 
 | Package | Responsibility |
 |---|---|
-| `internal/server` | TCP listener, per-connection goroutines, connection tracking, frame handling, acknowledgment delivery, server lifecycle (`RunContext`), and graceful shutdown. |
+| `internal/server` | TCP listener, per-connection goroutines, connection tracking, frame handling, acknowledgment delivery, server lifecycle (`RunContext`), optional shipper startup and shutdown, and graceful shutdown. |
 | `internal/wire` | Frame codec, event and acknowledgment types, validation. |
 | `internal/admit` | Token-bucket admission control. |
 | `internal/sched` | Per-producer bounded queues (including context-aware `EnqueueContext`) and the DRR scheduler. |
 | `internal/wal` | Segmented WAL, writer goroutine with group commit, segment rotation, synchronization, and ordered recovery with cross-segment validation. |
-| `internal/shipper` | Durable WAL reader, checkpoint load and atomic commit, batching, and retry with capped exponential backoff and jitter. |
+| `internal/shipper` | Durable WAL reader, checkpoint load and atomic commit, batching, polling at the durable end, and retry with capped exponential backoff and jitter. |
 | `internal/store` | `Store` interface and the ClickHouse adapter. |
 
 ## Event lifecycle
@@ -255,6 +268,8 @@ sequenceDiagram
 An `accepted` ACK reflects WAL durability and queue admission. It does not reflect downstream storage. See [Delivery semantics](#delivery-semantics).
 
 If shutdown cancels the handler while it is waiting for queue space, the event has already been appended to the WAL but is not acknowledged. It remains available for recovery on the next startup.
+
+When the shipper is enabled, it picks the event up from the WAL separately, after the event is durable and independently of the scheduler.
 
 ## Event model
 
@@ -424,7 +439,7 @@ The shipper reads the WAL through a reader that stops at the WAL's synchronized 
 
 Each producer has its own bounded queue. The queue capacity is configured when the queue manager is created, and the server currently uses 256 events per producer. Enqueueing blocks when a producer's queue is full, applying backpressure to the caller instead of allowing the queue to grow without bound. In the connection handler the wait is context-aware (`EnqueueContext`), so a blocked handler can stop waiting if shutdown is forced.
 
-The DRR scheduler visits producer queues and processes available events up to its configured quantum (currently 8 in the server). The scheduler is independent of event meaning, and its callback is responsible for downstream handling. At this beta stage, the callback only logs events.
+The DRR scheduler visits producer queues and processes available events up to its configured quantum (currently 8 in the server). The scheduler is independent of event meaning, and its callback is responsible for downstream handling. At this beta stage, the callback only logs events; database delivery is handled by the separate WAL shipper.
 
 ```mermaid
 flowchart TD
@@ -469,11 +484,13 @@ flowchart TD
     ACC["Accept loop"]
     H["Handler goroutines<br/>one per connection<br/>controlled by handlerCtx"]
     SCH["Scheduler goroutine<br/>controlled by schedulerCtx"]
+    SHP["Shipper goroutine (optional)<br/>FAIRGATE_SHIPPER_ENABLED"]
     TRK["Tracking state<br/>handlerWG and activeConns<br/>guarded by connMu"]
 
     CALLER --> WATCH
     CALLER --> ACC
     CALLER --> SCH
+    CALLER -.-> SHP
     ACC -->|"registers and spawns"| H
     ACC --> TRK
     H -->|"deregisters on exit"| TRK
@@ -500,10 +517,11 @@ flowchart TD
     D -->|"No"| E["Close active connections<br/>and cancel handler context"]
     E --> F
     F --> G["6. Cancel scheduler<br/>and wait for it to exit"]
-    G --> H["7. Return from RunContext<br/>deferred cleanup closes the WAL and listener"]
+    G --> G2["7. Stop and join the shipper<br/>(if enabled)"]
+    G2 --> H["8. Return from RunContext<br/>deferred cleanup closes the store, WAL, and listener"]
 ```
 
-The ordering is deliberate. The WAL is closed only after every tracked handler has exited, so no handler can append to a closed log. Closing the WAL then drains queued append requests and synchronizes the active segment before the writer exits. The scheduler keeps running during the grace period so queued events continue to be processed while handlers drain.
+The ordering is deliberate. The WAL is closed only after every tracked handler has exited, so no handler can append to a closed log, and only after the shipper has stopped, so the shipper never reads from a closed log or writes to a closed store. Closing the WAL then drains queued append requests and synchronizes the active segment before the writer exits. The scheduler keeps running during the grace period so queued events continue to be processed while handlers drain.
 
 ### Behavior details
 
@@ -525,11 +543,13 @@ if err := server.RunContext(ctx, ":9000", logger); err != nil {
 }
 ```
 
+The listen address is chosen by the caller. The Docker Compose stack publishes port `9001`; see [Docker deployment](#docker-deployment).
+
 ### Limitations
 
 - The five-second grace period bounds the wait before forced connection closure. It does not guarantee that shutdown completes within five seconds, because a handler blocked in an operation that responds to neither connection closure nor context cancellation could still delay it.
 - There is no explicit queue-drain confirmation. The scheduler callback only logs events, so shutdown does not prove that every queued event was delivered downstream. Events appended to the WAL remain recoverable on the next startup.
-- The shipper is not part of this lifecycle. The server does not start, stop, or wait for it.
+- When enabled, the server stops and joins the shipper during shutdown before closing the store and WAL. Events not yet shipped at that point stay in the WAL and are picked up from the checkpoint on the next start.
 
 ## Delivery semantics
 
@@ -548,12 +568,14 @@ if err := server.RunContext(ctx, ":9000", logger); err != nil {
 | Explicit queue-drain confirmation on shutdown | No |
 | Shipper and ClickHouse adapter available | Yes |
 | Shipper reads only synchronized (durable) WAL records | Yes |
-| Shipper resumes from a durable WAL checkpoint after restart | Yes, when the shipper is run |
+| Shipper resumes from a durable WAL checkpoint after restart | Yes, when `FAIRGATE_SHIPPER_ENABLED=true` |
 | Checkpoint written atomically after a successful insert | Yes |
 | Failed storage batches retried with backoff | Yes, until success or context cancellation |
 | Batch may be inserted again after a crash before checkpoint commit | Yes (duplicates possible) |
-| Shipper automatically started by the gateway command | No |
-| Shipper follows new WAL appends continuously | No (`Run` returns at the current durable end) |
+| Shipper started by the gateway runtime | Yes, when `FAIRGATE_SHIPPER_ENABLED=true` |
+| Shipper stopped and joined before the store and WAL close | Yes |
+| Shipper follows new WAL appends continuously | Yes, by polling at the durable end |
+| Events are shipped when the shipper is not enabled | No |
 | WAL segments reclaimed after shipping | No |
 | Acknowledgment implies database storage | No |
 | End-to-end exactly-once delivery | No |
@@ -572,17 +594,30 @@ The following values are currently fixed in the server and are expected to becom
 
 The WAL segment size is configurable. Group commit batching is bounded by a maximum request count and a short collection delay; refer to the `wal` package for the current options and defaults.
 
-The shipper is configured separately from the server. It takes a `BatchSize`, a checkpoint path, a `Store`, and a retry policy with a capped exponential delay and optional symmetric jitter. Because the gateway command does not start the shipper, these options are set by whatever code embeds it. Refer to the `shipper` package for the current options and defaults.
+### Shipper and ClickHouse
+
+The shipper is configured through environment variables.
+
+| Variable | Description |
+|---|---|
+| `FAIRGATE_SHIPPER_ENABLED` | Set to `true` to start the shipper with the gateway. When unset or not `true`, events stay in the WAL and are not shipped. |
+| `FAIRGATE_CHECKPOINT_PATH` | Checkpoint file location. Defaults to `data/checkpoint.json`. |
+| `CLICKHOUSE_ADDR` | ClickHouse address. |
+| `CLICKHOUSE_DATABASE` | ClickHouse database. |
+| `CLICKHOUSE_USER` | ClickHouse user. |
+| `CLICKHOUSE_PASSWORD` | ClickHouse password. |
+
+When enabled, the gateway runtime configures the shipper with a batch size of 100 and a one-second WAL polling interval. The retry policy starts at one second, caps at 30 seconds, doubles between attempts, and applies 20% symmetric jitter. These shipper values are currently fixed in the runtime.
 
 ## Storage integration
 
-ClickHouse is the initial storage backend. The `Store` interface, ClickHouse adapter, and WAL-backed shipper are implemented. The remaining work is to wire the shipper into the gateway runtime, define its operational configuration and lifecycle, and reclaim segments only after they are no longer needed.
+ClickHouse is the initial storage backend. The `Store` interface, ClickHouse adapter, and WAL-backed shipper are implemented and can be started by the gateway runtime with `FAIRGATE_SHIPPER_ENABLED=true`. The remaining storage work is automatic WAL segment reclamation after segments are safely shipped.
 
 ### Current building blocks
 
 | Component | Behavior |
 |---|---|
-| Shipper | Reads from the WAL at the saved position, forms batches up to `BatchSize`, and inserts them through the `Store`. `Run(ctx)` processes currently available durable WAL records and returns at the durable end. |
+| Shipper | Reads from the WAL at the saved position, forms batches up to `BatchSize`, and inserts them through the `Store`. `Run(ctx)` polls for newly durable records and runs until its context is canceled. |
 | Retry policy | Retries insertion errors with exponential backoff capped at a maximum delay, optional symmetric jitter, and context-aware cancellation. |
 | Checkpoint | JSON segment and byte offset. Missing files mean the beginning of the WAL; writes sync a temporary file and atomically rename it after each successful batch. |
 | `Store` interface | `InsertBatch(ctx, events)` and `Close()`. Backends plug in without changes to the shipper. |
@@ -590,11 +625,11 @@ ClickHouse is the initial storage backend. The `Store` interface, ClickHouse ada
 | Integration test | Optional and environment-gated. Validates connectivity, batch insertion, and retrieval. |
 
 > [!NOTE]
-> **Database delivery guarantees remain limited.** The shipper can resume from its checkpoint and retries insertion failures, but the gateway command does not start it. A process crash after a successful insert but before checkpoint commit can result in the batch being inserted again. Exactly-once delivery is not provided, and completed WAL segments are not reclaimed.
+> **Database delivery guarantees remain limited.** The shipper can resume from its checkpoint and retries insertion failures when enabled. A process crash after a successful insert but before checkpoint commit can result in the batch being inserted again. Exactly-once delivery is not provided, and completed WAL segments are not reclaimed.
 
 ### Shipper ordering
 
-Producer acknowledgments remain based on WAL durability. When run separately, the shipper loads its checkpoint, reads batches from that position up to the durable WAL end, and delivers each batch to the store. It writes the checkpoint only after a batch insert succeeds.
+Producer acknowledgments remain based on WAL durability. The shipper loads its checkpoint, reads batches from that position up to the durable WAL end, and delivers each batch to the store. It writes the checkpoint only after a batch insert succeeds, then polls for later appends.
 
 ```mermaid
 sequenceDiagram
@@ -605,26 +640,29 @@ sequenceDiagram
     participant CK as Checkpoint
 
     SH->>CK: Load checkpoint (start of WAL if missing)
-    loop Until durable WAL end is reached
+    loop While running
         SH->>W: Read next batch from current position
-        W-->>SH: Durable records (up to batch size or WAL end)
-        loop Until insert succeeds or context is canceled
-            SH->>DB: Insert batch
-            alt Insert fails
-                DB-->>SH: Error
-                SH->>SH: Wait with exponential backoff and jitter
-            else Insert succeeds
-                DB-->>SH: OK
+        alt Records available
+            W-->>SH: Durable records (up to batch size or WAL end)
+            loop Until insert succeeds or context is canceled
+                SH->>DB: Insert batch
+                alt Insert fails
+                    DB-->>SH: Error
+                    SH->>SH: Wait with exponential backoff and jitter
+                else Insert succeeds
+                    DB-->>SH: OK
+                end
             end
+            SH->>CK: Atomically persist batch end position
+        else At durable end
+            SH->>SH: Wait for poll interval
         end
-        SH->>CK: Atomically persist batch end position
     end
-    SH-->>SH: Run returns at the durable end
 ```
 
 ### Duplicate handling
 
-A crash between a successful insert and the checkpoint write can cause the same batch to be inserted again after restart. The current schema uses `ReplacingMergeTree`, but deduplication is subject to ClickHouse merge behavior and does not make insertion exactly once. The shipper also processes only the durable records available when `Run` reaches the WAL end; callers must manage its lifecycle if they need to pick up later appends.
+A crash between a successful insert and the checkpoint write can cause the same batch to be inserted again after restart. The current schema uses `ReplacingMergeTree`, but deduplication is subject to ClickHouse merge behavior and does not make insertion exactly once.
 
 ### Schema
 
@@ -637,7 +675,7 @@ The roadmap lists planned work in dependency order. Items are subject to change.
 ```mermaid
 flowchart TD
     P1["Phase 1: Core ingestion (implemented)<br/>TCP server, wire protocol, admission control<br/>Per-producer queues, DRR scheduling<br/>Segmented WAL with group commit and ordered recovery<br/>Context-aware lifecycle and graceful shutdown<br/>Store interface, ClickHouse adapter"]
-    P2["Phase 2: Durable delivery (in progress)<br/>WAL shipping, checkpoints, retry and backoff implemented<br/>Runtime wiring and WAL segment reclamation planned"]
+    P2["Phase 2: Durable delivery (in progress)<br/>WAL shipping, checkpoints, retry and runtime wiring implemented<br/>WAL segment reclamation planned"]
     P3["Phase 3: Fairness and overload control (planned)<br/>Producer weights, backlog-aware overload handling<br/>Load shedding"]
     P4["Phase 4: Operability and hardening (planned)<br/>Metrics, profiling, dashboards<br/>Load, reconcile, and chaos tools, protocol hardening"]
 
@@ -664,9 +702,10 @@ A solid border marks implemented work, a finely dashed thick border marks work i
 | Cancelable enqueueing and scheduler error propagation | Implemented |
 | `Store` interface, ClickHouse adapter | Implemented |
 | Optional ClickHouse integration test | Implemented |
-| Durable WAL reader and checkpoint-based batch shipping component | Implemented (not wired into gateway runtime) |
+| Durable WAL reader and checkpoint-based batch shipping | Implemented |
 | Durable checkpoints and retry with backoff | Implemented |
-| Shipper runtime wiring and lifecycle | Planned |
+| Shipper runtime wiring and lifecycle | Implemented (opt-in with `FAIRGATE_SHIPPER_ENABLED`) |
+| Docker image, Compose stack, Ubuntu install script | Implemented |
 | WAL segment reclamation | Planned |
 | Producer weights and richer fairness controls | Planned |
 | Backlog-aware overload handling | Planned |
@@ -682,12 +721,15 @@ FairGate/
 ├── internal/
 │   ├── admit/       # Admission control
 │   ├── sched/       # Producer queues and DRR scheduler
-│   ├── server/      # TCP listener and connection handling
+│   ├── server/      # TCP listener, connection handling, shipper lifecycle
 │   ├── shipper/     # WAL reader loop, checkpoints, retry/backoff
 │   ├── store/       # Storage interface and ClickHouse adapter
 │   ├── wal/         # Segmented WAL, group commit, and recovery
 │   └── wire/        # Frame codec, event and ACK types
 ├── data/            # Local WAL data (runtime; do not commit)
+├── Dockerfile
+├── docker-compose.yml
+├── install-docker-ubuntu.sh
 ├── go.mod
 └── README.md
 ```
@@ -700,6 +742,7 @@ This reflects the current core packages. Additional packages and commands may be
 
 - Go toolchain compatible with the version declared in `go.mod`
 - Git
+- Docker Engine and Docker Compose plugin for container deployment
 
 ### Installation
 
@@ -722,7 +765,37 @@ go test ./...
 go test -race ./...
 ```
 
-The repository is being developed as a gateway implementation. A stable command-line interface and client SDK are planned. Check the repository's current entry point and configuration before attempting to launch a server.
+The repository is being developed as a gateway implementation. A stable command-line interface and client SDK are planned. Check the repository's current entry point and configuration before attempting to launch a server, or use the Compose stack described in [Docker deployment](#docker-deployment).
+
+## Docker deployment
+
+The Compose stack starts the FairGate TCP server, ClickHouse, Prometheus, and Grafana. It enables the shipper, waits for ClickHouse's health check, and persists the WAL and checkpoint in the `fairgate_wal` volume.
+
+On an Ubuntu VM, install Docker Engine and the Compose plugin with the included script, then start the stack:
+
+```bash
+./install-docker-ubuntu.sh
+sudo docker compose up --build -d
+sudo docker compose ps
+sudo docker compose logs -f fairgate clickhouse
+```
+
+For access from outside the host, edit the `fairgate` port mapping in `docker-compose.yml` from the loopback-only binding to:
+
+```yaml
+ports:
+  - "9001:9001"
+```
+
+Recreate the service after changing the mapping:
+
+```bash
+sudo docker compose up --build -d --force-recreate fairgate
+```
+
+Allow inbound TCP traffic on port `9001` through the host firewall, restricted to the client IP range that needs access. Connect to the host's reachable IP or DNS name on port `9001`; this is FairGate's length-prefixed TCP protocol, not an HTTP endpoint.
+
+The Compose file uses development ClickHouse credentials. Replace them before exposing a non-development deployment. `docker compose down` keeps the named volumes; `docker compose down -v` removes them, including the WAL, checkpoint, and database data.
 
 ## Development status and limitations
 
@@ -730,17 +803,18 @@ FairGate is an experimental beta. Interfaces, protocol details, configuration, a
 
 Known limitations of the current beta:
 
-- The WAL-backed shipper is implemented but not started by the gateway command. Operators must run and manage it separately; it processes durable records through the current WAL end and does not continuously tail later appends.
+- The WAL-backed shipper starts only when `FAIRGATE_SHIPPER_ENABLED=true`; Compose enables it. Without that setting, events remain in the WAL and are not shipped to ClickHouse.
 - A crash after a successful database insert but before checkpoint commit can replay that batch. Storage therefore needs to tolerate duplicates; end-to-end exactly-once delivery is not guaranteed.
 - The ClickHouse integration test is optional and runs only when the environment is configured for it.
-- The WAL is segmented with group commit, but completed segments are not reclaimed automatically. Checkpoints exist, but reclamation is still unimplemented.
-- Queue capacity, DRR quantum, and the shutdown grace period are fixed in the server and not yet configurable.
+- The WAL is segmented with group commit, but completed segments are not reclaimed automatically. Checkpoints exist, but reclamation is still unimplemented, so the WAL grows until segments are removed by other means.
+- Queue capacity, DRR quantum, the shutdown grace period, and the shipper's batch size, poll interval, and retry policy are fixed in the code and not yet configurable.
 - All producers receive equal scheduling treatment. Weights are not yet supported.
 - Enqueueing blocks on a full queue (cancelable during shutdown), and no load-shedding policy exists yet.
 - A WAL write, rotation, or sync failure is fatal: later appends are rejected until the WAL is reopened.
 - Startup recovery fails on an incomplete record in any non-final segment, rather than repairing it.
 - Shutdown has no explicit queue-drain confirmation, and a handler stuck in an operation that ignores connection closure and context cancellation can delay it beyond the grace period.
-- No metrics, profiling endpoints, or dashboards are provided.
+- The Compose file ships with development credentials and, by default, a loopback-only FairGate port; exposing it needs the changes described in [Docker deployment](#docker-deployment).
+- FairGate does not yet provide its own metrics, profiling endpoints, or dashboards.
 
 ## Contributing
 

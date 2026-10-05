@@ -18,7 +18,8 @@ type Config struct {
 	//Maximum amount of time to wait before flushing a batch, regardless of whether batch size has been reached
 	FlushInterval time.Duration
 	//Capacity of the internal buffered channel that holds events waiting to be processed by the shipper.
-	QueueSize int
+	QueueSize    int
+	PollInterval time.Duration
 }
 
 type Shipper struct {
@@ -55,8 +56,8 @@ func New(
 	if config.BatchSize <= 0 {
 		return nil, errors.New("the batch size must be greater than zero")
 	}
-	if config.FlushInterval <= 0 {
-		return nil, errors.New("the flush interval must be greater than zero")
+	if config.PollInterval <= 0 {
+		return nil, errors.New("the poll interval must be greater than zero")
 	}
 
 	return &Shipper{
@@ -88,20 +89,24 @@ func (s *Shipper) Run(ctx context.Context) error {
 		return err
 	}
 
-	position := checkpointPosition(checkpoint)
-	reader := wal.NewReader(s.wal, position)
+	reader := wal.NewReader(s.wal, checkpointPosition(checkpoint))
+	poll := time.NewTicker(s.config.PollInterval)
+	defer poll.Stop()
 
 	for {
 		batch, end, err := s.readBatch(ctx, reader)
 		if err != nil {
-			if errors.Is(err, io.EOF) {
-				return nil
+			if !errors.Is(err, io.EOF) {
+				return err
 			}
-			return err
-		}
-
-		if len(batch) == 0 {
-			continue
+			//readBatch returns io.EOF only when it has no records to return.
+			//keep the same reader so it can observe later durable appends.
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-poll.C:
+				continue
+			}
 		}
 
 		if err := s.writeBatch(ctx, batch); err != nil {
@@ -111,8 +116,6 @@ func (s *Shipper) Run(ctx context.Context) error {
 		if err := s.checkpoint.Commit(positionCheckpoint(end)); err != nil {
 			return err
 		}
-
-		position = end
 	}
 }
 

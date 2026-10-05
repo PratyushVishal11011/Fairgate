@@ -5,10 +5,20 @@ services:
       context: .
       dockerfile: Dockerfile
     container_name: fairgate-server
+    environment:
+      FAIRGATE_SHIPPER_ENABLED: "true"
+      FAIRGATE_CHECKPOINT_PATH: /app/data/checkpoint.json
+      CLICKHOUSE_ADDR: clickhouse:9000
+      CLICKHOUSE_DATABASE: fairgate
+      CLICKHOUSE_USER: fairgate
+      CLICKHOUSE_PASSWORD: fairgate_dev_password
     ports:
       - "127.0.0.1:9001:9001"
     volumes:
       - fairgate_wal:/app/data
+    depends_on:
+      clickhouse:
+        condition: service_healthy
     restart: unless-stopped
 
   clickhouse:
@@ -19,7 +29,6 @@ services:
       CLICKHOUSE_PASSWORD: fairgate_dev_password
       CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
     ports:
-      - "127.0.0.1:8123:8123"
       - "127.0.0.1:9000:9000"
     volumes:
       - clickhouse_data:/var/lib/clickhouse
@@ -29,7 +38,15 @@ services:
         soft: 262144
         hard: 262144
     healthcheck:
-      test: ["CMD", "clickhouse-client", "--query", "SELECT 1"]
+      test:
+        - CMD
+        - clickhouse-client
+        - --user
+        - fairgate
+        - --password
+        - fairgate_dev_password
+        - --query
+        - SELECT 1
       interval: 10s
       timeout: 5s
       retries: 5

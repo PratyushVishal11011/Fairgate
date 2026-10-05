@@ -115,16 +115,25 @@ func TestShipperReadsFromWALAndAdvancesCheckpoint(t *testing.T) {
 		checkpointStore,
 		newTestBackoff(),
 		Config{
-			BatchSize:     2,
-			FlushInterval: time.Second,
+			BatchSize:    2,
+			PollInterval: time.Second,
 		},
 	)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	if err := shipper.Run(context.Background()); err != nil {
-		t.Fatalf("shipper.Run() failed: %v", err)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		done <- shipper.Run(ctx)
+	}()
+
+	waitForCheckpoint(t, checkpointStore, storage, 1)
+	cancel()
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected shipper to stop with context.Canceled, got %v", err)
 	}
 
 	if storage.Calls() != 1 {
@@ -201,21 +210,28 @@ func TestShipperRetriesFailedInsert(t *testing.T) {
 		checkpointStore,
 		newTestBackoff(),
 		Config{
-			BatchSize:     2,
-			FlushInterval: time.Second,
+			BatchSize:    2,
+			PollInterval: time.Second,
 		},
 	)
 	if err != nil {
 		t.Fatal(err)
 	}
 
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
 	start := time.Now()
+	go func() {
+		done <- shipper.Run(ctx)
+	}()
 
-	if err := shipper.Run(context.Background()); err != nil {
-		t.Fatalf("shipper.Run() failed: %v", err)
-	}
-
+	waitForCheckpoint(t, checkpointStore, storage, 3)
 	elapsed := time.Since(start)
+	cancel()
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected shipper to stop with context.Canceled, got %v", err)
+	}
 
 	if storage.Calls() != 3 {
 		t.Fatalf(
@@ -269,6 +285,38 @@ func TestShipperRetriesFailedInsert(t *testing.T) {
 	}
 }
 
+func waitForCheckpoint(
+	t *testing.T,
+	checkpointStore *CheckpointStore,
+	storage *fakeStore,
+	wantCalls int,
+) {
+	t.Helper()
+	deadline := time.NewTimer(5 * time.Second)
+	defer deadline.Stop()
+	ticker := time.NewTicker(time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		checkpoint, err := checkpointStore.Load()
+		if err != nil {
+			t.Fatalf("load checkpoint while waiting: %v", err)
+		}
+		if checkpoint.Offset > 0 && storage.Calls() >= wantCalls {
+			return
+		}
+
+		select {
+		case <-deadline.C:
+			t.Fatalf(
+				"timed out waiting for checkpoint and %d insert calls",
+				wantCalls,
+			)
+		case <-ticker.C:
+		}
+	}
+}
+
 func TestShipperDoesNotAdvanceCheckpointOnCanceledRetry(t *testing.T) {
 	dir := t.TempDir()
 	walPath := filepath.Join(dir, "events.wal")
@@ -306,8 +354,8 @@ func TestShipperDoesNotAdvanceCheckpointOnCanceledRetry(t *testing.T) {
 		checkpointStore,
 		backoff,
 		Config{
-			BatchSize:     1,
-			FlushInterval: time.Second,
+			BatchSize:    1,
+			PollInterval: time.Second,
 		},
 	)
 	if err != nil {
