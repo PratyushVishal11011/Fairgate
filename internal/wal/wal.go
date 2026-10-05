@@ -430,18 +430,28 @@ func listSegments(path string) ([]segment, error) {
 
 func (w *WAL) Close() error {
 	//this function safely closes the WAL file.
-
 	w.submitMu.Lock()
-	defer w.submitMu.Unlock()
 
-	//If w.file is already nil, it returns without doing anything.
-	if w.file == nil {
-		return nil
+	//the first time Close() is called, w.closed is false, so execution skips this block and proceeds to close the request channel.
+	if w.closed {
+		//release the mutex Close() acquired
+		w.submitMu.Unlock()
+		//wait until the writer goroutine has finished
+		//when the writer finishes processing pending requests, syncing and closing the WAL file, it closes w.done.
+		//if the writer is still working, this line blocks until it finishes. If it has already finished, it returns immediately.
+		<-w.done
+		return w.closeErr
 	}
-	//Otherwise, it closes the file, sets the pointer to nil, and returns any error.
-	err := w.file.Close()
-	w.file = nil
-	return err
+
+	//set the closed flag to true
+	//makes sure that any subsequent call to Append will return an error
+	w.closed = true
+	//close the requests channel
+	close(w.requests)
+
+	//wait for the writer to finish pending requests, sync the active segment, and close the file.
+	<-w.done
+	return w.closeErr
 }
 
 func writeFull(file *os.File, data []byte) error {

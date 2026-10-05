@@ -97,7 +97,14 @@ func recoverSegment(file *os.File, isLast bool) ([]wire.Event, error) {
 		_, err = io.ReadFull(file, payload)
 
 		if err == io.EOF || err == io.ErrUnexpectedEOF {
-			//checks if payload is incomplete
+			// Checks if the payload is incomplete
+			if !isLast {
+				return nil, fmt.Errorf(
+					"incomplete record in non-final WAL segment at offset: %d",
+					offset,
+				)
+			}
+
 			if err := file.Truncate(offset); err != nil {
 				return nil, err
 			}
