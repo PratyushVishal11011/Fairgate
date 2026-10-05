@@ -1,5 +1,16 @@
 
 services:
+  fairgate:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: fairgate-server
+    ports:
+      - "127.0.0.1:9001:9001"
+    volumes:
+      - fairgate_wal:/app/data
+    restart: unless-stopped
+
   clickhouse:
     image: clickhouse/clickhouse-server:25.8
     container_name: fairgate-clickhouse
@@ -49,6 +60,7 @@ services:
     restart: unless-stopped
 
 volumes:
+  fairgate_wal:
   clickhouse_data:
   prometheus_data:
   grafana_data:
