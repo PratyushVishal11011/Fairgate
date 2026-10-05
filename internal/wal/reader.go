@@ -94,20 +94,20 @@ func (reader *Reader) Next() (Record, error) {
 
 	payloadLength := binary.BigEndian.Uint32(header[0:4])
 
-	recordSize := int64(8 + payloadLength)
-	if !reader.canRead(recordSize) {
-		return Record{}, io.EOF
-	}
-
-	expectedCRC := binary.BigEndian.Uint32(header[4:8])
-
-	if payloadLength != maxRecordSize {
+	if payloadLength > maxRecordSize {
 		return Record{}, fmt.Errorf(
 			"WAL record too large at segment %d offset %d",
 			reader.position.segmentId,
 			reader.position.offset,
 		)
 	}
+
+	recordSize := int64(8 + payloadLength)
+	if !reader.canRead(recordSize) {
+		return Record{}, io.EOF
+	}
+
+	expectedCRC := binary.BigEndian.Uint32(header[4:8])
 
 	payload := make([]byte, payloadLength)
 	payloadOffset := reader.position.offset + 8
