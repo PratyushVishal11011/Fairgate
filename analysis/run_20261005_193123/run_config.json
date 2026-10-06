@@ -1,0 +1,46 @@
+{
+  "timestamp": "2026-10-05T14:01:23.531675+00:00",
+  "host": "15.252.182.150",
+  "port": 9001,
+  "num_producers": 50,
+  "events_per_producer": 2500,
+  "anomaly_producers": 3,
+  "random_seed": 42,
+  "anomaly_start_min_events": 150,
+  "anomaly_start_max_events": 500,
+  "anomaly_duration_min_events": 100,
+  "anomaly_duration_max_events": 300,
+  "normal_mean_delay": 0.004,
+  "normal_jitter": 0.002,
+  "burst_mean_delay": 0.0003,
+  "slow_mean_delay": 0.25,
+  "malformed_probability": 0.15,
+  "oversized_probability": 0.05,
+  "anomaly_profiles": [
+    "burst",
+    "slow",
+    "disconnect",
+    "malformed",
+    "oversized"
+  ],
+  "anomaly_plan": {
+    "producer-041": {
+      "profile": "disconnect",
+      "start_event": 221,
+      "end_event": 509,
+      "duration_events": 289
+    },
+    "producer-008": {
+      "profile": "slow",
+      "start_event": 202,
+      "end_event": 475,
+      "duration_events": 274
+    },
+    "producer-002": {
+      "profile": "slow",
+      "start_event": 429,
+      "end_event": 551,
+      "duration_events": 123
+    }
+  }
+}

@@ -11,19 +11,19 @@ import (
 )
 
 func Recover(path string) ([]wire.Event, error) {
-	//Open the wal file
-	base, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0600)
-
-	if err != nil {
-		return nil, err
-	}
-	if err := base.Close(); err != nil {
-		return nil, err
-	}
-
 	segments, err := listSegments(path)
 	if err != nil {
 		return nil, err
+	}
+	if len(segments) == 0 {
+		base, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0600)
+		if err != nil {
+			return nil, err
+		}
+		if err := base.Close(); err != nil {
+			return nil, err
+		}
+		segments = []segment{{id: 0, path: path}}
 	}
 
 	//close the file on return

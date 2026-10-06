@@ -6,7 +6,6 @@ services:
       dockerfile: Dockerfile
     container_name: fairgate-server
     environment:
-      FAIRGATE_SHIPPER_ENABLED: "true"
       FAIRGATE_CHECKPOINT_PATH: /app/data/checkpoint.json
       CLICKHOUSE_ADDR: clickhouse:9000
       CLICKHOUSE_DATABASE: fairgate

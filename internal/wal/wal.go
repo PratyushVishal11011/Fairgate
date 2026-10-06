@@ -9,6 +9,7 @@ import (
 	"hash/crc32"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -47,6 +48,7 @@ type WAL struct {
 	//separate mutex because the write goroutine updates durableEnd while future WAL will need to read it
 	stateMu    sync.RWMutex
 	durableEnd Position
+	segmentMu  sync.Mutex
 
 	//owned exclusively by the writer goroutine
 	file           *os.File
@@ -366,6 +368,8 @@ func (w *WAL) writeBatch(batch []appendRequest) {
 }
 
 func (w *WAL) rotate() error {
+	w.segmentMu.Lock()
+	defer w.segmentMu.Unlock()
 	if w.file == nil {
 		return errors.New("file is nil")
 	}
@@ -411,7 +415,12 @@ func listSegments(path string) ([]segment, error) {
 		return nil, err
 	}
 
-	segments := []segment{{id: 0, path: path}}
+	segments := make([]segment, 0)
+	if _, err := os.Stat(path); err == nil {
+		segments = append(segments, segment{id: 0, path: path})
+	} else if !os.IsNotExist(err) {
+		return nil, err
+	}
 
 	for _, entry := range entries {
 		name := entry.Name()
@@ -428,20 +437,36 @@ func listSegments(path string) ([]segment, error) {
 	}
 
 	// Keep the original WAL first, followed by numbered segments.
-	for i := 1; i < len(segments); i++ {
-		for j := i; j > 1 && segments[j].id < segments[j-1].id; j-- {
-			segments[j], segments[j-1] = segments[j-1], segments[j]
-		}
-	}
-
-	// If the original file does not exist, it should not be treated
-	// as a segment unless it is created by Open or Recover.
-	if len(segments) == 1 {
-		if _, err := os.Stat(path); os.IsNotExist(err) {
-			return nil, nil
-		}
-	}
+	sort.Slice(segments, func(i, j int) bool { return segments[i].id < segments[j].id })
 	return segments, nil
+}
+
+// ReclaimBefore removes completed WAL segments strictly older than the checkpoint segment.
+// The current checkpoint segment is retained because its offset may still point to records that have not shipped.
+func (w *WAL) ReclaimBefore(checkpoint Position) error {
+	w.segmentMu.Lock()
+	defer w.segmentMu.Unlock()
+	if checkpoint.SegmentId == 0 {
+		return nil
+	}
+	segments, err := listSegments(w.path)
+	if err != nil {
+		return err
+	}
+	for _, seg := range segments {
+		if seg.id >= checkpoint.SegmentId || seg.id == w.segmentId {
+			continue
+		}
+		if err := os.Remove(seg.path); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+	}
+	dir, err := os.Open(filepath.Dir(w.path))
+	if err != nil {
+		return err
+	}
+	defer dir.Close()
+	return dir.Sync()
 }
 
 func (w *WAL) Close() error {

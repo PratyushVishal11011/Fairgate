@@ -88,6 +88,9 @@ func (s *Shipper) Run(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	if err := s.wal.ReclaimBefore(checkpointPosition(checkpoint)); err != nil {
+		return err
+	}
 
 	reader := wal.NewReader(s.wal, checkpointPosition(checkpoint))
 	poll := time.NewTicker(s.config.PollInterval)
@@ -114,6 +117,9 @@ func (s *Shipper) Run(ctx context.Context) error {
 		}
 
 		if err := s.checkpoint.Commit(positionCheckpoint(end)); err != nil {
+			return err
+		}
+		if err := s.wal.ReclaimBefore(end); err != nil {
 			return err
 		}
 	}

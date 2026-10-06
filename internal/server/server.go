@@ -26,6 +26,17 @@ func Run(addr string, logger *slog.Logger) error {
 }
 
 func RunContext(ctx context.Context, addr string, logger *slog.Logger) error {
+	return runContext(ctx, addr, logger, func() (store.Store, error) {
+		return store.NewClickHouseStore(
+			[]string{envOrDefault("CLICKHOUSE_ADDR", "localhost:9000")},
+			envOrDefault("CLICKHOUSE_DATABASE", "fairgate"),
+			envOrDefault("CLICKHOUSE_USER", "fairgate"),
+			envOrDefault("CLICKHOUSE_PASSWORD", "fairgate_dev_password"),
+		)
+	})
+}
+
+func runContext(ctx context.Context, addr string, logger *slog.Logger, newStore func() (store.Store, error)) error {
 	// Open a TCP listener on the specified address.
 	listener, err := net.Listen("tcp", addr)
 	if err != nil {
@@ -58,66 +69,57 @@ func RunContext(ctx context.Context, addr string, logger *slog.Logger) error {
 	shipperDone := make(chan struct{})
 	cancelShipper := func() {}
 
-	if os.Getenv("FAIRGATE_SHIPPER_ENABLED") == "true" {
-		clickhouseStore, err := store.NewClickHouseStore(
-			[]string{envOrDefault("CLICKHOUSE_ADDR", "localhost:9000")},
-			envOrDefault("CLICKHOUSE_DATABASE", "fairgate"),
-			envOrDefault("CLICKHOUSE_USER", "fairgate"),
-			envOrDefault("CLICKHOUSE_PASSWORD", "fairgate_dev_password"),
-		)
-		if err != nil {
-			return fmt.Errorf("create ClickHouse store: %w", err)
-		}
-		defer clickhouseStore.Close()
-
-		checkpoint := shipper.NewCheckpointStore(
-			envOrDefault("FAIRGATE_CHECKPOINT_PATH", "data/checkpoint.json"),
-		)
-		backoff := shipper.NewBackoff(
-			time.Second,
-			30*time.Second,
-			2,
-			0.2,
-			time.Now().UnixNano(),
-		)
-
-		eventShipper, err := shipper.New(
-			clickhouseStore,
-			walLog,
-			checkpoint,
-			backoff,
-			shipper.Config{
-				BatchSize:    100,
-				PollInterval: time.Second,
-			},
-		)
-		if err != nil {
-			return fmt.Errorf("create shipper: %w", err)
-		}
-
-		shipperCtx, stopShipper := context.WithCancel(context.Background())
-		cancelShipper = stopShipper
-
-		go func() {
-			defer close(shipperDone)
-
-			if err := eventShipper.Run(shipperCtx); err != nil &&
-				!errors.Is(err, context.Canceled) {
-				shipperErr <- err
-				_ = listener.Close()
-				logger.Error("WAL shipper stopped", "error", err)
-			}
-		}()
-
-		logger.Info("WAL shipper started")
+	storage, err := newStore()
+	if err != nil {
+		return fmt.Errorf("create store: %w", err)
 	}
+	defer storage.Close()
+
+	checkpoint := shipper.NewCheckpointStore(
+		envOrDefault("FAIRGATE_CHECKPOINT_PATH", "data/checkpoint.json"),
+	)
+	backoff := shipper.NewBackoff(
+		time.Second,
+		30*time.Second,
+		2,
+		0.2,
+		time.Now().UnixNano(),
+	)
+
+	eventShipper, err := shipper.New(
+		storage,
+		walLog,
+		checkpoint,
+		backoff,
+		shipper.Config{
+			BatchSize:    100,
+			PollInterval: time.Second,
+		},
+	)
+	if err != nil {
+		return fmt.Errorf("create shipper: %w", err)
+	}
+
+	shipperCtx, stopShipper := context.WithCancel(context.Background())
+	cancelShipper = stopShipper
+
+	go func() {
+		defer close(shipperDone)
+
+		if err := eventShipper.Run(shipperCtx); err != nil &&
+			!errors.Is(err, context.Canceled) {
+			shipperErr <- err
+			_ = listener.Close()
+			logger.Error("WAL shipper stopped", "error", err)
+		}
+	}()
+
+	logger.Info("WAL shipper started")
 
 	// Stop and join the shipper before the deferred store and WAL cleanup.
 	defer func() {
 		cancelShipper()
-		if os.Getenv("FAIRGATE_SHIPPER_ENABLED") == "true" {
-			<-shipperDone
-		}
+		<-shipperDone
 	}()
 
 	logger.Info("server listening on", "address", addr)

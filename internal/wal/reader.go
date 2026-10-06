@@ -89,12 +89,27 @@ func (reader *Reader) Next() (Record, error) {
 		if reader.position.Offset+8 > fileInfo.Size() {
 			durable := reader.wal.DurableEnd()
 			if reader.position.SegmentId < durable.SegmentId {
+				segments, err := listSegments(reader.wal.path)
+				if err != nil {
+					return Record{}, err
+				}
+				next := uint64(0)
+				found := false
+				for _, seg := range segments {
+					if seg.id > reader.position.SegmentId {
+						next, found = seg.id, true
+						break
+					}
+				}
+				if !found {
+					return Record{}, io.EOF
+				}
 				if err := reader.closeFile(); err != nil {
 					return Record{}, err
 				}
 
 				reader.position = Position{
-					SegmentId: reader.position.SegmentId + 1,
+					SegmentId: next,
 					Offset:    0,
 				}
 				continue

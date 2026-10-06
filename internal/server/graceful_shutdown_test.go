@@ -7,7 +7,15 @@ import (
 	"net"
 	"testing"
 	"time"
+
+	"FairGate/internal/store"
+	"FairGate/internal/wire"
 )
+
+type shutdownTestStore struct{}
+
+func (shutdownTestStore) InsertBatch(context.Context, []wire.Event) error { return nil }
+func (shutdownTestStore) Close() error                                  { return nil }
 
 func testServerAddress(t *testing.T) string {
 	t.Helper()
@@ -29,12 +37,15 @@ func startTestServer(t *testing.T) (context.CancelFunc, <-chan error, string) {
 	t.Helper()
 
 	ctx, cancel := context.WithCancel(context.Background())
+	t.Setenv("FAIRGATE_CHECKPOINT_PATH", t.TempDir()+"/checkpoint.json")
 	addr := testServerAddress(t)
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	done := make(chan error, 1)
 
 	go func() {
-		done <- RunContext(ctx, addr, logger)
+		done <- runContext(ctx, addr, logger, func() (store.Store, error) {
+			return shutdownTestStore{}, nil
+		})
 	}()
 
 	// Wait until the server is listening.
