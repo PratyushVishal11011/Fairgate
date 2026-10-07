@@ -762,7 +762,7 @@ A solid border marks implemented work. Dashed borders mark planned work.
 | Durable checkpoints and retry with backoff | Implemented |
 | Shipper runtime wiring and lifecycle | Implemented; shipper always runs |
 | WAL segment reclamation | Implemented for segments older than the committed checkpoint segment |
-| Docker image, Compose stack, Ubuntu install script | Implemented |
+| Docker image, Compose stack | Implemented |
 | Producer weights and richer fairness controls | Planned |
 | Backlog-aware overload handling | Planned |
 | Metrics, profiling, dashboards | Planned |
