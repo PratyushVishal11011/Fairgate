@@ -829,10 +829,7 @@ The repository is being developed as a gateway implementation. A stable command-
 
 The Compose stack starts the FairGate TCP server, ClickHouse, Prometheus, and Grafana. FairGate waits for ClickHouse's health check before starting, the shipper runs as part of the gateway (no enabling setting is needed), and the WAL and checkpoint persist in the `fairgate_wal` volume. As the shipper's checkpoint advances, older WAL segments in that volume are deleted automatically.
 
-On an Ubuntu VM, install Docker Engine and the Compose plugin with the included script, then start the stack:
-
 ```bash
-./install-docker-ubuntu.sh
 sudo docker compose up --build -d
 sudo docker compose ps
 sudo docker compose logs -f fairgate clickhouse
