@@ -19,7 +19,25 @@ import (
 	"time"
 )
 
-const shutdownGracePeriod = 5 * time.Second
+const (
+	ackAccepted         = "accepted"
+	ackRejected         = "rejected" // refused by the gateway, retryable after backoff
+	ackError            = "error"    // server-side failure, retryable
+	ackInvalid          = "invalid"  // malformed request, do not retry unchanged
+	shutdownGracePeriod = 5 * time.Second
+)
+
+func sendAck(conn net.Conn, ack wire.Ack) error {
+	payload, err := json.Marshal(ack)
+	if err != nil {
+		return err
+	}
+	return wire.WriteFrame(conn, wire.Frame{
+		Type:    wire.FrameTypeAck,
+		Flags:   0,
+		Payload: payload,
+	})
+}
 
 func Run(addr string, logger *slog.Logger) error {
 	return RunContext(context.Background(), addr, logger)
@@ -398,11 +416,14 @@ func handleConnContext(
 		// Decode the event and check for errors in the payload.
 		event, err := wire.DecodeEvent(frame.Payload)
 		if err != nil {
-			logger.Warn(
-				"Invalid Event Payload",
-				"remoteAddr", remoteAddr,
-				"error", err,
-			)
+			logger.Warn("Invalid event payload", "remote_addr", remoteAddr, "error", err)
+			if werr := sendAck(conn, wire.Ack{
+				Status:  ackInvalid,
+				Message: "invalid_payload",
+			}); werr != nil {
+				logger.Warn("Failed to send NACK", "remote_addr", remoteAddr, "error", werr)
+				return
+			}
 			continue
 		}
 
@@ -417,26 +438,37 @@ func handleConnContext(
 			"event_type", event.EventType,
 		)
 
-		// If the event is not allowed, log and continue.
+		// If the event is not allowed: log, send ack and continue.
 		if !admission.Allow(event.ProducerId) {
-			logger.Warn(
-				"Event rejected by admission control",
-				"remote_addr", remoteAddr,
-				"producer_id", event.ProducerId,
-				"seq", event.Seq,
-			)
+			logger.Warn("Event rejected by admission control",
+				"remote_addr", remoteAddr, "producer_id", event.ProducerId, "seq", event.Seq)
+			if werr := sendAck(conn, wire.Ack{
+				ProducerId: event.ProducerId,
+				Seq:        event.Seq,
+				Idx:        event.Idx,
+				Status:     ackRejected,
+				Message:    "rate_limited",
+			}); werr != nil {
+				logger.Warn("Failed to send NACK", "remote_addr", remoteAddr, "error", werr)
+				return
+			}
 			continue
 		}
 
 		// Append the event to the WAL.
 		if err := walLog.Append(event); err != nil {
-			logger.Error(
-				"Failed to append to WAL",
-				"producer_id", event.ProducerId,
-				"sequence", event.Seq,
-				"error", err,
-			)
-			continue
+			logger.Error("Failed to append to WAL",
+				"remote_addr", remoteAddr, "producer_id", event.ProducerId, "seq", event.Seq, "error", err)
+			if werr := sendAck(conn, wire.Ack{
+				ProducerId: event.ProducerId,
+				Seq:        event.Seq,
+				Idx:        event.Idx,
+				Status:     ackError,
+				Message:    "wal_append_failed",
+			}); werr != nil {
+				logger.Warn("Failed to send NACK", "remote_addr", remoteAddr, "error", werr)
+			}
+			return // see note below
 		}
 
 		// Enqueue the event, allowing shutdown to cancel a blocked enqueue.
@@ -457,34 +489,14 @@ func handleConnContext(
 			continue
 		}
 
-		// Create the acknowledgement object.
-		ack := wire.Ack{
+		if err := sendAck(conn, wire.Ack{
 			ProducerId: event.ProducerId,
 			Seq:        event.Seq,
 			Idx:        event.Idx,
-			Status:     "accepted",
+			Status:     ackAccepted,
 			Message:    "Event successfully enqueued",
-		}
-
-		// Convert the ACK into a JSON object.
-		payload, err := json.Marshal(ack)
-		if err != nil {
-			logger.Error("Failed to encode ACK", "error", err)
-			return
-		}
-
-		// Send the acknowledgement.
-		if err := wire.WriteFrame(conn, wire.Frame{
-			Type:    wire.FrameTypeAck,
-			Flags:   0,
-			Payload: payload,
 		}); err != nil {
-			logger.Error(
-				"Failed to send ACK",
-				"producer_id", event.ProducerId,
-				"seq", event.Seq,
-				"error", err,
-			)
+			logger.Warn("Failed to send ACK", "remote_addr", remoteAddr, "error", err)
 			return
 		}
 
