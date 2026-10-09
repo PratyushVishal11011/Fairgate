@@ -12,12 +12,18 @@ services:
       CLICKHOUSE_USER: fairgate
       CLICKHOUSE_PASSWORD: fairgate_dev_password
     ports:
-      - "127.0.0.1:9001:9001"
+      - "9001:9001"
+      - "9100:9100"
     volumes:
       - fairgate_wal:/app/data
     depends_on:
       clickhouse:
         condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:9100/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
     restart: unless-stopped
 
   clickhouse:
@@ -28,7 +34,7 @@ services:
       CLICKHOUSE_PASSWORD: fairgate_dev_password
       CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
     ports:
-      - "127.0.0.1:9000:9000"
+      - "9000:9000"
     volumes:
       - clickhouse_data:/var/lib/clickhouse
       - ./deploy/clickhouse:/docker-entrypoint-initdb.d
@@ -52,10 +58,10 @@ services:
     restart: unless-stopped
 
   prometheus:
-    image: prom/prometheus:latest
+    image: prom/prometheus:v3.5.0
     container_name: fairgate-prometheus
     ports:
-      - "127.0.0.1:9090:9090"
+      - "9090:9090"
     volumes:
       - ./deploy/prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - prometheus_data:/prometheus
@@ -65,12 +71,14 @@ services:
     restart: unless-stopped
 
   grafana:
-    image: grafana/grafana:latest
+    image: grafana/grafana:12.2.0
     container_name: fairgate-grafana
     ports:
-      - "127.0.0.1:3000:3000"
+      - "3001:3000"
     volumes:
       - grafana_data:/var/lib/grafana
+      - ./deploy/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./deploy/grafana/dashboards:/var/lib/grafana/dashboards:ro
     depends_on:
       - prometheus
     restart: unless-stopped

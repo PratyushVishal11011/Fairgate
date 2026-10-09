@@ -1,0 +1,42 @@
+{
+  "uid": "fairgate-overview",
+  "title": "FairGate Overview",
+  "tags": ["fairgate"],
+  "timezone": "browser",
+  "schemaVersion": 41,
+  "version": 1,
+  "refresh": "5s",
+  "time": { "from": "now-1h", "to": "now" },
+  "panels": [
+    {
+      "id": 1,
+      "title": "Active TCP Connections",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "targets": [{ "expr": "fairgate_tcp_connections_active", "legendFormat": "active", "refId": "A" }]
+    },
+    {
+      "id": 2,
+      "title": "Events per Second",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "targets": [
+        { "expr": "rate(fairgate_events_accepted_total[1m])", "legendFormat": "accepted", "refId": "A" },
+        { "expr": "rate(fairgate_events_rejected_total[1m])", "legendFormat": "rate limited", "refId": "B" },
+        { "expr": "rate(fairgate_events_invalid_total[1m])", "legendFormat": "invalid", "refId": "C" },
+        { "expr": "rate(fairgate_events_processed_total[1m])", "legendFormat": "processed", "refId": "D" }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "WAL Append Errors",
+      "type": "stat",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 5, "w": 6, "x": 0, "y": 8 },
+      "targets": [{ "expr": "increase(fairgate_wal_append_errors_total[$__range])", "legendFormat": "errors", "refId": "A" }],
+      "fieldConfig": { "defaults": { "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "red", "value": 1 }] } }, "overrides": [] }
+    }
+  ]
+}

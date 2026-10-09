@@ -6,3 +6,4 @@ dist/
 .vscode/
 .DS_Store
 coverage.out
+install-docker-ubuntu.sh

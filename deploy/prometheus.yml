@@ -6,3 +6,8 @@ scrape_configs:
   - job_name: prometheus
     static_configs:
       - targets: ["prometheus:9090"]
+  - job_name: fairgate
+    scrape_interval: 5s
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["fairgate:9100"]

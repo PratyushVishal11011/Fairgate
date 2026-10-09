@@ -7,7 +7,7 @@ FairGate is a modular event-ingestion gateway. It accepts framed event streams o
 The project explores fair resource sharing in event-ingestion systems: keeping producers isolated from one another through bounded buffering, admission limits, and fair scheduling. FairGate is being developed as an open-source foundation that can be extended with different storage backends and downstream processing components.
 
 > [!IMPORTANT]
-> **Beta status.** FairGate is under active development. The current implementation provides TCP ingestion, event decoding and validation, admission control, per-producer bounded queues, DRR scheduling, a segmented WAL with group commit and ordered recovery, acknowledgments, and context-aware graceful shutdown. The gateway always runs a shipper that reads durable WAL records from a persisted checkpoint, batches them for a `Store` (ClickHouse), retries failed inserts with capped exponential backoff and jitter, atomically persists progress after successful inserts, and then reclaims WAL segments older than the checkpoint segment. A Docker Compose stack runs FairGate with ClickHouse. Delivery to the database is at-least-once, not exactly-once, and advanced overload control and production observability are not implemented.
+> **Beta status.** FairGate is under active development. The current implementation provides TCP ingestion, event decoding and validation, admission control, per-producer bounded queues, DRR scheduling, a segmented WAL with group commit and ordered recovery, acknowledgments, and context-aware graceful shutdown. The gateway always runs a shipper that reads durable WAL records from a persisted checkpoint, batches them for a `Store` (ClickHouse), retries failed inserts with capped exponential backoff and jitter, atomically persists progress after successful inserts, and then reclaims WAL segments older than the checkpoint segment. The gateway serves an HTTP health endpoint and Prometheus metrics, and a Docker Compose stack runs FairGate with ClickHouse, Prometheus, and Grafana. Delivery to the database is at-least-once, not exactly-once, and advanced overload control, profiling, and deep pipeline observability are not implemented.
 
 ## Table of Contents
 
@@ -49,8 +49,8 @@ The project explores fair resource sharing in event-ingestion systems: keeping p
 - **TCP event ingestion.** Accepts client connections and reads length-prefixed frames.
 - **Framed wire protocol.** Identifies event and acknowledgment frames using frame types.
 - **JSON event decoding.** Decodes events and checks required fields.
-- **Admission control.** Applies token-bucket-based limits to incoming events.
-- **Per-producer queues.** Keeps producer events in separate bounded channels.
+- **Admission control.** Applies token-bucket-based limits to incoming events (currently 500 requests per second with a burst of 1,000).
+- **Per-producer queues.** Keeps producer events in separate bounded channels (512 events each).
 - **DRR scheduling.** Selects queued events in producer rounds using a configurable quantum.
 - **Segmented Write-Ahead Log.** Appends events with length and CRC metadata across multiple segment files, rotating to a new segment when the configured segment size would be exceeded.
 - **Group commit.** A dedicated writer goroutine batches concurrent append requests and issues a single `Sync()` per batch, bounded by a maximum request count and a short collection delay.
@@ -65,7 +65,8 @@ The project explores fair resource sharing in event-ingestion systems: keeping p
 - **Store interface.** `InsertBatch(ctx, events)` and `Close()` separate storage from the processing pipeline.
 - **ClickHouse adapter.** Official Go client with configurable authentication, `Ping` health checks, batched inserts through `PrepareBatch` and `Send`, and graceful cleanup.
 - **Optional ClickHouse integration test.** Environment-gated test covering connectivity, batch insertion, and retrieval.
-- **Docker deployment.** A `Dockerfile` and Compose stack run FairGate with ClickHouse, starting FairGate only after ClickHouse reports healthy. `install-docker-ubuntu.sh` installs Docker Engine and the Compose plugin on Ubuntu.
+- **Health and Prometheus endpoints.** FairGate responds with `200 OK` and `ok` at `/health` on port `9100`; Docker Compose uses this endpoint for its gateway healthcheck. Prometheus metrics for active TCP connections, accepted, rejected and invalid events, WAL append errors, and scheduler processing totals remain available at `/metrics` on port `9100`.
+- **Docker deployment.** A `Dockerfile` and Compose stack run FairGate with ClickHouse, Prometheus, and Grafana. Prometheus scrapes the gateway and Grafana provisions its Prometheus datasource and FairGate overview dashboard. `install-docker-ubuntu.sh` installs Docker Engine and the Compose plugin on Ubuntu.
 - **Acknowledgments.** Sends an accepted acknowledgment after the event has been appended to the WAL and enqueued.
 - **Concurrent connections.** Handles client connections in separate goroutines and tracks them for coordinated shutdown.
 - **Context-aware lifecycle.** `RunContext` lets the caller control server lifetime through a `context.Context`.
@@ -78,14 +79,28 @@ The project explores fair resource sharing in event-ingestion systems: keeping p
 
 - Configurable producer weights and richer fairness controls
 - Backlog-aware overload handling and load shedding
-- Prometheus metrics, profiling endpoints, and dashboards
-- Load-generation, reconciliation, and chaos-testing tools
+- Profiling endpoints, deeper pipeline metrics, alerting, and deeper operational dashboards
+- Packaged load-generation, reconciliation, and chaos-testing tools
 - Additional protocol hardening
 - Explicit queue-drain confirmation during shutdown
 
 Planned capabilities are not implied to be available in this beta.
 
 ## Recent updates
+
+### 09th October, 2026: Gateway health, metrics, and deployment monitoring
+
+The gateway now exposes an HTTP health endpoint and Prometheus metrics alongside its TCP ingestion listener. The Compose deployment publishes the gateway's TCP and HTTP ports, checks gateway health, and provisions Prometheus and Grafana for monitoring.
+
+- **Health endpoint.** `GET /health` on port `9100` returns `200 OK` with `ok`. Docker Compose uses it to report whether the FairGate container is healthy.
+- **Prometheus metrics.** `GET /metrics` on port `9100` reports active TCP connections, accepted, rejected and invalid events, WAL append errors, and scheduler processing totals. Prometheus is configured to scrape the gateway every five seconds.
+- **Grafana monitoring.** Compose provisions Prometheus as Grafana's data source and loads the FairGate Overview dashboard, including active connections, event rate, and WAL append errors.
+- **Container image versions.** Prometheus and Grafana now use pinned image versions rather than `latest`.
+- **Gateway capacity settings.** The configured shipper batch size is 200, admission control is set to 500 requests per second with a 1,000 request burst, and per-producer queues buffer up to 512 events.
+- **Published service ports.** Compose publishes FairGate TCP port `9001`, its HTTP port `9100`, ClickHouse port `9000`, Prometheus port `9090`, and Grafana on host port `3001`.
+- **Stress tests.** Ran multiple stress tests with varying producer counts and workload types, including bursty and misbehaving-producer workloads. A report is coming soon.
+
+See [Docker deployment](#docker-deployment) for the Compose setup and monitoring URLs.
 
 ### 06th October, 2026: Checkpoint-based WAL reclamation and always-on shipper
 
@@ -195,6 +210,7 @@ flowchart TD
         D["DRR scheduler<br/>configurable quantum"]
         C["Event callback<br/>currently logs producer ID and sequence"]
         SH["WAL shipper<br/>always enabled"]
+        M["HTTP :9100<br/>/health and /metrics"]
 
         S --> A
         A --> W
@@ -208,9 +224,11 @@ flowchart TD
 
     Q -.->|"accepted ACK"| P
     SH -->|"batched inserts"| CHDB[("ClickHouse")]
+    PROM["Prometheus<br/>scrapes every 5 s"] -.->|"GET /metrics"| M
+    GRAF["Grafana<br/>FairGate Overview"] --> PROM
 ```
 
-Accepted events are appended to the WAL before they are enqueued and acknowledged to the client. The scheduler callback logs selected events. The server always runs a WAL shipper that writes batches to ClickHouse independently of the scheduler and reclaims WAL segments once they are fully shipped.
+Accepted events are appended to the WAL before they are enqueued and acknowledged to the client. The scheduler callback logs selected events. The server always runs a WAL shipper that writes batches to ClickHouse independently of the scheduler and reclaims WAL segments once they are fully shipped. Alongside the TCP listener, the gateway serves `/health` and Prometheus `/metrics` on port `9100`; in the Compose stack Prometheus scrapes it and Grafana visualizes the result.
 
 The server's goroutine and context structure, including the shutdown path, is described in [Server lifecycle and graceful shutdown](#server-lifecycle-and-graceful-shutdown).
 
@@ -239,7 +257,7 @@ flowchart LR
 
 | Package | Responsibility |
 |---|---|
-| `internal/server` | TCP listener, per-connection goroutines, connection tracking, frame handling, acknowledgment delivery, server lifecycle (`RunContext`), required shipper startup and shutdown, and graceful shutdown. |
+| `internal/server` | TCP listener, per-connection goroutines, connection tracking, frame handling, acknowledgment delivery, server lifecycle (`RunContext`), required shipper startup and shutdown, graceful shutdown, and the HTTP health and Prometheus metrics endpoint. |
 | `internal/wire` | Frame codec, event and acknowledgment types, validation. |
 | `internal/admit` | Token-bucket admission control. |
 | `internal/sched` | Per-producer bounded queues (including context-aware `EnqueueContext`) and the DRR scheduler. |
@@ -483,7 +501,7 @@ The shipper reads the WAL through a reader that stops at the WAL's synchronized 
 
 ## Backpressure and scheduling
 
-Each producer has its own bounded queue. The queue capacity is configured when the queue manager is created, and the server currently uses 256 events per producer. Enqueueing blocks when a producer's queue is full, applying backpressure to the caller instead of allowing the queue to grow without bound. In the connection handler the wait is context-aware (`EnqueueContext`), so a blocked handler can stop waiting if shutdown is forced.
+Each producer has its own bounded queue. The queue capacity is configured when the queue manager is created, and the server currently uses 512 events per producer. Enqueueing blocks when a producer's queue is full, applying backpressure to the caller instead of allowing the queue to grow without bound. In the connection handler the wait is context-aware (`EnqueueContext`), so a blocked handler can stop waiting if shutdown is forced.
 
 The DRR scheduler visits producer queues and processes available events up to its configured quantum (currently 8 in the server). The scheduler is independent of event meaning, and its callback is responsible for downstream handling. At this beta stage, the callback only logs events; database delivery is handled by the separate WAL shipper.
 
@@ -640,7 +658,8 @@ The following values are currently fixed in the server and are expected to becom
 
 | Setting | Current value | Description |
 |---|---|---|
-| Queue capacity | 256 events per producer | Bound on each producer's queue. |
+| Queue capacity | 512 events per producer | Bound on each producer's queue. |
+| Admission rate / burst | 500 requests per second / 1,000 burst | Token-bucket limit applied by admission control. |
 | DRR quantum | 8 | Maximum events served from a producer queue per visit. |
 | Shutdown grace period | 5 seconds | Time active handlers have to finish before connections are forcibly closed. |
 
@@ -657,10 +676,11 @@ The shipper and its ClickHouse store are configured through environment variable
 | `CLICKHOUSE_DATABASE` | ClickHouse database. |
 | `CLICKHOUSE_USER` | ClickHouse user. |
 | `CLICKHOUSE_PASSWORD` | ClickHouse password. |
+| `FAIRGATE_METRICS_ADDR` | Listener address for the HTTP `/health` and `/metrics` endpoints (port `9100`). If you change it, update the Compose port mapping, healthcheck, and Prometheus target to match. |
 
 `FAIRGATE_SHIPPER_ENABLED` is no longer read. The shipper always runs, and the setting was removed from Docker Compose; it can be deleted from existing environments.
 
-The gateway runtime configures the shipper with a batch size of 100 and a one-second WAL polling interval. The retry policy starts at one second, caps at 30 seconds, doubles between attempts, and applies 20% symmetric jitter. These shipper values are currently fixed in the runtime. After each successful checkpoint commit, WAL segments older than the checkpoint segment are reclaimed.
+The gateway runtime configures the shipper with a batch size of 200 and a one-second WAL polling interval. The retry policy starts at one second, caps at 30 seconds, doubles between attempts, and applies 20% symmetric jitter. These shipper values are currently fixed in the runtime. After each successful checkpoint commit, WAL segments older than the checkpoint segment are reclaimed.
 
 ## Storage integration
 
@@ -731,10 +751,10 @@ The roadmap lists planned work in dependency order. Items are subject to change.
 
 ```mermaid
 flowchart TD
-    P1["Phase 1: Core ingestion (implemented)<br/>TCP server, wire protocol, admission control<br/>Per-producer queues, DRR scheduling<br/>Segmented WAL with group commit and ordered recovery<br/>Context-aware lifecycle and graceful shutdown<br/>Store interface, ClickHouse adapter"]
+    P1["Phase 1: Core ingestion (implemented)<br/>TCP server, wire protocol, admission control<br/>Per-producer queues, DRR scheduling<br/>Segmented WAL with group commit and ordered recovery<br/>Context-aware lifecycle and graceful shutdown<br/>Store interface, ClickHouse adapter<br/>Health endpoint, Prometheus metrics, Grafana overview"]
     P2["Phase 2: Durable delivery (implemented)<br/>WAL shipping, checkpoints, retry and backoff<br/>Always-on runtime wiring<br/>Checkpoint-based WAL segment reclamation"]
     P3["Phase 3: Fairness and overload control (planned)<br/>Producer weights, backlog-aware overload handling<br/>Load shedding"]
-    P4["Phase 4: Operability and hardening (planned)<br/>Metrics, profiling, dashboards<br/>Load, reconcile, and chaos tools, protocol hardening"]
+    P4["Phase 4: Operability and hardening (planned)<br/>Profiling, deeper metrics, alerting<br/>Packaged load, reconcile, and chaos tools<br/>Protocol hardening"]
 
     P1 --> P2 --> P3 --> P4
 
@@ -763,12 +783,13 @@ A solid border marks implemented work. Dashed borders mark planned work.
 | Shipper runtime wiring and lifecycle | Implemented; shipper always runs |
 | WAL segment reclamation | Implemented for segments older than the committed checkpoint segment |
 | Docker image, Compose stack | Implemented |
+| Health endpoint, basic Prometheus metrics, Grafana overview dashboard | Implemented |
 | Producer weights and richer fairness controls | Planned |
 | Backlog-aware overload handling | Planned |
-| Metrics, profiling, dashboards | Planned |
-| Load generator, reconciliation, chaos tooling | Planned |
+| Profiling, deeper pipeline metrics, alerting | Planned |
+| Packaged load generator, reconciliation, chaos tooling | Planned |
 | Explicit queue-drain confirmation on shutdown | Planned |
-| Protocol hardening | Planned |
+| Protocol hardening (malformed and oversized frame handling) | Planned |
 
 ## Project structure
 
@@ -827,7 +848,7 @@ The repository is being developed as a gateway implementation. A stable command-
 
 ## Docker deployment
 
-The Compose stack starts the FairGate TCP server, ClickHouse, Prometheus, and Grafana. FairGate waits for ClickHouse's health check before starting, the shipper runs as part of the gateway (no enabling setting is needed), and the WAL and checkpoint persist in the `fairgate_wal` volume. As the shipper's checkpoint advances, older WAL segments in that volume are deleted automatically.
+The Compose stack starts the FairGate TCP server and its health and metrics endpoint, ClickHouse, Prometheus, and Grafana. Prometheus and Grafana use pinned image versions. FairGate waits for ClickHouse's health check before starting, Compose checks the gateway through `GET /health` on port `9100`, the shipper runs as part of the gateway (no enabling setting is needed), and the WAL and checkpoint persist in the `fairgate_wal` volume. As the shipper's checkpoint advances, older WAL segments in that volume are deleted automatically. Prometheus scrapes FairGate at `fairgate:9100`; Grafana automatically loads the Prometheus datasource and the FairGate Overview dashboard.
 
 ```bash
 sudo docker compose up --build -d
@@ -835,7 +856,19 @@ sudo docker compose ps
 sudo docker compose logs -f fairgate clickhouse
 ```
 
-For access from outside the host, edit the `fairgate` port mapping in `docker-compose.yml` from the loopback-only binding to:
+Open Grafana at [http://localhost:3001](http://localhost:3001) (default login `admin` / `admin`; change the password at first login). The standalone Next.js dashboard uses port `3000`. Prometheus is at [http://localhost:9090](http://localhost:9090); its host port is published for the remote dashboard, so restrict inbound TCP `9090` to trusted source addresses in the host firewall/security group. The gateway metrics endpoint is at [http://localhost:9100/metrics](http://localhost:9100/metrics), bound to loopback by default. `FAIRGATE_METRICS_ADDR` changes the gateway's metrics listener; if you change it, update the Compose port mapping and Prometheus target to match.
+
+Published ports:
+
+| Port | Service |
+|---|---|
+| `9001` | FairGate TCP ingestion (length-prefixed protocol, not HTTP) |
+| `9100` | FairGate HTTP: `/health` and `/metrics` |
+| `9000` | ClickHouse native protocol |
+| `9090` | Prometheus |
+| `3001` | Grafana |
+
+For access from outside the host, if your `fairgate` port mapping is still bound to loopback, edit it in `docker-compose.yml` from the loopback-only binding to:
 
 ```yaml
 ports:
@@ -863,14 +896,14 @@ Known limitations of the current beta:
 - WAL retention depends on the shipper. Reclamation advances only when a batch is inserted and its checkpoint committed, so while ClickHouse is unavailable, or a batch keeps failing and is retried, segments accumulate on disk.
 - Reclamation deletes whole segments older than the checkpoint segment. The checkpoint and active segments are retained, so some already shipped records remain on disk until a later checkpoint passes them, and reclaimed records are no longer available for recovery replay or inspection.
 - The ClickHouse integration test is optional and runs only when the environment is configured for it.
-- Queue capacity, DRR quantum, the shutdown grace period, and the shipper's batch size, poll interval, and retry policy are fixed in the code and not yet configurable.
+- Queue capacity, the admission rate and burst, the DRR quantum, the shutdown grace period, and the shipper's batch size, poll interval, and retry policy are fixed in the code and not yet configurable.
 - All producers receive equal scheduling treatment. Weights are not yet supported.
 - Enqueueing blocks on a full queue (cancelable during shutdown), and no load-shedding policy exists yet.
 - A WAL write, rotation, or sync failure is fatal: later appends are rejected until the WAL is reopened.
 - Startup recovery fails on an incomplete record in any non-final segment, rather than repairing it.
 - Shutdown has no explicit queue-drain confirmation, and a handler stuck in an operation that ignores connection closure and context cancellation can delay it beyond the grace period.
-- The Compose file ships with development credentials and, by default, a loopback-only FairGate port; exposing it needs the changes described in [Docker deployment](#docker-deployment).
-- FairGate does not yet provide its own metrics, profiling endpoints, or dashboards.
+- The Compose file ships with development credentials and publishes the FairGate, ClickHouse, Prometheus, and Grafana ports; restrict inbound access to trusted addresses as described in [Docker deployment](#docker-deployment) and replace the credentials before any non-development use.
+- FairGate currently exposes a basic Prometheus metrics set (active connections, accepted, rejected and invalid events, WAL append errors, scheduler totals), a `/health` endpoint, and a provisioned Grafana overview dashboard. Profiling, per-stage latency metrics, queue-depth metrics, and shipper lag metrics are not available yet.
 
 ## Contributing
 

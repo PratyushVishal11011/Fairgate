@@ -2,6 +2,7 @@ package server
 
 import (
 	"FairGate/internal/admit"
+	"FairGate/internal/observability"
 	"FairGate/internal/sched"
 	"FairGate/internal/shipper"
 	"FairGate/internal/store"
@@ -14,6 +15,7 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"net/http"
 	"os"
 	"sync"
 	"time"
@@ -55,6 +57,20 @@ func RunContext(ctx context.Context, addr string, logger *slog.Logger) error {
 }
 
 func runContext(ctx context.Context, addr string, logger *slog.Logger, newStore func() (store.Store, error)) error {
+	metrics := observability.New()
+	metricsServer := &http.Server{Addr: envOrDefault("FAIRGATE_METRICS_ADDR", ":9100"), Handler: metrics.Handler()}
+	metricsListener, err := net.Listen("tcp", metricsServer.Addr)
+	if err != nil {
+		return fmt.Errorf("listen for metrics: %w", err)
+	}
+	metricsErr := make(chan error, 1)
+	go func() {
+		if err := metricsServer.Serve(metricsListener); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			metricsErr <- err
+		}
+	}()
+	defer func() { _ = metricsServer.Close() }()
+
 	// Open a TCP listener on the specified address.
 	listener, err := net.Listen("tcp", addr)
 	if err != nil {
@@ -110,7 +126,7 @@ func runContext(ctx context.Context, addr string, logger *slog.Logger, newStore 
 		checkpoint,
 		backoff,
 		shipper.Config{
-			BatchSize:    100,
+			BatchSize:    200,
 			PollInterval: time.Second,
 		},
 	)
@@ -142,14 +158,14 @@ func runContext(ctx context.Context, addr string, logger *slog.Logger, newStore 
 
 	logger.Info("server listening on", "address", addr)
 
-	admission, err := admit.NewManager(100, 200)
+	admission, err := admit.NewManager(500, 1000)
 	if err != nil {
 		return err
 	}
 
 	// Create one shared queue manager.
-	// For testing, each producer can buffer up to 256 events.
-	queues, err := sched.NewQueues(256)
+	// For testing, each producer can buffer up to 512 events.
+	queues, err := sched.NewQueues(512)
 	if err != nil {
 		return err
 	}
@@ -171,6 +187,7 @@ func runContext(ctx context.Context, addr string, logger *slog.Logger, newStore 
 		defer close(schedulerDone)
 
 		err := scheduler.Run(schedulerCtx, queues, func(event wire.Event) error {
+			metrics.EventProcessed()
 			logger.Info("Event processed by DRR",
 				"producer_id", event.ProducerId,
 				"seq", event.Seq,
@@ -271,6 +288,11 @@ func runContext(ctx context.Context, addr string, logger *slog.Logger, newStore 
 				if ctx.Err() == nil && !errors.Is(err, net.ErrClosed) {
 					runErr = err
 				}
+				select {
+				case metricsError := <-metricsErr:
+					runErr = fmt.Errorf("metrics server: %w", metricsError)
+				default:
+				}
 			}
 			break
 		}
@@ -281,6 +303,7 @@ func runContext(ctx context.Context, addr string, logger *slog.Logger, newStore 
 		//register the connection.
 		activeConns[conn] = struct{}{}
 		connMu.Unlock()
+		metrics.ConnectionOpened()
 
 		//Increments the WaitGroup counter
 		//We do this as we're starting a new goroutine
@@ -294,18 +317,20 @@ func runContext(ctx context.Context, addr string, logger *slog.Logger, newStore 
 
 			//deferred function to remove the connection from active connections when the function exits
 			defer func() {
+				metrics.ConnectionClosed()
 				connMu.Lock()
 				delete(activeConns, conn)
 				connMu.Unlock()
 			}()
 
-			handleConnContext(
+			handleConnWithMetrics(
 				handlerCtx,
 				conn,
 				logger,
 				admission,
 				queues,
 				walLog,
+				metrics,
 			)
 		}(conn)
 	}
@@ -374,6 +399,18 @@ func handleConnContext(
 	queues *sched.Queues,
 	walLog *wal.WAL,
 ) {
+	handleConnWithMetrics(ctx, conn, logger, admission, queues, walLog, observability.New())
+}
+
+func handleConnWithMetrics(
+	ctx context.Context,
+	conn net.Conn,
+	logger *slog.Logger,
+	admission *admit.Manager,
+	queues *sched.Queues,
+	walLog *wal.WAL,
+	metrics *observability.Metrics,
+) {
 	// Close the connection when the client exits.
 	defer conn.Close()
 
@@ -416,6 +453,7 @@ func handleConnContext(
 		// Decode the event and check for errors in the payload.
 		event, err := wire.DecodeEvent(frame.Payload)
 		if err != nil {
+			metrics.EventInvalid()
 			logger.Warn("Invalid event payload", "remote_addr", remoteAddr, "error", err)
 			if werr := sendAck(conn, wire.Ack{
 				Status:  ackInvalid,
@@ -440,6 +478,7 @@ func handleConnContext(
 
 		// If the event is not allowed: log, send ack and continue.
 		if !admission.Allow(event.ProducerId) {
+			metrics.EventRejected()
 			logger.Warn("Event rejected by admission control",
 				"remote_addr", remoteAddr, "producer_id", event.ProducerId, "seq", event.Seq)
 			if werr := sendAck(conn, wire.Ack{
@@ -457,6 +496,7 @@ func handleConnContext(
 
 		// Append the event to the WAL.
 		if err := walLog.Append(event); err != nil {
+			metrics.WALAppendError()
 			logger.Error("Failed to append to WAL",
 				"remote_addr", remoteAddr, "producer_id", event.ProducerId, "seq", event.Seq, "error", err)
 			if werr := sendAck(conn, wire.Ack{
@@ -499,6 +539,7 @@ func handleConnContext(
 			logger.Warn("Failed to send ACK", "remote_addr", remoteAddr, "error", err)
 			return
 		}
+		metrics.EventAccepted()
 
 		logger.Info(
 			"Event enqueued",
