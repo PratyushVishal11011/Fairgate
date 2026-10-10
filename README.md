@@ -61,7 +61,7 @@ The project explores fair resource sharing in event-ingestion systems: keeping p
 - **Always-on gateway shipper.** `RunContext` always constructs the ClickHouse store and starts the shipper alongside the server. Shutdown always cancels and joins it before the store and WAL are closed.
 - **Retry with backoff.** Retries failed batch inserts with capped exponential delay, configurable jitter, and context-aware waiting. The same batch is retried until it succeeds or the context is canceled.
 - **Durable checkpoints.** Stores the last successfully inserted record position as a segment and offset. Checkpoints are written through a synced temporary file followed by an atomic rename; a missing checkpoint starts reading at the beginning of the WAL, and invalid JSON or negative offsets are rejected.
-- **Checkpoint-based WAL reclamation.** After each committed checkpoint, and once at startup against the checkpoint already on disk, the shipper calls `WAL.ReclaimBefore`. Only segments with IDs strictly less than the checkpoint segment are deleted; the checkpoint segment and the active segment are retained. Reclamation is serialized with rotation, and the containing directory is synced after deletion.
+- **Checkpoint-based WAL reclamation.** After each committed checkpoint, and once at startup against the checkpoint already on disk, the shipper calls `WAL.ReclaimBefore`. Only segments with IDs strictly less than the checkpoint segment are deleted; the checkpoint segment and the active segment are retained. A checkpoint beyond the durable end is rejected with `ErrCheckpointAhead`, and nothing is deleted. Reclamation is serialized with rotation, and the containing directory is synced after deletion.
 - **Store interface.** `InsertBatch(ctx, events)` and `Close()` separate storage from the processing pipeline.
 - **ClickHouse adapter.** Official Go client with configurable authentication, `Ping` health checks, batched inserts through `PrepareBatch` and `Send`, and graceful cleanup.
 - **Optional ClickHouse integration test.** Environment-gated test covering connectivity, batch insertion, and retrieval.
@@ -87,6 +87,16 @@ The project explores fair resource sharing in event-ingestion systems: keeping p
 Planned capabilities are not implied to be available in this beta.
 
 ## Recent updates
+
+### 10th October, 2026: Checkpoint guard for WAL reclamation
+
+`WAL.ReclaimBefore` now rejects checkpoints that point past the WAL's durable end, and it holds the segment mutex for the whole reclamation so the active segment cannot change while files are being removed.
+
+- **Durable-end guard.** A checkpoint whose segment is beyond the durable end returns `ErrCheckpointAhead` and deletes nothing. A caller that passes an unsynced position now gets an error instead of silently removing segments.
+- **Active and checkpoint segments protected.** Reclamation never removes the checkpoint segment or the active segment, even if a caller passes an unexpected position.
+- **Tests.** A new test covers reclamation across rotated segments, confirms that the checkpoint and active segments survive, and confirms that a checkpoint past the durable end is rejected.
+
+Startup ordering is `Recover` (which truncates any torn tail in the final segment) followed by `wal.Open`, so `DurableEnd()` reflects only complete records.
 
 ### 09th October, 2026: Gateway health, metrics, and deployment monitoring
 
@@ -261,7 +271,7 @@ flowchart LR
 | `internal/wire` | Frame codec, event and acknowledgment types, validation. |
 | `internal/admit` | Token-bucket admission control. |
 | `internal/sched` | Per-producer bounded queues (including context-aware `EnqueueContext`) and the DRR scheduler. |
-| `internal/wal` | Segmented WAL, writer goroutine with group commit, segment rotation, synchronization, ordered recovery with cross-segment validation over a possibly sparse segment set, and checkpoint-based segment reclamation (`ReclaimBefore`). |
+| `internal/wal` | Segmented WAL, writer goroutine with group commit, segment rotation, synchronization, ordered recovery with cross-segment validation over a possibly sparse segment set, and checkpoint-based segment reclamation (`ReclaimBefore`) with a durable-end guard (`ErrCheckpointAhead`). |
 | `internal/shipper` | Durable WAL reader, checkpoint load and atomic commit, batching, polling at the durable end, retry with capped exponential backoff and jitter, and triggering WAL reclamation after each commit and at startup. |
 | `internal/store` | `Store` interface and the ClickHouse adapter. |
 
@@ -449,6 +459,7 @@ Once the shipper has committed a checkpoint, segments that lie entirely before i
 The deletion rules are conservative:
 
 - Only segments whose IDs are strictly less than the checkpoint segment are deleted.
+- A checkpoint in a segment beyond the durable end is rejected with `ErrCheckpointAhead`, and nothing is deleted.
 - The checkpoint segment is retained, because the checkpoint offset may still leave records in it to ship.
 - The active segment is always retained.
 - Reclamation is serialized with rotation through a segment mutex, so a segment is not deleted while the writer is rotating.
@@ -644,6 +655,7 @@ The listen address is chosen by the caller. The ClickHouse store is built from t
 | Batch may be inserted again after a crash before checkpoint commit | Yes (duplicates possible) |
 | WAL segments reclaimed after shipping | Yes; segments older than the committed checkpoint segment are removed |
 | Reclamation runs only after the checkpoint commit (and at startup against the checkpoint on disk) | Yes |
+| Reclamation rejects checkpoints beyond the durable end | Yes (`ErrCheckpointAhead`) |
 | Checkpoint segment or active segment reclaimed | No |
 | Unshipped records removed by reclamation | No |
 | WAL retains full event history | No |
@@ -693,7 +705,7 @@ ClickHouse is the initial storage backend. The `Store` interface, ClickHouse ada
 | Shipper | Reads from the WAL at the saved position, forms batches up to `BatchSize`, and inserts them through the `Store`. `Run(ctx)` polls for newly durable records and runs until its context is canceled. |
 | Retry policy | Retries insertion errors with exponential backoff capped at a maximum delay, optional symmetric jitter, and context-aware cancellation. |
 | Checkpoint | JSON segment and byte offset. Missing files mean the beginning of the WAL; writes sync a temporary file and atomically rename it after each successful batch. |
-| Reclamation | After each checkpoint commit, and once at startup against the checkpoint on disk, calls `WAL.ReclaimBefore`. Deletes only segments with IDs strictly less than the checkpoint segment, keeping the checkpoint and active segments, serialized with rotation, with a directory sync afterward. |
+| Reclamation | After each checkpoint commit, and once at startup against the checkpoint on disk, calls `WAL.ReclaimBefore`. Rejects checkpoints beyond the durable end with `ErrCheckpointAhead`. Otherwise deletes only segments with IDs strictly less than the checkpoint segment, keeping the checkpoint and active segments, serialized with rotation, with a directory sync afterward. |
 | `Store` interface | `InsertBatch(ctx, events)` and `Close()`. Backends plug in without changes to the shipper. |
 | ClickHouse adapter | Official Go client, configurable authentication, `Ping` health check, batched inserts with `PrepareBatch` and `Send`, graceful close. |
 | Integration test | Optional and environment-gated. Validates connectivity, batch insertion, and retrieval. |
@@ -752,7 +764,7 @@ The roadmap lists planned work in dependency order. Items are subject to change.
 ```mermaid
 flowchart TD
     P1["Phase 1: Core ingestion (implemented)<br/>TCP server, wire protocol, admission control<br/>Per-producer queues, DRR scheduling<br/>Segmented WAL with group commit and ordered recovery<br/>Context-aware lifecycle and graceful shutdown<br/>Store interface, ClickHouse adapter<br/>Health endpoint, Prometheus metrics, Grafana overview"]
-    P2["Phase 2: Durable delivery (implemented)<br/>WAL shipping, checkpoints, retry and backoff<br/>Always-on runtime wiring<br/>Checkpoint-based WAL segment reclamation"]
+    P2["Phase 2: Durable delivery (implemented)<br/>WAL shipping, checkpoints, retry and backoff<br/>Always-on runtime wiring<br/>Checkpoint-based WAL segment reclamation with durable-end guard"]
     P3["Phase 3: Fairness and overload control (planned)<br/>Producer weights, backlog-aware overload handling<br/>Load shedding"]
     P4["Phase 4: Operability and hardening (planned)<br/>Profiling, deeper metrics, alerting<br/>Packaged load, reconcile, and chaos tools<br/>Protocol hardening"]
 
@@ -782,6 +794,7 @@ A solid border marks implemented work. Dashed borders mark planned work.
 | Durable checkpoints and retry with backoff | Implemented |
 | Shipper runtime wiring and lifecycle | Implemented; shipper always runs |
 | WAL segment reclamation | Implemented for segments older than the committed checkpoint segment |
+| Durable-end guard on reclamation | Implemented (`ErrCheckpointAhead`); same-segment offset check planned |
 | Docker image, Compose stack | Implemented |
 | Health endpoint, basic Prometheus metrics, Grafana overview dashboard | Implemented |
 | Producer weights and richer fairness controls | Planned |
@@ -895,6 +908,7 @@ Known limitations of the current beta:
 - A crash after a successful database insert but before checkpoint commit can replay that batch. Storage therefore needs to tolerate duplicates; end-to-end exactly-once delivery is not guaranteed.
 - WAL retention depends on the shipper. Reclamation advances only when a batch is inserted and its checkpoint committed, so while ClickHouse is unavailable, or a batch keeps failing and is retried, segments accumulate on disk.
 - Reclamation deletes whole segments older than the checkpoint segment. The checkpoint and active segments are retained, so some already shipped records remain on disk until a later checkpoint passes them, and reclaimed records are no longer available for recovery replay or inspection.
+- The reclamation guard compares segment IDs only. A checkpoint in the same segment as the durable end but with an offset past it is not rejected yet.
 - The ClickHouse integration test is optional and runs only when the environment is configured for it.
 - Queue capacity, the admission rate and burst, the DRR quantum, the shutdown grace period, and the shipper's batch size, poll interval, and retry policy are fixed in the code and not yet configurable.
 - All producers receive equal scheduling treatment. Weights are not yet supported.

@@ -443,24 +443,46 @@ func listSegments(path string) ([]segment, error) {
 
 // ReclaimBefore removes completed WAL segments strictly older than the checkpoint segment.
 // The current checkpoint segment is retained because its offset may still point to records that have not shipped.
+var ErrCheckpointAhead = errors.New("wal: checkpoint is beyond durable end")
+
 func (w *WAL) ReclaimBefore(checkpoint Position) error {
 	w.segmentMu.Lock()
 	defer w.segmentMu.Unlock()
+
 	if checkpoint.SegmentId == 0 {
 		return nil
 	}
-	segments, err := listSegments(w.path)
+
+	// Reject checkpoints that refer to data the WAL has not made durable.
+	if durable := w.DurableEnd(); checkpoint.SegmentId > durable.SegmentId {
+		return ErrCheckpointAhead
+	}
+
+	// Never reclaim the checkpoint segment or the active segment.
+	cutoff := checkpoint.SegmentId
+	if w.segmentId < cutoff {
+		cutoff = w.segmentId
+	}
+
+	segments, err := listSegments(w.path) // sorted ascending by id
 	if err != nil {
 		return err
 	}
+
+	removed := false
 	for _, seg := range segments {
-		if seg.id >= checkpoint.SegmentId || seg.id == w.segmentId {
-			continue
+		if seg.id >= cutoff {
+			break
 		}
 		if err := os.Remove(seg.path); err != nil && !os.IsNotExist(err) {
 			return err
 		}
+		removed = true
 	}
+	if !removed {
+		return nil
+	}
+
 	dir, err := os.Open(filepath.Dir(w.path))
 	if err != nil {
 		return err
@@ -468,7 +490,6 @@ func (w *WAL) ReclaimBefore(checkpoint Position) error {
 	defer dir.Close()
 	return dir.Sync()
 }
-
 func (w *WAL) Close() error {
 	//this function safely closes the WAL file.
 	w.submitMu.Lock()

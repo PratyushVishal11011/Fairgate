@@ -3,6 +3,7 @@ package wal
 import (
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"hash/crc32"
 	"os"
 	"path/filepath"
@@ -68,4 +69,54 @@ func TestAppend(t *testing.T) {
 		decoded.Payload != event.Payload {
 		t.Fatal("decoded event does not match original")
 	}
+}
+
+func TestReclaimBeforeKeepsCheckpointAndActiveSegments(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "wal")
+
+	w, err := openWithSegmentSize(path, 256) // tiny segments force rotation
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+
+	for i := 0; i < 50; i++ {
+		if err := w.Append(wire.Event{ /* fill in fields */ }); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	durable := w.DurableEnd()
+	if durable.SegmentId < 2 {
+		t.Fatalf("need at least 3 segments, got active id %d", durable.SegmentId)
+	}
+
+	// Checkpoint on the active segment: everything older may go, nothing else.
+	if err := w.ReclaimBefore(durable); err != nil {
+		t.Fatal(err)
+	}
+	segs, _ := listSegments(path)
+	if !containsSegment(segs, durable.SegmentId) {
+		t.Fatalf("active/checkpoint segment %d was reclaimed", durable.SegmentId)
+	}
+	if segs[0].id < durable.SegmentId {
+		// Only the active segment and newer should remain.
+		t.Fatalf("older segment %d survived reclaim", segs[0].id)
+	}
+
+	// A checkpoint beyond the durable end must be rejected.
+	ahead := Position{SegmentId: durable.SegmentId + 1}
+	if err := w.ReclaimBefore(ahead); !errors.Is(err, ErrCheckpointAhead) {
+		t.Fatalf("expected ErrCheckpointAhead, got %v", err)
+	}
+}
+
+func containsSegment(segs []segment, id uint64) bool {
+	for _, s := range segs {
+		if s.id == id {
+			return true
+		}
+	}
+	return false
 }
