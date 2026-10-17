@@ -11,12 +11,10 @@ import (
 )
 
 func TestClickHouseInsertBatchIntegration(t *testing.T) {
-	// Run this test only when explicitly enabled.
 	if os.Getenv("FAIRGATE_CLICKHOUSE_INTEGRATION") != "1" {
 		t.Skip("set FAIRGATE_CLICKHOUSE_INTEGRATION=1 to run")
 	}
 
-	// Use Docker Compose defaults, with environment overrides available.
 	addr := os.Getenv("CLICKHOUSE_ADDR")
 	if addr == "" {
 		addr = "127.0.0.1:9000"
@@ -43,7 +41,6 @@ func TestClickHouseInsertBatchIntegration(t *testing.T) {
 	)
 	defer cancel()
 
-	// Connect to the running ClickHouse instance.
 	ch, err := NewClickHouseStore(
 		[]string{addr},
 		database,
@@ -55,7 +52,6 @@ func TestClickHouseInsertBatchIntegration(t *testing.T) {
 	}
 	defer ch.Close()
 
-	// Generate a unique producer ID to isolate this test's records.
 	producerID := fmt.Sprintf(
 		"integration-test-%d",
 		time.Now().UnixNano(),
@@ -83,12 +79,17 @@ func TestClickHouseInsertBatchIntegration(t *testing.T) {
 		},
 	}
 
-	// Insert both events as a single batch.
-	if err := ch.InsertBatch(ctx, events); err != nil {
-		t.Fatalf("InsertBatch failed: %v", err)
+	token := fmt.Sprintf("integration-%s-%d", producerID, baseSeq)
+
+	if err := ch.InsertBatch(ctx, events, token); err != nil {
+		t.Fatalf("initial InsertBatch failed: %v", err)
 	}
 
-	// Query each event back and verify its stored fields.
+	// Replay the exact same batch with the same idempotency token.
+	if err := ch.InsertBatch(ctx, events, token); err != nil {
+		t.Fatalf("replayed InsertBatch failed: %v", err)
+	}
+
 	for _, want := range events {
 		t.Run(fmt.Sprintf("seq_%d", want.Seq), func(t *testing.T) {
 			var got wire.Event
@@ -96,17 +97,17 @@ func TestClickHouseInsertBatchIntegration(t *testing.T) {
 			err := ch.conn.QueryRow(
 				ctx,
 				`SELECT
-					producer_id,
-					event_time,
-					seq,
-					idx,
-					event_type,
-					payload
-				FROM fairgate.events
-				WHERE producer_id = ?
-					AND seq = ?
-					AND idx = ?
-				LIMIT 1`,
+producer_id,
+event_time,
+seq,
+idx,
+event_type,
+payload
+FROM fairgate.events
+WHERE producer_id = ?
+AND seq = ?
+AND idx = ?
+LIMIT 1`,
 				want.ProducerId,
 				want.Seq,
 				want.Idx,

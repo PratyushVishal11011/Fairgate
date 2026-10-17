@@ -5,7 +5,10 @@ import (
 	"FairGate/internal/wal"
 	"FairGate/internal/wire"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
+	"fmt"
 	"io"
 	"time"
 )
@@ -82,7 +85,6 @@ func positionCheckpoint(position wal.Position) Checkpoint {
 		Offset:  position.Offset,
 	}
 }
-
 func (s *Shipper) Run(ctx context.Context) error {
 	checkpoint, err := s.checkpoint.Load()
 	if err != nil {
@@ -91,8 +93,8 @@ func (s *Shipper) Run(ctx context.Context) error {
 	if err := s.wal.ReclaimBefore(checkpointPosition(checkpoint)); err != nil {
 		return err
 	}
-
-	reader := wal.NewReader(s.wal, checkpointPosition(checkpoint))
+	start := checkpointPosition(checkpoint)
+	reader := wal.NewReader(s.wal, start)
 	poll := time.NewTicker(s.config.PollInterval)
 	defer poll.Stop()
 
@@ -112,7 +114,7 @@ func (s *Shipper) Run(ctx context.Context) error {
 			}
 		}
 
-		if err := s.writeBatch(ctx, batch); err != nil {
+		if err := s.writeBatch(ctx, batch, start, end); err != nil {
 			return err
 		}
 
@@ -163,9 +165,12 @@ func (s *Shipper) readBatch(
 func (s *Shipper) writeBatch(
 	ctx context.Context,
 	batch []wire.Event,
+	start wal.Position,
+	end wal.Position,
 ) error {
 	for attempt := 0; ; attempt++ {
-		err := s.store.InsertBatch(ctx, batch)
+		token := batchToken(start, end)
+		err := s.store.InsertBatch(ctx, batch, token)
 		if err == nil {
 			return nil
 		}
@@ -178,4 +183,17 @@ func (s *Shipper) writeBatch(
 			return err
 		}
 	}
+}
+
+func batchToken(start, end wal.Position) string {
+	value := fmt.Sprintf(
+		"fairgate:%d:%d:%d:%d",
+		start.SegmentId,
+		start.Offset,
+		end.SegmentId,
+		end.Offset,
+	)
+
+	sum := sha256.Sum256([]byte(value))
+	return hex.EncodeToString(sum[:])
 }
