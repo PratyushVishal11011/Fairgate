@@ -11,12 +11,10 @@ import (
 )
 
 func TestClickHouseInsertBatchIntegration(t *testing.T) {
-	// Run this test only when explicitly enabled.
 	if os.Getenv("FAIRGATE_CLICKHOUSE_INTEGRATION") != "1" {
 		t.Skip("set FAIRGATE_CLICKHOUSE_INTEGRATION=1 to run")
 	}
 
-	// Use Docker Compose defaults, with environment overrides available.
 	addr := os.Getenv("CLICKHOUSE_ADDR")
 	if addr == "" {
 		addr = "127.0.0.1:9000"
@@ -39,11 +37,10 @@ func TestClickHouseInsertBatchIntegration(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(
 		context.Background(),
-		15*time.Second,
+		30*time.Second,
 	)
 	defer cancel()
 
-	// Connect to the running ClickHouse instance.
 	ch, err := NewClickHouseStore(
 		[]string{addr},
 		database,
@@ -55,7 +52,6 @@ func TestClickHouseInsertBatchIntegration(t *testing.T) {
 	}
 	defer ch.Close()
 
-	// Generate a unique producer ID to isolate this test's records.
 	producerID := fmt.Sprintf(
 		"integration-test-%d",
 		time.Now().UnixNano(),
@@ -83,30 +79,68 @@ func TestClickHouseInsertBatchIntegration(t *testing.T) {
 		},
 	}
 
-	// Insert both events as a single batch.
-	if err := ch.InsertBatch(ctx, events); err != nil {
-		t.Fatalf("InsertBatch failed: %v", err)
+	token := fmt.Sprintf("integration-%s-%d", producerID, baseSeq)
+
+	if err := ch.InsertBatch(ctx, events, token); err != nil {
+		t.Fatalf("initial InsertBatch failed: %v", err)
 	}
 
-	// Query each event back and verify its stored fields.
+	if err := ch.InsertBatch(ctx, events, token); err != nil {
+		t.Fatalf("replayed InsertBatch failed: %v", err)
+	}
+
 	for _, want := range events {
-		t.Run(fmt.Sprintf("seq_%d", want.Seq), func(t *testing.T) {
-			var got wire.Event
+		want := want
+
+		t.Run(fmt.Sprintf("seq_%d_idx_%d", want.Seq, want.Idx), func(t *testing.T) {
+			var count uint64
 
 			err := ch.conn.QueryRow(
 				ctx,
-				`SELECT
-					producer_id,
-					event_time,
-					seq,
-					idx,
-					event_type,
-					payload
-				FROM fairgate.events
-				WHERE producer_id = ?
-					AND seq = ?
-					AND idx = ?
-				LIMIT 1`,
+				fmt.Sprintf(
+					`SELECT count()
+FROM %s.events
+WHERE producer_id = ?
+AND seq = ?
+AND idx = ?`,
+					quoteIdentifier(database),
+				),
+				want.ProducerId,
+				want.Seq,
+				want.Idx,
+			).Scan(&count)
+			if err != nil {
+				t.Fatalf("count inserted event: %v", err)
+			}
+
+			if count != 1 {
+				t.Fatalf(
+					"expected exactly one copy of event seq=%d idx=%d, got %d",
+					want.Seq,
+					want.Idx,
+					count,
+				)
+			}
+
+			var got wire.Event
+
+			err = ch.conn.QueryRow(
+				ctx,
+				fmt.Sprintf(
+					`SELECT
+producer_id,
+event_time,
+seq,
+idx,
+event_type,
+payload
+FROM %s.events
+WHERE producer_id = ?
+AND seq = ?
+AND idx = ?
+LIMIT 1`,
+					quoteIdentifier(database),
+				),
 				want.ProducerId,
 				want.Seq,
 				want.Idx,
@@ -146,4 +180,21 @@ func TestClickHouseInsertBatchIntegration(t *testing.T) {
 			}
 		})
 	}
+}
+
+func quoteIdentifier(identifier string) string {
+	for _, r := range identifier {
+		if (r < 'a' || r > 'z') &&
+			(r < 'A' || r > 'Z') &&
+			(r < '0' || r > '9') &&
+			r != '_' {
+			panic("invalid ClickHouse database identifier")
+		}
+	}
+
+	if identifier == "" {
+		panic("empty ClickHouse database identifier")
+	}
+
+	return "`" + identifier + "`"
 }

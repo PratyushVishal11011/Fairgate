@@ -48,7 +48,9 @@ func Run(addr string, logger *slog.Logger) error {
 func RunContext(ctx context.Context, addr string, logger *slog.Logger) error {
 	return runContext(ctx, addr, logger, func() (store.Store, error) {
 		return store.NewClickHouseStore(
-			[]string{envOrDefault("CLICKHOUSE_ADDR", "localhost:9000")},
+			[]string{
+				envOrDefault("CLICKHOUSE_ADDR", "localhost:9000"),
+			},
 			envOrDefault("CLICKHOUSE_DATABASE", "fairgate"),
 			envOrDefault("CLICKHOUSE_USER", "fairgate"),
 			envOrDefault("CLICKHOUSE_PASSWORD", "fairgate_dev_password"),

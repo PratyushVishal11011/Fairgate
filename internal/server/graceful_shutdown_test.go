@@ -14,8 +14,17 @@ import (
 
 type shutdownTestStore struct{}
 
-func (shutdownTestStore) InsertBatch(context.Context, []wire.Event) error { return nil }
-func (shutdownTestStore) Close() error                                  { return nil }
+func (shutdownTestStore) InsertBatch(
+	context.Context,
+	[]wire.Event,
+	string,
+) error {
+	return nil
+}
+
+func (shutdownTestStore) Close() error {
+	return nil
+}
 
 func testServerAddress(t *testing.T) string {
 	t.Helper()
@@ -37,7 +46,12 @@ func startTestServer(t *testing.T) (context.CancelFunc, <-chan error, string) {
 	t.Helper()
 
 	ctx, cancel := context.WithCancel(context.Background())
-	t.Setenv("FAIRGATE_CHECKPOINT_PATH", t.TempDir()+"/checkpoint.json")
+
+	t.Setenv(
+		"FAIRGATE_CHECKPOINT_PATH",
+		t.TempDir()+"/checkpoint.json",
+	)
+
 	addr := testServerAddress(t)
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	done := make(chan error, 1)
@@ -48,7 +62,6 @@ func startTestServer(t *testing.T) (context.CancelFunc, <-chan error, string) {
 		})
 	}()
 
-	// Wait until the server is listening.
 	deadline := time.Now().Add(5 * time.Second)
 
 	for time.Now().Before(deadline) {
@@ -91,6 +104,7 @@ func TestRunContextShutdown(t *testing.T) {
 
 func TestRunContextStopsAcceptingConnections(t *testing.T) {
 	cancel, done, addr := startTestServer(t)
+	defer cancel()
 
 	cancel()
 

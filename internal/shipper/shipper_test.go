@@ -17,11 +17,13 @@ type fakeStore struct {
 	failuresRemaining int
 	insertCalls       int
 	batches           [][]wire.Event
+	tokens            []string
 }
 
 func (f *fakeStore) InsertBatch(
 	ctx context.Context,
 	events []wire.Event,
+	token string,
 ) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -30,6 +32,7 @@ func (f *fakeStore) InsertBatch(
 
 	batchCopy := append([]wire.Event(nil), events...)
 	f.batches = append(f.batches, batchCopy)
+	f.tokens = append(f.tokens, token)
 
 	if f.failuresRemaining > 0 {
 		f.failuresRemaining--
@@ -55,12 +58,18 @@ func (f *fakeStore) Batches() [][]wire.Event {
 	defer f.mu.Unlock()
 
 	batches := make([][]wire.Event, len(f.batches))
-
 	for i, batch := range f.batches {
 		batches[i] = append([]wire.Event(nil), batch...)
 	}
 
 	return batches
+}
+
+func (f *fakeStore) Tokens() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	return append([]string(nil), f.tokens...)
 }
 
 func testShipperEvent(seq uint64, payload string) wire.Event {
@@ -104,9 +113,9 @@ func TestShipperReadsFromWALAndAdvancesCheckpoint(t *testing.T) {
 		}
 	}
 
-	checkpointPath := filepath.Join(dir, "checkpoint.json")
-	checkpointStore := NewCheckpointStore(checkpointPath)
-
+	checkpointStore := NewCheckpointStore(
+		filepath.Join(dir, "checkpoint.json"),
+	)
 	storage := &fakeStore{}
 
 	shipper, err := New(
@@ -124,63 +133,46 @@ func TestShipperReadsFromWALAndAdvancesCheckpoint(t *testing.T) {
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
 	done := make(chan error, 1)
+
 	go func() {
 		done <- shipper.Run(ctx)
 	}()
 
 	waitForCheckpoint(t, checkpointStore, storage, 1)
 	cancel()
+
 	if err := <-done; !errors.Is(err, context.Canceled) {
-		t.Fatalf("expected shipper to stop with context.Canceled, got %v", err)
+		t.Fatalf("expected context.Canceled, got %v", err)
 	}
 
-	if storage.Calls() != 1 {
-		t.Fatalf(
-			"expected 1 InsertBatch call, got %d",
-			storage.Calls(),
-		)
+	if got := storage.Calls(); got != 1 {
+		t.Fatalf("expected 1 InsertBatch call, got %d", got)
 	}
 
 	batches := storage.Batches()
-
-	if len(batches) != 1 {
-		t.Fatalf(
-			"expected 1 stored batch, got %d",
-			len(batches),
-		)
-	}
-
-	if len(batches[0]) != 2 {
-		t.Fatalf(
-			"expected batch of 2 events, got %d",
-			len(batches[0]),
-		)
+	if len(batches) != 1 || len(batches[0]) != 2 {
+		t.Fatalf("expected one batch of 2 events, got %#v", batches)
 	}
 
 	if batches[0][0].Seq != 1 || batches[0][1].Seq != 2 {
-		t.Fatalf("events were not read from WAL in order")
+		t.Fatal("events were not read from WAL in order")
 	}
+
+	assertNonEmptyTokens(t, storage.Tokens(), 1)
 
 	checkpoint, err := checkpointStore.Load()
 	if err != nil {
 		t.Fatal(err)
 	}
-
 	if checkpoint.Offset <= 0 {
-		t.Fatalf(
-			"expected checkpoint offset to advance, got %d",
-			checkpoint.Offset,
-		)
+		t.Fatalf("expected checkpoint to advance, got %d", checkpoint.Offset)
 	}
 }
 
 func TestShipperRetriesFailedInsert(t *testing.T) {
 	dir := t.TempDir()
-	walPath := filepath.Join(dir, "events.wal")
-
-	w, err := wal.Open(walPath)
+	w, err := wal.Open(filepath.Join(dir, "events.wal"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -190,19 +182,16 @@ func TestShipperRetriesFailedInsert(t *testing.T) {
 		testShipperEvent(1, "event-1"),
 		testShipperEvent(2, "event-2"),
 	}
-
 	for _, event := range events {
 		if err := w.Append(event); err != nil {
 			t.Fatal(err)
 		}
 	}
 
-	checkpointPath := filepath.Join(dir, "checkpoint.json")
-	checkpointStore := NewCheckpointStore(checkpointPath)
-
-	storage := &fakeStore{
-		failuresRemaining: 2,
-	}
+	checkpointStore := NewCheckpointStore(
+		filepath.Join(dir, "checkpoint.json"),
+	)
+	storage := &fakeStore{failuresRemaining: 2}
 
 	shipper, err := New(
 		storage,
@@ -219,56 +208,51 @@ func TestShipperRetriesFailedInsert(t *testing.T) {
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
 	done := make(chan error, 1)
-	start := time.Now()
+	startTime := time.Now()
+
 	go func() {
 		done <- shipper.Run(ctx)
 	}()
 
 	waitForCheckpoint(t, checkpointStore, storage, 3)
-	elapsed := time.Since(start)
+	elapsed := time.Since(startTime)
 	cancel()
+
 	if err := <-done; !errors.Is(err, context.Canceled) {
-		t.Fatalf("expected shipper to stop with context.Canceled, got %v", err)
+		t.Fatalf("expected context.Canceled, got %v", err)
 	}
 
-	if storage.Calls() != 3 {
-		t.Fatalf(
-			"expected 3 InsertBatch calls, got %d",
-			storage.Calls(),
-		)
+	if got := storage.Calls(); got != 3 {
+		t.Fatalf("expected 3 InsertBatch calls, got %d", got)
 	}
-
 	if elapsed < 2*time.Millisecond {
-		t.Fatalf(
-			"expected backoff delays, elapsed time was %v",
-			elapsed,
-		)
+		t.Fatalf("expected backoff delays, elapsed %v", elapsed)
 	}
 
 	batches := storage.Batches()
-
 	if len(batches) != 3 {
-		t.Fatalf(
-			"expected 3 attempts, got %d",
-			len(batches),
-		)
+		t.Fatalf("expected 3 attempts, got %d", len(batches))
 	}
 
 	for i, batch := range batches {
-		if len(batch) != 2 {
-			t.Fatalf(
-				"attempt %d: expected 2 events, got %d",
-				i+1,
-				len(batch),
-			)
+		if len(batch) != 2 ||
+			batch[0].Seq != 1 ||
+			batch[1].Seq != 2 {
+			t.Fatalf("attempt %d did not submit the original batch", i+1)
 		}
+	}
 
-		if batch[0].Seq != 1 || batch[1].Seq != 2 {
+	tokens := storage.Tokens()
+	assertNonEmptyTokens(t, tokens, 3)
+
+	for i, token := range tokens {
+		if token != tokens[0] {
 			t.Fatalf(
-				"attempt %d: retry did not submit the same batch",
+				"attempt %d used token %q; expected %q",
 				i+1,
+				token,
+				tokens[0],
 			)
 		}
 	}
@@ -277,68 +261,27 @@ func TestShipperRetriesFailedInsert(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-
 	if checkpoint.Offset <= 0 {
-		t.Fatalf(
-			"checkpoint did not advance after successful retry",
-		)
-	}
-}
-
-func waitForCheckpoint(
-	t *testing.T,
-	checkpointStore *CheckpointStore,
-	storage *fakeStore,
-	wantCalls int,
-) {
-	t.Helper()
-	deadline := time.NewTimer(5 * time.Second)
-	defer deadline.Stop()
-	ticker := time.NewTicker(time.Millisecond)
-	defer ticker.Stop()
-
-	for {
-		checkpoint, err := checkpointStore.Load()
-		if err != nil {
-			t.Fatalf("load checkpoint while waiting: %v", err)
-		}
-		if checkpoint.Offset > 0 && storage.Calls() >= wantCalls {
-			return
-		}
-
-		select {
-		case <-deadline.C:
-			t.Fatalf(
-				"timed out waiting for checkpoint and %d insert calls",
-				wantCalls,
-			)
-		case <-ticker.C:
-		}
+		t.Fatal("checkpoint did not advance after successful retry")
 	}
 }
 
 func TestShipperDoesNotAdvanceCheckpointOnCanceledRetry(t *testing.T) {
 	dir := t.TempDir()
-	walPath := filepath.Join(dir, "events.wal")
-
-	w, err := wal.Open(walPath)
+	w, err := wal.Open(filepath.Join(dir, "events.wal"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer w.Close()
 
-	event := testShipperEvent(1, "event-1")
-
-	if err := w.Append(event); err != nil {
+	if err := w.Append(testShipperEvent(1, "event-1")); err != nil {
 		t.Fatal(err)
 	}
 
-	checkpointPath := filepath.Join(dir, "checkpoint.json")
-	checkpointStore := NewCheckpointStore(checkpointPath)
-
-	storage := &fakeStore{
-		failuresRemaining: 100,
-	}
+	checkpointStore := NewCheckpointStore(
+		filepath.Join(dir, "checkpoint.json"),
+	)
+	storage := &fakeStore{failuresRemaining: 100}
 
 	backoff := NewBackoff(
 		50*time.Millisecond,
@@ -363,26 +306,23 @@ func TestShipperDoesNotAdvanceCheckpointOnCanceledRetry(t *testing.T) {
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
 	done := make(chan error, 1)
 
 	go func() {
 		done <- shipper.Run(ctx)
 	}()
 
-	deadline := time.After(time.Second)
+	deadline := time.NewTimer(time.Second)
+	defer deadline.Stop()
+	ticker := time.NewTicker(time.Millisecond)
+	defer ticker.Stop()
 
-	for {
-		if storage.Calls() >= 1 {
-			break
-		}
-
+	for storage.Calls() < 1 {
 		select {
-		case <-deadline:
+		case <-deadline.C:
+			cancel()
 			t.Fatal("timed out waiting for InsertBatch")
-		default:
-			time.Sleep(time.Millisecond)
+		case <-ticker.C:
 		}
 	}
 
@@ -391,25 +331,72 @@ func TestShipperDoesNotAdvanceCheckpointOnCanceledRetry(t *testing.T) {
 	select {
 	case err := <-done:
 		if !errors.Is(err, context.Canceled) {
-			t.Fatalf(
-				"expected context.Canceled, got %v",
-				err,
-			)
+			t.Fatalf("expected context.Canceled, got %v", err)
 		}
-
 	case <-time.After(time.Second):
-		t.Fatal("shipper did not stop after context cancellation")
+		t.Fatal("shipper did not stop after cancellation")
 	}
 
 	checkpoint, err := checkpointStore.Load()
 	if err != nil {
 		t.Fatal(err)
 	}
-
 	if checkpoint.Offset != 0 {
 		t.Fatalf(
 			"checkpoint advanced despite failed storage: offset=%d",
 			checkpoint.Offset,
 		)
+	}
+
+	tokens := storage.Tokens()
+	assertNonEmptyTokens(t, tokens, len(tokens))
+}
+
+func assertNonEmptyTokens(t *testing.T, tokens []string, want int) {
+	t.Helper()
+
+	if len(tokens) != want {
+		t.Fatalf("expected %d tokens, got %d", want, len(tokens))
+	}
+
+	for i, token := range tokens {
+		if token == "" {
+			t.Fatalf("attempt %d had an empty idempotency token", i+1)
+		}
+	}
+}
+
+func waitForCheckpoint(
+	t *testing.T,
+	checkpointStore *CheckpointStore,
+	storage *fakeStore,
+	wantCalls int,
+) {
+	t.Helper()
+
+	deadline := time.NewTimer(5 * time.Second)
+	defer deadline.Stop()
+
+	ticker := time.NewTicker(time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		checkpoint, err := checkpointStore.Load()
+		if err != nil {
+			t.Fatalf("load checkpoint while waiting: %v", err)
+		}
+
+		if checkpoint.Offset > 0 && storage.Calls() >= wantCalls {
+			return
+		}
+
+		select {
+		case <-deadline.C:
+			t.Fatalf(
+				"timed out waiting for checkpoint and %d insert calls",
+				wantCalls,
+			)
+		case <-ticker.C:
+		}
 	}
 }

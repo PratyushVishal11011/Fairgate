@@ -3,6 +3,8 @@ package store
 import (
 	"FairGate/internal/wire"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"time"
@@ -44,18 +46,27 @@ func NewClickHouseStore(
 }
 
 // InsertBatch inserts a batch of events into ClickHouse.
-func (s *ClickHouseStore) InsertBatch(ctx context.Context, events []wire.Event) error {
+func (s *ClickHouseStore) InsertBatch(ctx context.Context, events []wire.Event, token string) error {
 	if len(events) == 0 {
 		return nil
 	}
+
+	if token == "" {
+		return errors.New("token is required")
+	}
+
+	ctx = clickhouse.Context(ctx, clickhouse.WithSettings(clickhouse.Settings{"insert_deduplication_token": token}))
+
 	batch, err := s.conn.PrepareBatch(ctx, `INSERT INTO fairgate.events
-		(producer_id, event_time, seq, idx, event_type, payload)`)
+		(event_id, producer_id, event_time, seq, idx, event_type, payload)`)
 	if err != nil {
 		return fmt.Errorf("prepare batch: %w", err)
 	}
+	defer batch.Close()
 
 	for _, event := range events {
 		err := batch.Append(
+			eventID(event),
 			event.ProducerId,
 			event.EventTime,
 			event.Seq,
@@ -77,4 +88,16 @@ func (s *ClickHouseStore) InsertBatch(ctx context.Context, events []wire.Event) 
 // Close releases the ClickHouse connection.
 func (s *ClickHouseStore) Close() error {
 	return s.conn.Close()
+}
+
+func eventID(event wire.Event) string {
+	identity := fmt.Sprintf(
+		"%s:%d:%d",
+		event.ProducerId,
+		event.Seq,
+		event.Idx,
+	)
+
+	sum := sha256.Sum256([]byte(identity))
+	return hex.EncodeToString(sum[:])
 }
