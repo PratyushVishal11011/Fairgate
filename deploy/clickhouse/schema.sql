@@ -16,4 +16,6 @@ PARTITION BY toYYYYMM(event_time)
 -- ORDER BY organizes events by producer, event time, sequence number and index.
 ORDER BY (producer_id, event_time, seq, idx)
 -- Automatically expire old data
-TTL event_time + INTERVAL 30 DAY;
+TTL event_time + INTERVAL 30 DAY
+SETTINGS
+    non_replicated_deduplication_window = 1000;

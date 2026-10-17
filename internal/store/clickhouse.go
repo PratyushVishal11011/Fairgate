@@ -50,11 +50,19 @@ func (s *ClickHouseStore) InsertBatch(ctx context.Context, events []wire.Event, 
 	if len(events) == 0 {
 		return nil
 	}
+
+	if token == "" {
+		return errors.New("token is required")
+	}
+
+	ctx = clickhouse.Context(ctx, clickhouse.WithSettings(clickhouse.Settings{"insert_deduplication_token": token}))
+
 	batch, err := s.conn.PrepareBatch(ctx, `INSERT INTO fairgate.events
 		(event_id, producer_id, event_time, seq, idx, event_type, payload)`)
 	if err != nil {
 		return fmt.Errorf("prepare batch: %w", err)
 	}
+	defer batch.Close()
 
 	for _, event := range events {
 		err := batch.Append(

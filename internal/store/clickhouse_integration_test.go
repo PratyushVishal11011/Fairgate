@@ -37,7 +37,7 @@ func TestClickHouseInsertBatchIntegration(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(
 		context.Background(),
-		15*time.Second,
+		30*time.Second,
 	)
 	defer cancel()
 
@@ -85,29 +85,62 @@ func TestClickHouseInsertBatchIntegration(t *testing.T) {
 		t.Fatalf("initial InsertBatch failed: %v", err)
 	}
 
-	// Replay the exact same batch with the same idempotency token.
 	if err := ch.InsertBatch(ctx, events, token); err != nil {
 		t.Fatalf("replayed InsertBatch failed: %v", err)
 	}
 
 	for _, want := range events {
-		t.Run(fmt.Sprintf("seq_%d", want.Seq), func(t *testing.T) {
-			var got wire.Event
+		want := want
+
+		t.Run(fmt.Sprintf("seq_%d_idx_%d", want.Seq, want.Idx), func(t *testing.T) {
+			var count uint64
 
 			err := ch.conn.QueryRow(
 				ctx,
-				`SELECT
+				fmt.Sprintf(
+					`SELECT count()
+FROM %s.events
+WHERE producer_id = ?
+AND seq = ?
+AND idx = ?`,
+					quoteIdentifier(database),
+				),
+				want.ProducerId,
+				want.Seq,
+				want.Idx,
+			).Scan(&count)
+			if err != nil {
+				t.Fatalf("count inserted event: %v", err)
+			}
+
+			if count != 1 {
+				t.Fatalf(
+					"expected exactly one copy of event seq=%d idx=%d, got %d",
+					want.Seq,
+					want.Idx,
+					count,
+				)
+			}
+
+			var got wire.Event
+
+			err = ch.conn.QueryRow(
+				ctx,
+				fmt.Sprintf(
+					`SELECT
 producer_id,
 event_time,
 seq,
 idx,
 event_type,
 payload
-FROM fairgate.events
+FROM %s.events
 WHERE producer_id = ?
 AND seq = ?
 AND idx = ?
 LIMIT 1`,
+					quoteIdentifier(database),
+				),
 				want.ProducerId,
 				want.Seq,
 				want.Idx,
@@ -147,4 +180,21 @@ LIMIT 1`,
 			}
 		})
 	}
+}
+
+func quoteIdentifier(identifier string) string {
+	for _, r := range identifier {
+		if (r < 'a' || r > 'z') &&
+			(r < 'A' || r > 'Z') &&
+			(r < '0' || r > '9') &&
+			r != '_' {
+			panic("invalid ClickHouse database identifier")
+		}
+	}
+
+	if identifier == "" {
+		panic("empty ClickHouse database identifier")
+	}
+
+	return "`" + identifier + "`"
 }
