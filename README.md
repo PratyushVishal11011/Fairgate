@@ -28,6 +28,7 @@ The project explores fair resource sharing in event-ingestion systems: keeping p
 - [Project structure](#project-structure)
 - [Getting started](#getting-started)
 - [Docker deployment](#docker-deployment)
+  - [Native Apple Container on macOS](#native-apple-container-on-macos)
 - [Development status and limitations](#development-status-and-limitations)
 - [Contributing](#contributing)
 - [License](#license)
@@ -929,6 +930,22 @@ sudo docker compose up --build -d --force-recreate fairgate
 Allow inbound TCP traffic on port `9001` through the host firewall, restricted to the client IP range that needs access. Connect to the host's reachable IP or DNS name on port `9001`; this is FairGate's length-prefixed TCP protocol, not an HTTP endpoint.
 
 The Compose file uses development ClickHouse credentials. Replace them before exposing a non-development deployment. `docker compose down` keeps the named volumes; `docker compose down -v` removes them, including the WAL, checkpoint, and database data.
+
+### Native Apple Container on macOS
+
+On an Apple silicon Mac running macOS 26 or later, the project can run with Apple's [`container` CLI](https://github.com/apple/container) without Docker Desktop. Apple's CLI runs OCI Linux images in lightweight VMs and does not provide Docker Compose, so this repository includes `scripts/apple-container.sh` to build and run the same four services with equivalent ports, networking, and persistent data volumes.
+
+Install Apple's signed `container` package from its [release page](https://github.com/apple/container/releases), then start its system service once:
+
+```bash
+container system start
+./scripts/apple-container.sh up
+./scripts/apple-container.sh status
+```
+
+The local endpoints match the Compose setup: FairGate TCP at `localhost:9001`, health and metrics at `localhost:9100`, Prometheus at `localhost:9090`, and Grafana at `localhost:3001` (default login `admin` / `admin`). ClickHouse's native port is `localhost:9000`. Named volumes persist data across `stop` and `down`; remove them explicitly with `./scripts/apple-container.sh down -v`. Follow logs with `./scripts/apple-container.sh logs [fairgate|clickhouse|prometheus|grafana]`.
+
+This launcher is for local development on Apple silicon. It does not change the Linux EC2 deployment, and the Apple Container CLI requirements and available flags are controlled by Apple's runtime release.
 
 ## Development status and limitations
 

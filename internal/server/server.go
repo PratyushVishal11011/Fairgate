@@ -544,12 +544,6 @@ func handleConnWithMetrics(
 		metrics.EventAccepted()
 
 		logger.Info(
-			"Event enqueued",
-			"producer_id", event.ProducerId,
-			"seq", event.Seq,
-		)
-
-		logger.Info(
 			"Event admitted",
 			"remote_addr", remoteAddr,
 			"producer_id", event.ProducerId,
