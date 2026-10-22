@@ -9,6 +9,9 @@ import (
 type Event struct {
 	//identify the producer sending the event
 	ProducerId string `json:"producer_id"`
+	//identifies a particular generation of a producer
+	//prevents FairGate from confusing new events with old events when a producer restarts and resets its sequence counter
+	ProducerEpoch string `json:"producer_epoch,omitempty"`
 	//timestamp associated with event
 	EventTime time.Time `json:"event_time"`
 	//sequence number for tracking event
@@ -37,6 +40,10 @@ func DecodeEvent(data []byte) (Event, error) {
 
 	if event.EventType == "" {
 		return Event{}, errors.New("Event type is required")
+	}
+
+	if event.ProducerEpoch == "" {
+		return Event{}, errors.New("Producer epoch is required")
 	}
 
 	return event, nil

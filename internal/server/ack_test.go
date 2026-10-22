@@ -39,12 +39,13 @@ func TestAcknowledgment(t *testing.T) {
 	}()
 
 	event := wire.Event{
-		ProducerId: "producer-ack-test",
-		EventTime:  time.Now().UTC(),
-		Seq:        1,
-		Idx:        0,
-		EventType:  "test_event",
-		Payload:    "ack-test",
+		ProducerId:    "producer-ack-test",
+		ProducerEpoch: "epoch-001",
+		EventTime:     time.Now().UTC(),
+		Seq:           1,
+		Idx:           0,
+		EventType:     "test_event",
+		Payload:       "ack-test",
 	}
 
 	payload, err := json.Marshal(event)
@@ -52,7 +53,6 @@ func TestAcknowledgment(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Send event to the server.
 	if err := wire.WriteFrame(clientConn, wire.Frame{
 		Type:    wire.FrameTypeEvent,
 		Payload: payload,
@@ -60,7 +60,6 @@ func TestAcknowledgment(t *testing.T) {
 		t.Fatalf("failed to send event: %v", err)
 	}
 
-	// Read the ACK from the server.
 	ackFrame, err := wire.ReadFrame(clientConn)
 	if err != nil {
 		t.Fatalf("failed to read ACK: %v", err)
@@ -95,7 +94,6 @@ func TestAcknowledgment(t *testing.T) {
 			event.Idx, ack.Idx)
 	}
 
-	// Close the connection so handleConn can finish.
 	clientConn.Close()
 	<-done
 }

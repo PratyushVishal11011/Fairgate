@@ -8,3 +8,4 @@ dist/
 coverage.out
 install-docker-ubuntu.sh
 run-ec2-benchmark.sh
+scripts

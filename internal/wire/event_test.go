@@ -7,13 +7,14 @@ import (
 
 func TestDecodeEvent(t *testing.T) {
 	data := []byte(`{
-        "producer_id": "producer-001",
-        "event_time": "2026-10-02T09:00:00Z",
-        "seq": 42,
-        "idx": 0,
-        "event_type": "bearing_fault",
-        "payload": "vibration anomaly"
-    }`)
+		"producer_id": "producer-001",
+		"producer_epoch": "epoch-001",
+		"event_time": "2026-10-02T09:00:00Z",
+		"seq": 42,
+		"idx": 0,
+		"event_type": "bearing_fault",
+		"payload": "vibration anomaly"
+	}`)
 
 	event, err := DecodeEvent(data)
 	if err != nil {
@@ -24,8 +25,16 @@ func TestDecodeEvent(t *testing.T) {
 		t.Errorf("unexpected producer ID: %s", event.ProducerId)
 	}
 
+	if event.ProducerEpoch != "epoch-001" {
+		t.Errorf("unexpected producer epoch: %s", event.ProducerEpoch)
+	}
+
 	if event.Seq != 42 {
 		t.Errorf("expected sequence 42, got %d", event.Seq)
+	}
+
+	if event.Idx != 0 {
+		t.Errorf("expected index 0, got %d", event.Idx)
 	}
 
 	if event.EventType != "bearing_fault" {
@@ -35,6 +44,10 @@ func TestDecodeEvent(t *testing.T) {
 	expectedTime, _ := time.Parse(time.RFC3339, "2026-10-02T09:00:00Z")
 	if !event.EventTime.Equal(expectedTime) {
 		t.Errorf("unexpected event time: %v", event.EventTime)
+	}
+
+	if event.Payload != "vibration anomaly" {
+		t.Errorf("unexpected payload: %s", event.Payload)
 	}
 }
 
@@ -68,5 +81,19 @@ func TestDecodeInvalidEvent(t *testing.T) {
 				t.Fatal("expected an error")
 			}
 		})
+	}
+}
+
+func TestDecodeEventWithoutProducerEpoch(t *testing.T) {
+	data := []byte(`{
+		"producer_id": "producer-001",
+		"event_time": "2026-10-02T09:00:00Z",
+		"seq": 42,
+		"event_type": "bearing_fault"
+	}`)
+
+	_, err := DecodeEvent(data)
+	if err == nil {
+		t.Fatal("expected an error when producer epoch is missing")
 	}
 }
