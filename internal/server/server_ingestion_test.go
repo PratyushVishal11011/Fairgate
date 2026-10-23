@@ -1,10 +1,7 @@
 package server
 
 import (
-	"FairGate/internal/admit"
-	"FairGate/internal/sched"
-	"FairGate/internal/wal"
-	"FairGate/internal/wire"
+	"context"
 	"encoding/json"
 	"io"
 	"log/slog"
@@ -12,6 +9,13 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+
+	"FairGate/internal/admit"
+	"FairGate/internal/deduplication"
+	"FairGate/internal/observability"
+	"FairGate/internal/sched"
+	"FairGate/internal/wal"
+	"FairGate/internal/wire"
 )
 
 func TestTCPIngestionPersistsEventsToWAL(t *testing.T) {
@@ -24,16 +28,28 @@ func TestTCPIngestionPersistsEventsToWAL(t *testing.T) {
 
 	queues, err := sched.NewQueues(256)
 	if err != nil {
-		walLog.Close()
+		_ = walLog.Close()
 		t.Fatal(err)
 	}
 
-	admission, _ := admit.NewManager(100, 200)
+	admission, err := admit.NewManager(100, 200)
+	if err != nil {
+		_ = walLog.Close()
+		t.Fatal(err)
+	}
+
+	dedupManager, err := deduplication.NewManager(nil)
+	if err != nil {
+		_ = walLog.Close()
+		t.Fatal(err)
+	}
+
+	metrics := observability.New()
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
-		walLog.Close()
+		_ = walLog.Close()
 		t.Fatal(err)
 	}
 	defer listener.Close()
@@ -48,80 +64,88 @@ func TestTCPIngestionPersistsEventsToWAL(t *testing.T) {
 			return
 		}
 
-		handleConn(conn, logger, admission, queues, walLog)
+		handleConn(
+			context.Background(),
+			conn,
+			logger,
+			admission,
+			queues,
+			walLog,
+			metrics,
+			dedupManager,
+		)
 	}()
 
 	clientConn, err := net.Dial("tcp", listener.Addr().String())
 	if err != nil {
-		walLog.Close()
+		_ = walLog.Close()
 		t.Fatal(err)
 	}
 
-	// Prevent the test from hanging indefinitely if the server
-	// does not send an acknowledgment.
 	if err := clientConn.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
-		clientConn.Close()
-		walLog.Close()
+		_ = clientConn.Close()
+		_ = walLog.Close()
 		t.Fatal(err)
 	}
 
 	events := []wire.Event{
 		{
-			ProducerId: "producer-001",
-			EventTime:  time.Now().UTC(),
-			Seq:        1,
-			Idx:        0,
-			EventType:  "test_event",
-			Payload:    "sample-event-1",
+			ProducerId:    "producer-001",
+			ProducerEpoch: "epoch-001",
+			EventTime:     time.Now().UTC(),
+			Seq:           1,
+			Idx:           0,
+			EventType:     "test_event",
+			Payload:       "sample-event-1",
 		},
 		{
-			ProducerId: "producer-001",
-			EventTime:  time.Now().UTC(),
-			Seq:        2,
-			Idx:        0,
-			EventType:  "test_event",
-			Payload:    "sample-event-2",
+			ProducerId:    "producer-001",
+			ProducerEpoch: "epoch-001",
+			EventTime:     time.Now().UTC(),
+			Seq:           2,
+			Idx:           0,
+			EventType:     "test_event",
+			Payload:       "sample-event-2",
 		},
 		{
-			ProducerId: "producer-002",
-			EventTime:  time.Now().UTC(),
-			Seq:        1,
-			Idx:        0,
-			EventType:  "test_event",
-			Payload:    "sample-event-3",
+			ProducerId:    "producer-002",
+			ProducerEpoch: "epoch-001",
+			EventTime:     time.Now().UTC(),
+			Seq:           1,
+			Idx:           0,
+			EventType:     "test_event",
+			Payload:       "sample-event-3",
 		},
 	}
 
 	for _, event := range events {
 		payload, err := json.Marshal(event)
 		if err != nil {
-			clientConn.Close()
-			walLog.Close()
+			_ = clientConn.Close()
+			_ = walLog.Close()
 			t.Fatal(err)
 		}
 
-		// Send the event frame.
 		err = wire.WriteFrame(clientConn, wire.Frame{
 			Type:    wire.FrameTypeEvent,
 			Payload: payload,
 		})
 		if err != nil {
-			clientConn.Close()
-			walLog.Close()
+			_ = clientConn.Close()
+			_ = walLog.Close()
 			t.Fatalf("failed to send event: %v", err)
 		}
 
-		// Read the acknowledgment.
 		ackFrame, err := wire.ReadFrame(clientConn)
 		if err != nil {
-			clientConn.Close()
-			walLog.Close()
+			_ = clientConn.Close()
+			_ = walLog.Close()
 			t.Fatalf("failed to read ACK: %v", err)
 		}
 
 		if ackFrame.Type != wire.FrameTypeAck {
-			clientConn.Close()
-			walLog.Close()
+			_ = clientConn.Close()
+			_ = walLog.Close()
 			t.Fatalf(
 				"expected ACK frame type %d, got %d",
 				wire.FrameTypeAck,
@@ -131,20 +155,20 @@ func TestTCPIngestionPersistsEventsToWAL(t *testing.T) {
 
 		var ack wire.Ack
 		if err := json.Unmarshal(ackFrame.Payload, &ack); err != nil {
-			clientConn.Close()
-			walLog.Close()
+			_ = clientConn.Close()
+			_ = walLog.Close()
 			t.Fatalf("failed to decode ACK: %v", err)
 		}
 
 		if ack.Status != "accepted" {
-			clientConn.Close()
-			walLog.Close()
+			_ = clientConn.Close()
+			_ = walLog.Close()
 			t.Fatalf("expected accepted status, got %q", ack.Status)
 		}
 
 		if ack.ProducerId != event.ProducerId {
-			clientConn.Close()
-			walLog.Close()
+			_ = clientConn.Close()
+			_ = walLog.Close()
 			t.Fatalf(
 				"expected producer ID %q, got %q",
 				event.ProducerId,
@@ -153,8 +177,8 @@ func TestTCPIngestionPersistsEventsToWAL(t *testing.T) {
 		}
 
 		if ack.Seq != event.Seq {
-			clientConn.Close()
-			walLog.Close()
+			_ = clientConn.Close()
+			_ = walLog.Close()
 			t.Fatalf(
 				"expected sequence %d, got %d",
 				event.Seq,
@@ -163,8 +187,8 @@ func TestTCPIngestionPersistsEventsToWAL(t *testing.T) {
 		}
 
 		if ack.Idx != event.Idx {
-			clientConn.Close()
-			walLog.Close()
+			_ = clientConn.Close()
+			_ = walLog.Close()
 			t.Fatalf(
 				"expected index %d, got %d",
 				event.Idx,
@@ -173,11 +197,9 @@ func TestTCPIngestionPersistsEventsToWAL(t *testing.T) {
 		}
 	}
 
-	// Closing the client allows handleConn to exit.
-	clientConn.Close()
+	_ = clientConn.Close()
 	<-serverDone
 
-	// Close the WAL before recovering it.
 	if err := walLog.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -195,7 +217,6 @@ func TestTCPIngestionPersistsEventsToWAL(t *testing.T) {
 		)
 	}
 
-	// Verify that all expected events were persisted.
 	for i, expected := range events {
 		actual := recovered[i]
 
@@ -205,6 +226,24 @@ func TestTCPIngestionPersistsEventsToWAL(t *testing.T) {
 				i,
 				expected.ProducerId,
 				actual.ProducerId,
+			)
+		}
+
+		if actual.ProducerEpoch != expected.ProducerEpoch {
+			t.Errorf(
+				"event %d: expected producer epoch %q, got %q",
+				i,
+				expected.ProducerEpoch,
+				actual.ProducerEpoch,
+			)
+		}
+
+		if !actual.EventTime.Equal(expected.EventTime) {
+			t.Errorf(
+				"event %d: expected event time %v, got %v",
+				i,
+				expected.EventTime,
+				actual.EventTime,
 			)
 		}
 
@@ -242,6 +281,51 @@ func TestTCPIngestionPersistsEventsToWAL(t *testing.T) {
 				expected.Payload,
 				actual.Payload,
 			)
+		}
+	}
+
+	// Verify that all accepted events reached their respective queues.
+	expectedByProducer := map[string][]wire.Event{
+		"producer-001": {events[0], events[1]},
+		"producer-002": {events[2]},
+	}
+
+	for producerID, expectedEvents := range expectedByProducer {
+		queue := queues.Queue(producerID)
+
+		for i, expected := range expectedEvents {
+			select {
+			case actual := <-queue:
+				if actual.ProducerId != expected.ProducerId ||
+					actual.ProducerEpoch != expected.ProducerEpoch ||
+					actual.Seq != expected.Seq ||
+					actual.Idx != expected.Idx ||
+					actual.Payload != expected.Payload {
+					t.Errorf(
+						"producer %s, event %d: unexpected queued event: %+v",
+						producerID,
+						i,
+						actual,
+					)
+				}
+			default:
+				t.Fatalf(
+					"producer %s: expected %d queued events; queue became empty at event %d",
+					producerID,
+					len(expectedEvents),
+					i,
+				)
+			}
+		}
+
+		select {
+		case extra := <-queue:
+			t.Errorf(
+				"producer %s: unexpected extra queued event: %+v",
+				producerID,
+				extra,
+			)
+		default:
 		}
 	}
 }

@@ -8,7 +8,7 @@ import (
 
 const (
 	HeaderSize           = 6
-	MaxFrameSize         = 1 << 20 //Set Max Frame Size to 1 MiB
+	MaxFrameSize         = 5 * (1 << 20) //Set Max Frame Size to 5 MiB
 	FrameTypeEvent uint8 = 1
 	FrameTypeAck   uint8 = 2
 )
@@ -66,7 +66,7 @@ func ReadFrame(r io.Reader) (Frame, error) {
 
 	//Read the length prefix of the buffer
 	//lengthBuf[:] converts the array into a slice containing all 4 bytes
-	//_ discards the number of bytes (we don't really need it tbh - just find it to make sure that the read succeeded
+	//_ discards the number of bytes (we don't really need it tbh - just find it to make sure that the read succeeded)
 	//If there's an error, Frame returns an empty frame
 	if _, err := io.ReadFull(r, lengthBuf[:]); err != nil {
 		return Frame{}, err

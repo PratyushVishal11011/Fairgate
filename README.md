@@ -2,12 +2,12 @@
 
 **A fair-share event ingestion gateway written in Go.**
 
-FairGate is a modular event-ingestion gateway. It accepts framed event streams over TCP, applies admission control, persists accepted events in a segmented Write-Ahead Log (WAL) with group commit, schedules events from per-producer queues using Deficit Round Robin (DRR), and ships durable WAL records to ClickHouse through a checkpointed shipper that also reclaims fully shipped WAL segments.
+FairGate is a modular event-ingestion gateway. It accepts framed event streams over TCP, applies admission control, deduplicates retried events by a stable event identity, persists accepted events in a segmented Write-Ahead Log (WAL) with group commit, schedules events from per-producer queues using Deficit Round Robin (DRR), and ships durable WAL records to ClickHouse through a checkpointed shipper that also reclaims fully shipped WAL segments.
 
 The project explores fair resource sharing in event-ingestion systems: keeping producers isolated from one another through bounded buffering, admission limits, and fair scheduling. FairGate is being developed as an open-source foundation that can be extended with different storage backends and downstream processing components.
 
 > [!IMPORTANT]
-> **Beta status.** FairGate is under active development. The current implementation provides TCP ingestion, event decoding and validation, admission control, per-producer bounded queues, DRR scheduling, a segmented WAL with group commit and ordered recovery, acknowledgments, and context-aware graceful shutdown. The gateway always runs a shipper that reads durable WAL records from a persisted checkpoint, batches them for a `Store` (ClickHouse), retries failed inserts with capped exponential backoff and jitter, atomically persists progress after successful inserts, and then reclaims WAL segments older than the checkpoint segment. The gateway serves an HTTP health endpoint and Prometheus metrics, and a Docker Compose stack runs FairGate with ClickHouse, Prometheus, and Grafana. Delivery to the database is at-least-once, not exactly-once, and advanced overload control, profiling, and deep pipeline observability are not implemented.
+> **Beta status.** FairGate is under active development. The current implementation provides TCP ingestion, event decoding and validation, admission control, event idempotency keyed by producer ID, producer epoch, sequence number, and index, per-producer bounded queues, DRR scheduling, a segmented WAL with group commit and ordered recovery, acknowledgments, and context-aware graceful shutdown. The gateway always runs a shipper that reads durable WAL records from a persisted checkpoint, batches them for a `Store` (ClickHouse), retries failed inserts with capped exponential backoff and jitter, atomically persists progress after successful inserts, and then reclaims WAL segments older than the checkpoint segment. The gateway serves an HTTP health endpoint and Prometheus metrics, and a Docker Compose stack runs FairGate with ClickHouse, Prometheus, and Grafana. Delivery to the database is at-least-once, not exactly-once, and advanced overload control, profiling, and deep pipeline observability are not implemented.
 
 ## Table of Contents
 
@@ -17,6 +17,7 @@ The project explores fair resource sharing in event-ingestion systems: keeping p
 - [Architecture](#architecture)
 - [Event lifecycle](#event-lifecycle)
 - [Event model](#event-model)
+- [Event identity and idempotency](#event-identity-and-idempotency)
 - [Wire protocol](#wire-protocol)
 - [Write-Ahead Log](#write-ahead-log)
 - [Backpressure and scheduling](#backpressure-and-scheduling)
@@ -28,6 +29,7 @@ The project explores fair resource sharing in event-ingestion systems: keeping p
 - [Project structure](#project-structure)
 - [Getting started](#getting-started)
 - [Docker deployment](#docker-deployment)
+  - [Native Apple Container on macOS](#native-apple-container-on-macos)
 - [Development status and limitations](#development-status-and-limitations)
 - [Contributing](#contributing)
 - [License](#license)
@@ -40,6 +42,7 @@ The project explores fair resource sharing in event-ingestion systems: keeping p
 | Fair service | DRR scheduling visits producer queues in rounds and serves a bounded amount from each. |
 | Bounded resource usage | Every queue has an explicit capacity, and a full queue applies backpressure instead of growing. Shipped WAL segments are reclaimed instead of accumulating. |
 | Durability before acknowledgment | Events are appended to the WAL and synchronized to disk (via group commit) before an acknowledgment is sent. |
+| Safe producer retries | Every event has a stable identity. An identical retry is acknowledged without a second WAL append, and conflicting reuse of an identity is rejected. |
 | Extensibility | Core ingestion and scheduling are independent of event meaning. Storage and processing attach through well-defined seams. |
 
 ## Features
@@ -47,10 +50,12 @@ The project explores fair resource sharing in event-ingestion systems: keeping p
 ### Currently implemented
 
 - **TCP event ingestion.** Accepts client connections and reads length-prefixed frames.
-- **Framed wire protocol.** Identifies event and acknowledgment frames using frame types.
-- **JSON event decoding.** Decodes events and checks required fields.
+- **Framed wire protocol.** Identifies event and acknowledgment frames using frame types. The maximum frame size is 5 MiB.
+- **JSON event decoding.** Decodes events and checks required fields, including `producer_epoch`.
 - **Admission control.** Applies token-bucket-based limits to incoming events (currently 500 requests per second with a burst of 1,000).
-- **Per-producer queues.** Keeps producer events in separate bounded channels (512 events each).
+- **Event idempotency.** A deduplication manager identifies each event by producer ID, producer epoch, sequence number, and index. An identical retry is acknowledged without being appended to the WAL again. Reusing an identity with a different event time, type, or payload is rejected. A new identity is recorded only after the event has been persisted to the WAL.
+- **Producer epochs.** The epoch is part of event identity, so identity stays unambiguous across producer restarts.
+- **Per-producer queues.** Keeps producer events in separate bounded channels (512 events each). Queues also track event identities so duplicates are not enqueued twice.
 - **DRR scheduling.** Selects queued events in producer rounds using a configurable quantum.
 - **Segmented Write-Ahead Log.** Appends events with length and CRC metadata across multiple segment files, rotating to a new segment when the configured segment size would be exceeded.
 - **Group commit.** A dedicated writer goroutine batches concurrent append requests and issues a single `Sync()` per batch, bounded by a maximum request count and a short collection delay.
@@ -64,17 +69,18 @@ The project explores fair resource sharing in event-ingestion systems: keeping p
 - **Checkpoint-based WAL reclamation.** After each committed checkpoint, and once at startup against the checkpoint already on disk, the shipper calls `WAL.ReclaimBefore`. Only segments with IDs strictly less than the checkpoint segment are deleted; the checkpoint segment and the active segment are retained. A checkpoint beyond the durable end is rejected with `ErrCheckpointAhead`, and nothing is deleted. Reclamation is serialized with rotation, and the containing directory is synced after deletion.
 - **Stable batch tokens.** Each shipped batch carries a deterministic SHA-256 token derived from its WAL start and end positions. Retries and replays of the same batch reuse the same token.
 - **Store interface.** `InsertBatch(ctx, token, events)` and `Close()` separate storage from the processing pipeline.
-- **ClickHouse adapter.** Official Go client with configurable authentication, `Ping` health checks, batched inserts through `PrepareBatch` and `Send`, and graceful cleanup. Each row includes an `event_id` computed from `producer_id`, `seq`, and `idx`. The adapter rejects an empty token for a non-empty batch and passes the token to ClickHouse as `insert_deduplication_token`.
+- **ClickHouse adapter.** Official Go client with configurable authentication, `Ping` health checks, batched inserts through `PrepareBatch` and `Send`, and graceful cleanup. Each row includes an `event_id` computed from `producer_id`, `producer_epoch`, `seq`, and `idx` using an unambiguous encoding, and stores the epoch in its own column. The adapter rejects an empty token for a non-empty batch and passes the token to ClickHouse as `insert_deduplication_token`.
 - **Optional ClickHouse integration test.** Environment-gated test covering connectivity, batch insertion, retrieval, and re-inserting the same batch with the same token. It checks that each event appears exactly once, uses a 30-second timeout, and quotes the configured database name in its queries.
 - **Health and Prometheus endpoints.** FairGate responds with `200 OK` and `ok` at `/health` on port `9100`; Docker Compose uses this endpoint for its gateway healthcheck. Prometheus metrics for active TCP connections, accepted, rejected and invalid events, WAL append errors, and scheduler processing totals remain available at `/metrics` on port `9100`.
 - **Docker deployment.** A `Dockerfile` and Compose stack run FairGate with ClickHouse, Prometheus, and Grafana. Prometheus scrapes the gateway and Grafana provisions its Prometheus datasource and FairGate overview dashboard. `install-docker-ubuntu.sh` installs Docker Engine and the Compose plugin on Ubuntu.
-- **Acknowledgments.** Sends an accepted acknowledgment after the event has been appended to the WAL and enqueued.
+- **Acknowledgments.** Sends an accepted acknowledgment after the event has been appended to the WAL and enqueued, and also for an identical retry of an event that was already accepted.
 - **Concurrent connections.** Handles client connections in separate goroutines and tracks them for coordinated shutdown.
 - **Context-aware lifecycle.** `RunContext` lets the caller control server lifetime through a `context.Context`.
 - **Graceful shutdown.** Stops accepting clients, waits for active handlers within a grace period, forces closure of blocked connections afterward, stops the scheduler and shipper, and then closes the store and WAL.
 - **Cancelable enqueueing.** A handler blocked on a full producer queue can be interrupted during shutdown.
 - **Scheduler error propagation.** An unexpected scheduler failure is reported to the caller instead of being silently lost.
-- **Tests.** Includes unit and integration tests for core behavior. Graceful-shutdown tests use a no-op `Store` and a temporary checkpoint path, so they do not need a live ClickHouse service.
+- **Tests.** Includes unit and integration tests for core behavior, including idempotency, acknowledgments, recovery, queue deduplication, and TCP ingestion through the server. Graceful-shutdown tests use a no-op `Store` and a temporary checkpoint path, so they do not need a live ClickHouse service.
+- **Continuous integration.** The GitHub Actions workflow runs the test suite with the race detector (`go test -race -v ./...`).
 
 ### Planned
 
@@ -89,12 +95,34 @@ Planned capabilities are not implied to be available in this beta.
 
 ## Recent updates
 
+### 23rd October, 2026: Producer epochs, event idempotency, and TCP integration tests
+
+Events now carry a stable identity that survives producer restarts, and the server uses it to make producer retries safe. This update also adds server and scheduler test coverage, race detection in CI, and a larger frame size limit.
+
+- **Producer epoch.** The event format adds a required `producer_epoch` field. The decoder rejects events that omit it.
+- **Stable event identity.** An event is identified by `producer_id`, `producer_epoch`, `seq`, and `idx`. The ClickHouse `event_id` hashes these four fields with an unambiguous encoding, so different field combinations cannot collide through concatenation.
+- **Deduplication manager.** The manager checks both identity and content. An identical retry is accepted as a duplicate. Reusing an identity with a different event time, type, or payload is rejected as a conflict. A new identity is recorded only after WAL persistence succeeds.
+- **Idempotent TCP handler.** The handler acknowledges identical retries without appending them to the WAL again.
+- **Queue-level identity tracking.** Scheduler queues track event identities to avoid enqueuing duplicates.
+- **Schema changes.** `deploy/clickhouse/schema.sql` adds a `producer_epoch` column and orders records by `event_id`. Existing tables need a migration; see the note below.
+- **Frame size.** The maximum wire frame size is raised from 1 MiB to 5 MiB.
+- **Tests.** New tests cover idempotency, acknowledgments, recovery, queue behavior, and server ingestion over TCP.
+- **CI.** The GitHub Actions workflow now runs `go test -race -v ./...`.
+- **Docs.** The README adds instructions for running the services with Apple's container runtime.
+
+> [!WARNING]
+> **Schema migration required.** `deploy/clickhouse/schema.sql` uses `CREATE TABLE IF NOT EXISTS`, so editing the schema file does not add `producer_epoch` or change the sorting key on a table that already exists. Deployments with an existing `fairgate.events` table need to migrate it (or recreate it) before running this version. Changing the sorting key of a MergeTree table generally means creating a new table and copying data into it.
+
+Because a new identity is recorded only after the WAL write, and the WAL write happens before enqueueing, a stored event can wait for a restart before it is processed. If shutdown cancels a handler while it is enqueueing, the event is already in the WAL and already recorded as seen. A retry of that event during the same process lifetime is acknowledged as a duplicate without another enqueue, so the event may not reach the live processing queue until the next startup replays it from the WAL. It is not lost.
+
+See [Event identity and idempotency](#event-identity-and-idempotency) for the full rules.
+
 ### 17th October, 2026: Stable batch tokens and ClickHouse event identity
 
 The shipper now gives each WAL batch a stable identity, and ClickHouse rows carry a deterministic event ID. Together these let a storage backend recognize data it has already received.
 
 - **Deterministic batch token.** The shipper derives a SHA-256 token from the batch's WAL start and end positions and passes it to `Store.InsertBatch`. Retries of the same batch and replay after a restart reuse the same token.
-- **Event identity.** The ClickHouse adapter writes an `event_id` computed from `producer_id`, `seq`, and `idx`.
+- **Event identity.** The ClickHouse adapter writes an `event_id` computed from the event's identifying fields. The 23rd October update added `producer_epoch` to those fields.
 - **Schema changes.** `deploy/clickhouse/schema.sql` adds the `event_id` column, changes `idx` from `UInt16` to `UInt64`, removes the `LowCardinality` type from `event_type`, and drops the `received_at` column. Tables created from the earlier schema need to be migrated before this version runs against them.
 - **Tests.** Shipper tests check that batch tokens are non-empty and stay the same across retries. A crash-recovery test simulates a destination that accepts a batch before a crash, then checks that the batch is replayed and the checkpoint advances after restart. The optional ClickHouse integration test submits the same batch twice with the same token.
 
@@ -233,15 +261,17 @@ flowchart TD
         direction TB
         S["TCP server<br/>frame decoding and event validation"]
         A["Admission control<br/>token-bucket limits"]
+        DD["Deduplication manager<br/>identity and content check"]
         W[("Segmented Write-Ahead Log<br/>length + CRC32, group commit")]
-        Q["Per-producer bounded queues"]
+        Q["Per-producer bounded queues<br/>identity tracking"]
         D["DRR scheduler<br/>configurable quantum"]
         C["Event callback<br/>currently logs producer ID and sequence"]
         SH["WAL shipper<br/>always enabled"]
         M["HTTP :9100<br/>/health and /metrics"]
 
         S --> A
-        A --> W
+        A --> DD
+        DD --> W
         W --> Q
         Q --> D
         D --> C
@@ -251,12 +281,13 @@ flowchart TD
     end
 
     Q -.->|"accepted ACK"| P
+    DD -.->|"duplicate ACK<br/>(identical retry)"| P
     SH -->|"batched inserts"| CHDB[("ClickHouse")]
     PROM["Prometheus<br/>scrapes every 5 s"] -.->|"GET /metrics"| M
     GRAF["Grafana<br/>FairGate Overview"] --> PROM
 ```
 
-Accepted events are appended to the WAL before they are enqueued and acknowledged to the client. The scheduler callback logs selected events. The server always runs a WAL shipper that writes batches to ClickHouse independently of the scheduler and reclaims WAL segments once they are fully shipped. Alongside the TCP listener, the gateway serves `/health` and Prometheus `/metrics` on port `9100`; in the Compose stack Prometheus scrapes it and Grafana visualizes the result.
+Accepted events are checked for duplicates, appended to the WAL, enqueued, and then acknowledged to the client. An identical retry of an event that was already accepted is acknowledged without being appended again. The scheduler callback logs selected events. The server always runs a WAL shipper that writes batches to ClickHouse independently of the scheduler and reclaims WAL segments once they are fully shipped. Alongside the TCP listener, the gateway serves `/health` and Prometheus `/metrics` on port `9100`; in the Compose stack Prometheus scrapes it and Grafana visualizes the result.
 
 The server's goroutine and context structure, including the shutdown path, is described in [Server lifecycle and graceful shutdown](#server-lifecycle-and-graceful-shutdown).
 
@@ -285,13 +316,13 @@ flowchart LR
 
 | Package | Responsibility |
 |---|---|
-| `internal/server` | TCP listener, per-connection goroutines, connection tracking, frame handling, acknowledgment delivery, server lifecycle (`RunContext`), required shipper startup and shutdown, graceful shutdown, and the HTTP health and Prometheus metrics endpoint. |
-| `internal/wire` | Frame codec, event and acknowledgment types, validation. |
+| `internal/server` | TCP listener, per-connection goroutines, connection tracking, frame handling, idempotent event handling (deduplication check, duplicate ACKs), acknowledgment delivery, server lifecycle (`RunContext`), required shipper startup and shutdown, graceful shutdown, and the HTTP health and Prometheus metrics endpoint. |
+| `internal/wire` | Frame codec (5 MiB maximum frame size), event and acknowledgment types, validation including `producer_epoch`. |
 | `internal/admit` | Token-bucket admission control. |
-| `internal/sched` | Per-producer bounded queues (including context-aware `EnqueueContext`) and the DRR scheduler. |
+| `internal/sched` | Per-producer bounded queues (including context-aware `EnqueueContext` and event identity tracking) and the DRR scheduler. |
 | `internal/wal` | Segmented WAL, writer goroutine with group commit, segment rotation, synchronization, ordered recovery with cross-segment validation over a possibly sparse segment set, and checkpoint-based segment reclamation (`ReclaimBefore`) with a durable-end guard (`ErrCheckpointAhead`). |
 | `internal/shipper` | Durable WAL reader, checkpoint load and atomic commit, batching, polling at the durable end, retry with capped exponential backoff and jitter, and triggering WAL reclamation after each commit and at startup. |
-| `internal/store` | `Store` interface and the ClickHouse adapter. |
+| `internal/store` | `Store` interface and the ClickHouse adapter, including `event_id` computation from the event identity. |
 
 ## Event lifecycle
 
@@ -303,6 +334,7 @@ sequenceDiagram
     participant P as Producer
     participant S as TCP server
     participant A as Admission control
+    participant DD as Deduplication manager
     participant W as WAL
     participant Q as Producer queue
     participant D as DRR scheduler
@@ -313,14 +345,25 @@ sequenceDiagram
     S->>A: Admit event for producer
     alt Event admitted
         A-->>S: Allow
-        S->>W: Submit append request (batched with others)
-        W-->>S: Durable (after batch sync)
-        S->>Q: EnqueueContext (waits for space or cancellation)
-        Q-->>S: Enqueued
-        S-->>P: ACK with status accepted
-        D->>Q: Dequeue within quantum
-        Q-->>D: Event
-        D->>C: Deliver event
+        S->>DD: Check event identity and content
+        alt New identity
+            DD-->>S: New
+            S->>W: Submit append request (batched with others)
+            W-->>S: Durable (after batch sync)
+            S->>DD: Record identity
+            S->>Q: EnqueueContext (waits for space or cancellation)
+            Q-->>S: Enqueued
+            S-->>P: ACK with status accepted
+            D->>Q: Dequeue within quantum
+            Q-->>D: Event
+            D->>C: Deliver event
+        else Identical retry
+            DD-->>S: Duplicate
+            S-->>P: ACK without a second WAL append
+        else Same identity, different content
+            DD-->>S: Conflict
+            S-->>P: Rejection
+        end
     else Event not admitted
         A-->>S: Reject
         S-->>P: Rejection handled per server implementation
@@ -329,7 +372,7 @@ sequenceDiagram
 
 An `accepted` ACK reflects WAL durability and queue admission. It does not reflect downstream storage. See [Delivery semantics](#delivery-semantics).
 
-If shutdown cancels the handler while it is waiting for queue space, the event has already been appended to the WAL but is not acknowledged. It remains available for recovery on the next startup, unless the shipper has already delivered it and reclaimed its segment.
+If shutdown cancels the handler while it is waiting for queue space, the event has already been appended to the WAL and recorded by the deduplication manager, but it is not acknowledged. It remains available for recovery on the next startup, unless the shipper has already delivered it and reclaimed its segment. A retry of that event during the same process lifetime is acknowledged as a duplicate without another enqueue, so the event may not reach the live processing queue until restart.
 
 The shipper picks the event up from the WAL separately, after the event is durable and independently of the scheduler. Once the shipper's checkpoint moves past the segment holding the event, that segment becomes eligible for reclamation.
 
@@ -340,6 +383,7 @@ Events are represented as JSON with the following fields:
 ```json
 {
   "producer_id": "sensor-01",
+  "producer_epoch": 1,
   "event_time": "2026-10-02T08:00:00Z",
   "seq": 1,
   "idx": 0,
@@ -351,18 +395,20 @@ Events are represented as JSON with the following fields:
 | Field | Type | Description |
 |---|---|---|
 | `producer_id` | string | Identifier of the event producer |
+| `producer_epoch` | unsigned integer | Producer epoch, part of the event identity. Required. |
 | `event_time` | timestamp | Event timestamp |
 | `seq` | unsigned integer | Producer sequence number |
 | `idx` | unsigned integer | Event index |
 | `event_type` | string | Event category |
 | `payload` | string | Event payload |
 
-The decoder requires a non-empty producer ID, a non-zero event time, and a non-empty event type.
+The decoder requires a non-empty producer ID, a producer epoch, a non-zero event time, and a non-empty event type.
 
 ```mermaid
 classDiagram
     class Event {
         +string producer_id
+        +uint producer_epoch
         +timestamp event_time
         +uint seq
         +uint idx
@@ -380,6 +426,28 @@ classDiagram
 ```
 
 The `message` field of an acknowledgment is optional.
+
+## Event identity and idempotency
+
+Every event has a stable identity made of four fields:
+
+| Identity field | Role |
+|---|---|
+| `producer_id` | Which producer sent the event. |
+| `producer_epoch` | Distinguishes producer incarnations, so identity stays unambiguous after a producer restarts and resets its sequence numbers. |
+| `seq` | Producer sequence number. |
+| `idx` | Event index. |
+
+The server uses this identity to make producer retries safe:
+
+- **New identity.** The event is appended to the WAL, and its identity is recorded only after that append succeeds. A failed WAL write therefore never leaves behind an identity that was not persisted.
+- **Identical retry.** If the identity has been seen and the event time, type, and payload all match, the server acknowledges the retry without appending it to the WAL or enqueueing it again.
+- **Conflicting reuse.** If the identity has been seen but the event time, type, or payload differs, the event is rejected.
+- **Queue-level tracking.** Per-producer queues also track identities, so a duplicate is not enqueued twice.
+
+The same identity is used downstream. The ClickHouse adapter computes `event_id` by hashing `producer_id`, `producer_epoch`, `seq`, and `idx` with an unambiguous encoding, so two different field combinations cannot produce the same input to the hash. See [Batch and event identity](#batch-and-event-identity).
+
+A stored event can wait for a restart before processing. The server writes a new event to the WAL before enqueueing it. If shutdown cancels a handler while it is enqueueing, the WAL copy remains available for recovery, and because the identity has already been recorded, a retry in the same process lifetime is acknowledged as a duplicate. The event reaches the processing queue when recovery replays the WAL on the next startup.
 
 ## Wire protocol
 
@@ -399,7 +467,7 @@ flowchart LR
 
 | Field | Size | Description |
 |---|---|---|
-| Length | 4 bytes, big-endian | Frame length prefix used to delimit frames on the TCP stream. |
+| Length | 4 bytes, big-endian | Frame length prefix used to delimit frames on the TCP stream. The maximum frame size is 5 MiB. |
 | Type | 1 byte | Identifies the frame kind (see below). |
 | Flags | 1 byte | Per-frame flags. |
 | Payload | Variable | Frame body, interpreted according to the type. |
@@ -424,7 +492,7 @@ The current frame types are:
 | `1` | Event |
 | `2` | Acknowledgment (ACK) |
 
-An ACK contains the producer ID, sequence number, event index, status, and an optional message. An `accepted` ACK indicates that the event was written to the WAL and enqueued. It does **not** indicate that a downstream database has stored or queried the event.
+An ACK contains the producer ID, sequence number, event index, status, and an optional message. An `accepted` ACK indicates that the event was written to the WAL and enqueued, or that it is an identical retry of an event that was already accepted. It does **not** indicate that a downstream database has stored or queried the event.
 
 Refer to the `wire` package for the current protocol implementation and exact encoding behavior.
 
@@ -530,7 +598,7 @@ The shipper reads the WAL through a reader that stops at the WAL's synchronized 
 
 ## Backpressure and scheduling
 
-Each producer has its own bounded queue. The queue capacity is configured when the queue manager is created, and the server currently uses 512 events per producer. Enqueueing blocks when a producer's queue is full, applying backpressure to the caller instead of allowing the queue to grow without bound. In the connection handler the wait is context-aware (`EnqueueContext`), so a blocked handler can stop waiting if shutdown is forced.
+Each producer has its own bounded queue. The queue capacity is configured when the queue manager is created, and the server currently uses 512 events per producer. Enqueueing blocks when a producer's queue is full, applying backpressure to the caller instead of allowing the queue to grow without bound. In the connection handler the wait is context-aware (`EnqueueContext`), so a blocked handler can stop waiting if shutdown is forced. Queues also track event identities so that a duplicate is not enqueued twice.
 
 The DRR scheduler visits producer queues and processes available events up to its configured quantum (currently 8 in the server). The scheduler is independent of event meaning, and its callback is responsible for downstream handling. At this beta stage, the callback only logs events; database delivery is handled by the separate WAL shipper.
 
@@ -644,6 +712,7 @@ The listen address is chosen by the caller. The ClickHouse store is built from t
 
 - The five-second grace period bounds the wait before forced connection closure. It does not guarantee that shutdown completes within five seconds, because a handler blocked in an operation that responds to neither connection closure nor context cancellation could still delay it.
 - There is no explicit queue-drain confirmation. The scheduler callback only logs events, so shutdown does not prove that every queued event was delivered downstream. Events appended to the WAL remain recoverable on the next startup.
+- An event that was appended to the WAL but not yet enqueued when shutdown canceled its handler is not processed by the live scheduler. It is recovered on the next startup, and in the meantime a retry of it is acknowledged as a duplicate.
 - The server always stops and joins the shipper during shutdown before closing the store and WAL. Events not yet shipped at that point stay in the WAL and are picked up from the checkpoint on the next start.
 
 ## Delivery semantics
@@ -653,6 +722,11 @@ The listen address is chosen by the caller. The ClickHouse store is built from t
 | Event persisted to the WAL before acknowledgment | Yes |
 | Disk synchronization completed (per batch) before acknowledgment | Yes |
 | Acknowledgment sent after enqueue | Yes |
+| Event identity includes producer ID, producer epoch, sequence number, and index | Yes |
+| Identical retry acknowledged without a second WAL append or enqueue | Yes |
+| Conflicting reuse of an event identity rejected | Yes |
+| Identity recorded only after WAL persistence succeeds | Yes |
+| Event appended to the WAL but not yet enqueued at shutdown reaches the live queue | No; replayed from the WAL on the next startup |
 | Per-producer memory bounded | Yes, by queue capacity |
 | WAL split into segments with rotation | Yes |
 | Persisted records scanned across segments on restart | Yes |
@@ -671,7 +745,7 @@ The listen address is chosen by the caller. The ClickHouse store is built from t
 | Checkpoint written atomically after a successful insert | Yes |
 | Failed storage batches retried with backoff | Yes, until success or context cancellation |
 | Stable SHA-256 batch token passed to the store | Yes; same token on retry and replay |
-| Deterministic `event_id` written with each ClickHouse row | Yes |
+| Deterministic `event_id` written with each ClickHouse row | Yes; hash of producer ID, epoch, sequence number, and index |
 | Empty batch token rejected before insert | Yes |
 | Batch token passed to ClickHouse as `insert_deduplication_token` | Yes |
 | Replayed batch deduplicated by ClickHouse | Within the deduplication window only; not exactly-once |
@@ -697,6 +771,7 @@ The following values are currently fixed in the server and are expected to becom
 | Admission rate / burst | 500 requests per second / 1,000 burst | Token-bucket limit applied by admission control. |
 | DRR quantum | 8 | Maximum events served from a producer queue per visit. |
 | Shutdown grace period | 5 seconds | Time active handlers have to finish before connections are forcibly closed. |
+| Maximum frame size | 5 MiB | Largest frame the wire codec accepts. |
 
 The WAL segment size is configurable. Group commit batching is bounded by a maximum request count and a short collection delay; refer to the `wal` package for the current options and defaults. Segment reclamation has no separate switch: it is driven by the shipper's checkpoint.
 
@@ -776,17 +851,20 @@ sequenceDiagram
 
 Each batch is identified by a SHA-256 token computed from the WAL positions where the batch starts and ends. Durable WAL records do not move, so the same batch produces the same token on every retry and after every restart. The shipper passes that token to `Store.InsertBatch` with the batch.
 
-Each row also carries an `event_id` computed from `producer_id`, `seq`, and `idx`, so an event has the same identifier wherever it is written.
+Each row also carries an `event_id` computed from `producer_id`, `producer_epoch`, `seq`, and `idx`. The fields are encoded unambiguously before hashing, so different field combinations cannot collide through concatenation, and an event has the same identifier wherever it is written. This is the same identity the server uses for [idempotent ingestion](#event-identity-and-idempotency).
 
 The adapter rejects an empty token for a non-empty batch, so every batch that reaches ClickHouse has one. It passes the token as `insert_deduplication_token`, which lets ClickHouse discard a repeated insert of the same block while the token is still in its deduplication history. Whether duplicates are removed from query results also depends on the table's ordering key and when ClickHouse merges parts, so the README does not claim exactly-once delivery.
 
 ### Duplicate handling
 
-A crash between a successful insert and the checkpoint write can cause the same batch to be inserted again after restart. The replayed batch carries the same token and the same `event_id` values as the original insert. The current schema uses `ReplacingMergeTree`, but deduplication is subject to ClickHouse merge behavior and does not make insertion exactly once.
+A crash between a successful insert and the checkpoint write can cause the same batch to be inserted again after restart. The replayed batch carries the same token and the same `event_id` values as the original insert. The current schema uses `ReplacingMergeTree` ordered by `event_id`, but deduplication is subject to ClickHouse merge behavior and does not make insertion exactly once.
 
 ### Schema
 
-The adapter persists events into the existing `fairgate.events` table, which uses `ReplacingMergeTree`, monthly partitioning, and a 30-day TTL. Persisted fields include `event_id`, the producer ID, event timestamp, sequence number, index (`UInt64`), event type, and payload. The `received_at` column has been removed. The schema sets `non_replicated_deduplication_window = 1000`, which controls how much insert deduplication history ClickHouse keeps for non-replicated MergeTree inserts. Refer to `deploy/clickhouse/schema.sql` for the exact columns, partition expression, TTL clause, and deduplication setting.
+The adapter persists events into the `fairgate.events` table, which uses `ReplacingMergeTree`, monthly partitioning, and a 30-day TTL. Persisted fields include `event_id`, the producer ID, `producer_epoch`, event timestamp, sequence number, index (`UInt64`), event type, and payload. Records are ordered by `event_id`. The `received_at` column has been removed. The schema sets `non_replicated_deduplication_window = 1000`, which controls how much insert deduplication history ClickHouse keeps for non-replicated MergeTree inserts. Refer to `deploy/clickhouse/schema.sql` for the exact columns, partition expression, TTL clause, and deduplication setting.
+
+> [!WARNING]
+> The schema file uses `CREATE TABLE IF NOT EXISTS`. Editing it does not add `producer_epoch` or change the sorting key on a table that already exists, so existing installations must migrate their table (or create a new one and copy the data) before running this version.
 
 ## Roadmap
 
@@ -794,7 +872,7 @@ The roadmap lists planned work in dependency order. Items are subject to change.
 
 ```mermaid
 flowchart TD
-    P1["Phase 1: Core ingestion (implemented)<br/>TCP server, wire protocol, admission control<br/>Per-producer queues, DRR scheduling<br/>Segmented WAL with group commit and ordered recovery<br/>Context-aware lifecycle and graceful shutdown<br/>Store interface, ClickHouse adapter<br/>Health endpoint, Prometheus metrics, Grafana overview"]
+    P1["Phase 1: Core ingestion (implemented)<br/>TCP server, wire protocol, admission control<br/>Event identity and idempotent ingestion<br/>Per-producer queues, DRR scheduling<br/>Segmented WAL with group commit and ordered recovery<br/>Context-aware lifecycle and graceful shutdown<br/>Store interface, ClickHouse adapter<br/>Health endpoint, Prometheus metrics, Grafana overview"]
     P2["Phase 2: Durable delivery (implemented)<br/>WAL shipping, checkpoints, retry and backoff<br/>Always-on runtime wiring<br/>Checkpoint-based WAL segment reclamation with durable-end guard"]
     P3["Phase 3: Fairness and overload control (planned)<br/>Producer weights, backlog-aware overload handling<br/>Load shedding"]
     P4["Phase 4: Operability and hardening (planned)<br/>Profiling, deeper metrics, alerting<br/>Packaged load, reconcile, and chaos tools<br/>Protocol hardening"]
@@ -812,6 +890,7 @@ A solid border marks implemented work. Dashed borders mark planned work.
 | Area | Status |
 |---|---|
 | Ingestion, validation, admission control | Implemented |
+| Producer epochs, event identity, idempotent ingestion | Implemented |
 | Per-producer queues, DRR scheduling | Implemented |
 | WAL append and recovery | Implemented |
 | WAL segmentation and group commit | Implemented |
@@ -821,6 +900,7 @@ A solid border marks implemented work. Dashed borders mark planned work.
 | Cancelable enqueueing and scheduler error propagation | Implemented |
 | `Store` interface, ClickHouse adapter | Implemented |
 | Optional ClickHouse integration test | Implemented |
+| TCP integration tests, CI race detection | Implemented |
 | Durable WAL reader and checkpoint-based batch shipping | Implemented |
 | Durable checkpoints and retry with backoff | Implemented |
 | Stable batch tokens and deterministic event IDs | Implemented |
@@ -887,6 +967,8 @@ go test ./...
 go test -race ./...
 ```
 
+CI runs `go test -race -v ./...` on every push through GitHub Actions.
+
 The graceful-shutdown tests use a no-op `Store` and a temporary checkpoint path, so the suite does not need a live ClickHouse service. The ClickHouse integration test runs only when its environment is configured.
 
 The repository is being developed as a gateway implementation. A stable command-line interface and client SDK are planned. Check the repository's current entry point and configuration before attempting to launch a server, or use the Compose stack described in [Docker deployment](#docker-deployment).
@@ -930,6 +1012,27 @@ Allow inbound TCP traffic on port `9001` through the host firewall, restricted t
 
 The Compose file uses development ClickHouse credentials. Replace them before exposing a non-development deployment. `docker compose down` keeps the named volumes; `docker compose down -v` removes them, including the WAL, checkpoint, and database data.
 
+If you already have a `fairgate.events` table from an earlier version, migrate it to the current schema before starting this version; see [Schema](#schema). Keeping the existing `clickhouse` volume does not apply schema changes.
+
+### Native Apple Container on macOS
+
+On an Apple silicon Mac running macOS 26 or later, the project can run with Apple's [`container` CLI](https://github.com/apple/container) without Docker Desktop. Apple's CLI runs OCI Linux images in lightweight VMs and does not provide Docker Compose, so the project uses a launcher script, `scripts/apple-container.sh`, to build and run the same four services with equivalent ports, networking, and persistent data volumes.
+
+> [!NOTE]
+> The launcher script is not currently tracked in the repository (`scripts/` is listed in `.gitignore`), so these instructions will not work from a clean checkout until the script is committed.
+
+Install Apple's signed `container` package from its [release page](https://github.com/apple/container/releases), then start its system service once:
+
+```bash
+container system start
+./scripts/apple-container.sh up
+./scripts/apple-container.sh status
+```
+
+The local endpoints match the Compose setup: FairGate TCP at `localhost:9001`, health and metrics at `localhost:9100`, Prometheus at `localhost:9090`, and Grafana at `localhost:3001` (default login `admin` / `admin`). ClickHouse's native port is `localhost:9000`. Named volumes persist data across `stop` and `down`; remove them explicitly with `./scripts/apple-container.sh down -v`. Follow logs with `./scripts/apple-container.sh logs [fairgate|clickhouse|prometheus|grafana]`.
+
+This launcher is for local development on Apple silicon. It does not change the Linux EC2 deployment, and the Apple Container CLI requirements and available flags are controlled by Apple's runtime release.
+
 ## Development status and limitations
 
 FairGate is an experimental beta. Interfaces, protocol details, configuration, and storage semantics may change. The project has tests for implemented components, but its end-to-end durability and fairness goals still require broader load, crash-recovery, and downstream-outage validation.
@@ -937,20 +1040,23 @@ FairGate is an experimental beta. Interfaces, protocol details, configuration, a
 Known limitations of the current beta:
 
 - The gateway always constructs the ClickHouse store and starts the shipper; there is no mode that runs without storage. `FAIRGATE_SHIPPER_ENABLED` is no longer read.
+- Events must now include `producer_epoch`. Producers built against the earlier event format will have their events rejected until they send it.
 - A crash after a successful database insert but before checkpoint commit can replay that batch. The replay reuses the batch token and event IDs, so storage can detect it, but duplicates are still possible in the database and end-to-end exactly-once delivery is not guaranteed.
-- Existing ClickHouse tables created from the earlier schema must be migrated to the current `deploy/clickhouse/schema.sql` before this version writes to them.
+- Existing ClickHouse tables created from an earlier schema must be migrated to the current `deploy/clickhouse/schema.sql` before this version writes to them. The schema file uses `CREATE TABLE IF NOT EXISTS`, so it does not add `producer_epoch` or change the sorting key on an existing table.
 - Deduplication through the batch token only covers replays within ClickHouse's deduplication window, which the schema sets to 1,000. A replay that falls outside that window is not deduplicated. Confirm the window is large enough for the replay distances you expect.
+- An event that was appended to the WAL but whose handler was canceled during enqueueing is not processed by the live scheduler, and a retry of it in the same process lifetime is acknowledged as a duplicate. It is replayed from the WAL on the next startup.
 - WAL retention depends on the shipper. Reclamation advances only when a batch is inserted and its checkpoint committed, so while ClickHouse is unavailable, or a batch keeps failing and is retried, segments accumulate on disk.
 - Reclamation deletes whole segments older than the checkpoint segment. The checkpoint and active segments are retained, so some already shipped records remain on disk until a later checkpoint passes them, and reclaimed records are no longer available for recovery replay or inspection.
 - The reclamation guard compares segment IDs only. A checkpoint in the same segment as the durable end but with an offset past it is not rejected yet.
 - The ClickHouse integration test is optional and runs only when the environment is configured for it.
-- Queue capacity, the admission rate and burst, the DRR quantum, the shutdown grace period, and the shipper's batch size, poll interval, and retry policy are fixed in the code and not yet configurable.
+- Queue capacity, the admission rate and burst, the DRR quantum, the shutdown grace period, the maximum frame size, and the shipper's batch size, poll interval, and retry policy are fixed in the code and not yet configurable.
 - All producers receive equal scheduling treatment. Weights are not yet supported.
 - Enqueueing blocks on a full queue (cancelable during shutdown), and no load-shedding policy exists yet.
 - A WAL write, rotation, or sync failure is fatal: later appends are rejected until the WAL is reopened.
 - Startup recovery fails on an incomplete record in any non-final segment, rather than repairing it.
 - Shutdown has no explicit queue-drain confirmation, and a handler stuck in an operation that ignores connection closure and context cancellation can delay it beyond the grace period.
 - The Compose file ships with development credentials and publishes the FairGate, ClickHouse, Prometheus, and Grafana ports; restrict inbound access to trusted addresses as described in [Docker deployment](#docker-deployment) and replace the credentials before any non-development use.
+- The Apple Container launcher script is not tracked in the repository, so the macOS instructions do not work from a clean checkout.
 - FairGate currently exposes a basic Prometheus metrics set (active connections, accepted, rejected and invalid events, WAL append errors, scheduler totals), a `/health` endpoint, and a provisioned Grafana overview dashboard. Profiling, per-stage latency metrics, queue-depth metrics, and shipper lag metrics are not available yet.
 
 ## Contributing

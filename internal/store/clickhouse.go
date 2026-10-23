@@ -4,6 +4,7 @@ import (
 	"FairGate/internal/wire"
 	"context"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -58,7 +59,7 @@ func (s *ClickHouseStore) InsertBatch(ctx context.Context, events []wire.Event, 
 	ctx = clickhouse.Context(ctx, clickhouse.WithSettings(clickhouse.Settings{"insert_deduplication_token": token}))
 
 	batch, err := s.conn.PrepareBatch(ctx, `INSERT INTO fairgate.events
-		(event_id, producer_id, event_time, seq, idx, event_type, payload)`)
+		(event_id, producer_id, producer_epoch,event_time, seq, idx, event_type, payload)`)
 	if err != nil {
 		return fmt.Errorf("prepare batch: %w", err)
 	}
@@ -68,6 +69,7 @@ func (s *ClickHouseStore) InsertBatch(ctx context.Context, events []wire.Event, 
 		err := batch.Append(
 			eventID(event),
 			event.ProducerId,
+			event.ProducerEpoch,
 			event.EventTime,
 			event.Seq,
 			event.Idx,
@@ -91,13 +93,30 @@ func (s *ClickHouseStore) Close() error {
 }
 
 func eventID(event wire.Event) string {
-	identity := fmt.Sprintf(
-		"%s:%d:%d",
-		event.ProducerId,
-		event.Seq,
-		event.Idx,
-	)
+	//previous event identity was constructed using formatted text
+	//updated version uses length-prefixed strings and fixed-width numeric fields
+	//prevents ambiguous string combinations from producing the same encoded identity.
+	//creates an empty byte slice with a pre-allocated capacity.
+	//18 - two 4-byte length prefixes (8 bytes), a 8-byte sequence number, and a 2-byte index (10 bytes).
+	identity := make([]byte, 0, len(event.ProducerId)+len(event.ProducerEpoch)+18)
 
-	sum := sha256.Sum256([]byte(identity))
+	identity = appendLengthPrefixed(identity, event.ProducerId)
+	identity = appendLengthPrefixed(identity, event.ProducerEpoch)
+
+	//encode sequence number and index
+	var numbers [10]byte
+
+	binary.BigEndian.PutUint64(numbers[:8], event.Seq)
+	binary.BigEndian.PutUint16(numbers[8:], event.Idx)
+
+	identity = append(identity, numbers[:]...)
+	sum := sha256.Sum256(identity)
 	return hex.EncodeToString(sum[:])
+}
+
+func appendLengthPrefixed(dst []byte, value string) []byte {
+	var length [4]byte
+	binary.BigEndian.PutUint32(length[:], uint32(len(value)))
+	dst = append(dst, length[:]...)
+	return append(dst, value...)
 }

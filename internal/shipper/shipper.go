@@ -85,6 +85,7 @@ func positionCheckpoint(position wal.Position) Checkpoint {
 		Offset:  position.Offset,
 	}
 }
+
 func (s *Shipper) Run(ctx context.Context) error {
 	checkpoint, err := s.checkpoint.Load()
 	if err != nil {
