@@ -2,6 +2,7 @@ package server
 
 import (
 	"FairGate/internal/admit"
+	"FairGate/internal/deduplication"
 	"FairGate/internal/observability"
 	"FairGate/internal/sched"
 	"FairGate/internal/shipper"
@@ -94,6 +95,12 @@ func runContext(ctx context.Context, addr string, logger *slog.Logger, newStore 
 	logger.Info("WAL recovery complete",
 		"recovered_events", len(events),
 	)
+
+	//create a deduplication manager instance
+	dedupManager, err := deduplication.NewManager(events)
+	if err != nil {
+		return fmt.Errorf("initialize event deduplication: %w", err)
+	}
 
 	walLog, err := wal.Open(walPath)
 	if err != nil {
@@ -325,7 +332,8 @@ func runContext(ctx context.Context, addr string, logger *slog.Logger, newStore 
 				connMu.Unlock()
 			}()
 
-			handleConnWithMetrics(
+			//added deduplication manager
+			handleConn(
 				handlerCtx,
 				conn,
 				logger,
@@ -333,6 +341,7 @@ func runContext(ctx context.Context, addr string, logger *slog.Logger, newStore 
 				queues,
 				walLog,
 				metrics,
+				dedupManager,
 			)
 		}(conn)
 	}
@@ -377,34 +386,6 @@ func runContext(ctx context.Context, addr string, logger *slog.Logger, newStore 
 }
 
 func handleConn(
-	conn net.Conn,
-	logger *slog.Logger,
-	admission *admit.Manager,
-	queues *sched.Queues,
-	walLog *wal.WAL,
-) {
-	handleConnContext(
-		context.Background(),
-		conn,
-		logger,
-		admission,
-		queues,
-		walLog,
-	)
-}
-
-func handleConnContext(
-	ctx context.Context,
-	conn net.Conn,
-	logger *slog.Logger,
-	admission *admit.Manager,
-	queues *sched.Queues,
-	walLog *wal.WAL,
-) {
-	handleConnWithMetrics(ctx, conn, logger, admission, queues, walLog, observability.New())
-}
-
-func handleConnWithMetrics(
 	ctx context.Context,
 	conn net.Conn,
 	logger *slog.Logger,
@@ -412,121 +393,126 @@ func handleConnWithMetrics(
 	queues *sched.Queues,
 	walLog *wal.WAL,
 	metrics *observability.Metrics,
+	dedupManager *deduplication.Manager,
 ) {
-	// Close the connection when the client exits.
 	defer conn.Close()
 
 	remoteAddr := conn.RemoteAddr().String()
-	logger.Info("Client connected", "remoteAddr", remoteAddr)
+	logger.Info("Client connected", "remote_addr", remoteAddr)
 
 	for {
-		// Convert bytes into frames.
 		frame, err := wire.ReadFrame(conn)
-
 		if err != nil {
 			if !errors.Is(err, io.EOF) {
-				logger.Warn(
-					"error reading frame",
-					"remoteAddr", remoteAddr,
+				logger.Warn("Error reading frame",
+					"remote_addr", remoteAddr,
 					"error", err,
 				)
 			}
 			return
 		}
 
-		logger.Info(
-			"Frame received",
-			"remoteAddr", remoteAddr,
-			"type", frame.Type,
-			"payload_bytes", len(frame.Payload),
-		)
-
-		// Type 1 represents an event frame.
-		// Unsupported frame types are logged and skipped.
 		if frame.Type != 1 {
-			logger.Warn(
-				"Unsupported Frame Type",
-				"Remote Address", remoteAddr,
+			logger.Warn("Unsupported frame type",
+				"remote_addr", remoteAddr,
 				"type", frame.Type,
 			)
 			continue
 		}
 
-		// Decode the event and check for errors in the payload.
 		event, err := wire.DecodeEvent(frame.Payload)
 		if err != nil {
 			metrics.EventInvalid()
-			logger.Warn("Invalid event payload", "remote_addr", remoteAddr, "error", err)
-			if werr := sendAck(conn, wire.Ack{
+			if err := sendAck(conn, wire.Ack{
 				Status:  ackInvalid,
 				Message: "invalid_payload",
-			}); werr != nil {
-				logger.Warn("Failed to send NACK", "remote_addr", remoteAddr, "error", werr)
+			}); err != nil {
+				logger.Warn("Failed to send NACK", "error", err)
 				return
 			}
 			continue
 		}
 
-		// Log the event.
-		logger.Info(
-			"Event received",
-			"remote_addr", remoteAddr,
-			"producer_id", event.ProducerId,
-			"event_time", event.EventTime,
-			"seq", event.Seq,
-			"idx", event.Idx,
-			"event_type", event.EventType,
-		)
-
-		// If the event is not allowed: log, send ack and continue.
 		if !admission.Allow(event.ProducerId) {
 			metrics.EventRejected()
-			logger.Warn("Event rejected by admission control",
-				"remote_addr", remoteAddr, "producer_id", event.ProducerId, "seq", event.Seq)
-			if werr := sendAck(conn, wire.Ack{
+			if err := sendAck(conn, wire.Ack{
 				ProducerId: event.ProducerId,
 				Seq:        event.Seq,
 				Idx:        event.Idx,
 				Status:     ackRejected,
 				Message:    "rate_limited",
-			}); werr != nil {
-				logger.Warn("Failed to send NACK", "remote_addr", remoteAddr, "error", werr)
+			}); err != nil {
+				logger.Warn("Failed to send NACK", "error", err)
 				return
 			}
 			continue
 		}
 
-		// Append the event to the WAL.
-		if err := walLog.Append(event); err != nil {
+		duplicate, err := dedupManager.PersistIfNew(event, func() error {
+			return walLog.Append(event)
+		})
+		if err != nil {
+			if errors.Is(err, deduplication.ErrConflict) ||
+				errors.Is(err, deduplication.ErrInvalid) {
+				metrics.EventInvalid()
+				if err := sendAck(conn, wire.Ack{
+					ProducerId: event.ProducerId,
+					Seq:        event.Seq,
+					Idx:        event.Idx,
+					Status:     ackInvalid,
+					Message:    "event_identity_conflict",
+				}); err != nil {
+					logger.Warn("Failed to send NACK", "error", err)
+					return
+				}
+				continue
+			}
+
 			metrics.WALAppendError()
 			logger.Error("Failed to append to WAL",
-				"remote_addr", remoteAddr, "producer_id", event.ProducerId, "seq", event.Seq, "error", err)
-			if werr := sendAck(conn, wire.Ack{
+				"producer_id", event.ProducerId,
+				"seq", event.Seq,
+				"error", err,
+			)
+			if err := sendAck(conn, wire.Ack{
 				ProducerId: event.ProducerId,
 				Seq:        event.Seq,
 				Idx:        event.Idx,
 				Status:     ackError,
 				Message:    "wal_append_failed",
-			}); werr != nil {
-				logger.Warn("Failed to send NACK", "remote_addr", remoteAddr, "error", werr)
+			}); err != nil {
+				logger.Warn("Failed to send NACK", "error", err)
 			}
-			return // see note below
+			return
 		}
 
-		// Enqueue the event, allowing shutdown to cancel a blocked enqueue.
+		if duplicate {
+			if err := sendAck(conn, wire.Ack{
+				ProducerId: event.ProducerId,
+				Seq:        event.Seq,
+				Idx:        event.Idx,
+				Status:     ackAccepted,
+				Message:    "duplicate_event_already_persisted",
+			}); err != nil {
+				logger.Warn("Failed to send duplicate ACK", "error", err)
+				return
+			}
+			metrics.EventAccepted()
+			continue
+		}
+
 		if !queues.EnqueueContext(ctx, event) {
 			if ctx.Err() != nil {
-				logger.Debug(
-					"Handler canceled while enqueueing event",
+				logger.Debug("Handler canceled while enqueueing event",
 					"producer_id", event.ProducerId,
 					"seq", event.Seq,
 				)
 				return
 			}
 
-			logger.Warn(
-				"Event rejected: producer queue full",
+			logger.Warn("Event persisted but producer queue is full",
 				"producer_id", event.ProducerId,
+				"seq", event.Seq,
 			)
 			continue
 		}
@@ -538,13 +524,12 @@ func handleConnWithMetrics(
 			Status:     ackAccepted,
 			Message:    "Event successfully enqueued",
 		}); err != nil {
-			logger.Warn("Failed to send ACK", "remote_addr", remoteAddr, "error", err)
+			logger.Warn("Failed to send ACK", "error", err)
 			return
 		}
-		metrics.EventAccepted()
 
-		logger.Info(
-			"Event admitted",
+		metrics.EventAccepted()
+		logger.Info("Event admitted",
 			"remote_addr", remoteAddr,
 			"producer_id", event.ProducerId,
 			"seq", event.Seq,

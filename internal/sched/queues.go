@@ -9,9 +9,10 @@ import (
 )
 
 type EventKey struct {
-	ProducerId string
-	Seq        uint64
-	idx        uint16
+	ProducerId    string
+	ProducerEpoch string
+	Seq           uint64
+	Idx           uint16
 }
 
 type Queues struct {
@@ -37,10 +38,8 @@ func NewQueues(capacity int) (*Queues, error) {
 }
 
 func (q *Queues) getOrCreate(producerId string) chan wire.Event {
-	//Lock mutex to prevent dirty read / writes
-	q.mu.Lock()
-	//make sure the mutex unlocks when the function returns
-	defer q.mu.Unlock()
+	//remove mutex lock from this function to the enqueueContext function
+	//this prevents an indefinite lock
 
 	//Check if producerId has a queue
 	queue, exists := q.queues[producerId]
@@ -55,26 +54,51 @@ func (q *Queues) getOrCreate(producerId string) chan wire.Event {
 }
 
 func (q *Queues) EnqueueContext(ctx context.Context, event wire.Event) bool {
-	if event.ProducerId == "" {
+	//add a check for producer epoch as well
+	if event.ProducerId == "" || event.ProducerEpoch == "" {
 		return false
 	}
 
+	key := EventKey{
+		ProducerId:    event.ProducerId,
+		ProducerEpoch: event.ProducerEpoch,
+		Seq:           event.Seq,
+		Idx:           event.Idx,
+	}
+
 	//Get or create queue depending on availability
+	//obtain a mutex lock
+	q.mu.Lock()
+
+	//release the mutex if it has already been added
+	if _, exists := q.seen[key]; exists {
+		q.mu.Unlock()
+		return true
+	}
+
 	queue := q.getOrCreate(event.ProducerId)
+	//reserve this identity so concurrent retries cannot enqueue it twice.
+	q.seen[key] = struct{}{}
+
+	//unlock the mutex once the queue has been created
+	q.mu.Unlock()
 
 	//Convert the enqueue from a non-blocking to a blocking step
 	//Ensures no processes are rejected due to a full queue
-	//TODO: Implement Idempotency + Overflow Buffer + Non blocking queue to mitigate this issue to some extent
+	//TODO: Overflow Buffer + Non blocking queue to mitigate this issue to some extent
+	//update: idempotency implemented
 	//Might come up with a better solution later so haven't implemented for now
 
 	//Implemented a non-blocking procedure to ensure graceful shutdowns
 	select {
 	case queue <- event:
 		return true
-	//channel that gets closed when the context is canceled or its deadline expires.
-	//context is canceled while the function is waiting to enqueue an event, this case becomes ready and the function can return false without waiting for queue space.
-	//If a handler is blocked trying to enqueue an event and the server cancels its handler context, the handler can stop waiting and exit.
+	//if the context is canceled or its deadline expires while waiting to enqueue, the select statement can exit without waiting for space in the queue.
+	//remove the event's identity from the deduplication map so a subsequent retry can attempt to enqueue the event again.
 	case <-ctx.Done():
+		q.mu.Lock()
+		delete(q.seen, key)
+		q.mu.Unlock()
 		return false
 	}
 }

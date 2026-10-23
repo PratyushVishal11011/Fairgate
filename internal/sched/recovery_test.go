@@ -33,40 +33,48 @@ func TestSchedulerDrainsQueueBeyondCapacity(t *testing.T) {
 		})
 	}()
 
+	enqueueCtx, cancelEnqueue := context.WithCancel(ctx)
+	defer cancelEnqueue()
+
 	enqueueDone := make(chan bool, 1)
 
 	go func() {
 		for i := 0; i < total; i++ {
 			event := wire.Event{
-				ProducerId: "producer-1",
-				EventTime:  time.Now(),
-				Seq:        uint64(i + 1),
-				Idx:        0,
-				EventType:  "test",
-				Payload:    "recovery-test",
+				ProducerId:    "producer-1",
+				ProducerEpoch: "epoch-001",
+				EventTime:     time.Now().UTC(),
+				Seq:           uint64(i + 1),
+				Idx:           0,
+				EventType:     "test",
+				Payload:       "recovery-test",
 			}
 
-			if !queues.Enqueue(event) {
+			if !queues.EnqueueContext(enqueueCtx, event) {
 				enqueueDone <- false
 				return
 			}
 		}
+
 		enqueueDone <- true
 	}()
 
 	select {
 	case success := <-enqueueDone:
 		if !success {
+			cancel()
 			t.Fatal("failed to enqueue events")
 		}
 	case <-time.After(5 * time.Second):
-		t.Fatal("enqueue blocked; scheduler may not be draining the queue")
+		cancel()
+		t.Fatal("enqueue timed out; scheduler may not be draining the queue")
 	}
 
 	for i := 0; i < total; i++ {
 		select {
 		case <-processed:
 		case <-time.After(5 * time.Second):
+			cancel()
 			t.Fatalf("timed out after processing %d of %d events", i, total)
 		}
 	}
@@ -74,7 +82,10 @@ func TestSchedulerDrainsQueueBeyondCapacity(t *testing.T) {
 	cancel()
 
 	select {
-	case <-schedulerDone:
+	case err := <-schedulerDone:
+		if err != nil && err != context.Canceled {
+			t.Fatalf("scheduler returned unexpected error: %v", err)
+		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("scheduler did not stop after cancellation")
 	}

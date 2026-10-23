@@ -1,9 +1,11 @@
 package sched
 
 import (
-	"FairGate/internal/wire"
+	"context"
 	"testing"
 	"time"
+
+	"FairGate/internal/wire"
 )
 
 func TestQueueCapacity(t *testing.T) {
@@ -12,9 +14,24 @@ func TestQueueCapacity(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	event1 := wire.Event{ProducerId: "producer-A", Seq: 1}
-	event2 := wire.Event{ProducerId: "producer-A", Seq: 2}
-	event3 := wire.Event{ProducerId: "producer-A", Seq: 3}
+	event1 := wire.Event{
+		ProducerId:    "producer-A",
+		ProducerEpoch: "epoch-001",
+		Seq:           1,
+		Idx:           0,
+	}
+	event2 := wire.Event{
+		ProducerId:    "producer-A",
+		ProducerEpoch: "epoch-001",
+		Seq:           2,
+		Idx:           0,
+	}
+	event3 := wire.Event{
+		ProducerId:    "producer-A",
+		ProducerEpoch: "epoch-001",
+		Seq:           3,
+		Idx:           0,
+	}
 
 	if !queues.Enqueue(event1) {
 		t.Fatal("expected first event to be enqueued")
@@ -24,33 +41,37 @@ func TestQueueCapacity(t *testing.T) {
 		t.Fatal("expected second event to be enqueued")
 	}
 
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
 	result := make(chan bool, 1)
 
-	// Third enqueue should block because the queue is full.
+	// The third enqueue should block while the queue is full.
 	go func() {
-		result <- queues.Enqueue(event3)
+		result <- queues.EnqueueContext(ctx, event3)
 	}()
 
 	select {
-	case <-result:
-		t.Fatal("expected third enqueue to block")
+	case ok := <-result:
+		t.Fatalf("expected enqueue to block, returned %v", ok)
 	case <-time.After(50 * time.Millisecond):
-		// Expected: enqueue is blocked.
+		// Expected: the queue is full, so enqueue is waiting.
 	}
 
-	// Remove one event to free up queue capacity.
+	// Remove one event to free queue capacity.
 	received := <-queues.Queue("producer-A")
 	if received.Seq != 1 {
 		t.Fatalf("expected seq 1, got %d", received.Seq)
 	}
 
-	// Third enqueue should now complete.
+	// The third enqueue should now complete.
 	select {
 	case ok := <-result:
 		if !ok {
 			t.Fatal("expected third event to be enqueued")
 		}
 	case <-time.After(time.Second):
+		cancel()
 		t.Fatal("enqueue did not resume after space became available")
 	}
 
@@ -63,5 +84,53 @@ func TestQueueCapacity(t *testing.T) {
 	received = <-queues.Queue("producer-A")
 	if received.Seq != 3 {
 		t.Fatalf("expected seq 3, got %d", received.Seq)
+	}
+}
+
+func TestQueueCapacityCancellation(t *testing.T) {
+	queues, err := NewQueues(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	first := wire.Event{
+		ProducerId:    "producer-A",
+		ProducerEpoch: "epoch-001",
+		Seq:           1,
+	}
+	second := wire.Event{
+		ProducerId:    "producer-A",
+		ProducerEpoch: "epoch-001",
+		Seq:           2,
+	}
+
+	if !queues.Enqueue(first) {
+		t.Fatal("expected first event to be enqueued")
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan bool, 1)
+
+	go func() {
+		result <- queues.EnqueueContext(ctx, second)
+	}()
+
+	// Give the enqueue goroutine time to reach the full queue.
+	time.Sleep(50 * time.Millisecond)
+	cancel()
+
+	select {
+	case ok := <-result:
+		if ok {
+			t.Fatal("expected enqueue to fail after cancellation")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("enqueue did not return after context cancellation")
+	}
+
+	// The original event should remain in the queue.
+	received := <-queues.Queue("producer-A")
+	if received.Seq != 1 {
+		t.Fatalf("expected seq 1, got %d", received.Seq)
 	}
 }

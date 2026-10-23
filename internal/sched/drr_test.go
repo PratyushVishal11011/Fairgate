@@ -1,10 +1,11 @@
 package sched
 
 import (
-	"FairGate/internal/wire"
 	"context"
 	"errors"
 	"testing"
+
+	"FairGate/internal/wire"
 )
 
 func TestDRRFairness(t *testing.T) {
@@ -18,8 +19,10 @@ func TestDRRFairness(t *testing.T) {
 	for _, producer := range producers {
 		for i := 0; i < 10; i++ {
 			if !queues.Enqueue(wire.Event{
-				ProducerId: producer,
-				Seq:        uint64(i + 1),
+				ProducerId:    producer,
+				ProducerEpoch: "epoch-001",
+				Seq:           uint64(i + 1),
+				Idx:           0,
 			}) {
 				t.Fatalf("failed to enqueue for %s", producer)
 			}
@@ -50,8 +53,12 @@ func TestDRRFairness(t *testing.T) {
 
 	for _, producer := range producers {
 		if counts[producer] != 10 {
-			t.Errorf("%s processed %d events, expected 10",
-				producer, counts[producer])
+			t.Errorf(
+				"%s processed %d events, expected 10",
+				producer,
+				counts[producer],
+			)
 		}
+
 	}
 }
