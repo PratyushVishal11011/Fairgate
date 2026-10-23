@@ -107,8 +107,6 @@ Events now carry a stable identity that survives producer restarts, and the serv
 - **Schema changes.** `deploy/clickhouse/schema.sql` adds a `producer_epoch` column and orders records by `event_id`. Existing tables need a migration; see the note below.
 - **Frame size.** The maximum wire frame size is raised from 1 MiB to 5 MiB.
 - **Tests.** New tests cover idempotency, acknowledgments, recovery, queue behavior, and server ingestion over TCP.
-- **CI.** The GitHub Actions workflow now runs `go test -race -v ./...`.
-- **Docs.** The README adds instructions for running the services with Apple's container runtime.
 
 > [!WARNING]
 > **Schema migration required.** `deploy/clickhouse/schema.sql` uses `CREATE TABLE IF NOT EXISTS`, so editing the schema file does not add `producer_epoch` or change the sorting key on a table that already exists. Deployments with an existing `fairgate.events` table need to migrate it (or recreate it) before running this version. Changing the sorting key of a MergeTree table generally means creating a new table and copying data into it.
@@ -1014,7 +1012,7 @@ The Compose file uses development ClickHouse credentials. Replace them before ex
 
 If you already have a `fairgate.events` table from an earlier version, migrate it to the current schema before starting this version; see [Schema](#schema). Keeping the existing `clickhouse` volume does not apply schema changes.
 
-### Native Apple Container on macOS
+### Native Apple Container on macOS (Coming Soon)
 
 On an Apple silicon Mac running macOS 26 or later, the project can run with Apple's [`container` CLI](https://github.com/apple/container) without Docker Desktop. Apple's CLI runs OCI Linux images in lightweight VMs and does not provide Docker Compose, so the project uses a launcher script, `scripts/apple-container.sh`, to build and run the same four services with equivalent ports, networking, and persistent data volumes.
 
