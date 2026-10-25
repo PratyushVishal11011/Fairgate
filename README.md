@@ -4,6 +4,8 @@
 
 FairGate is a modular event-ingestion gateway. It accepts framed event streams over TCP, applies admission control, deduplicates retried events by a stable event identity, persists accepted events in a segmented Write-Ahead Log (WAL) with group commit, schedules events from per-producer queues using Deficit Round Robin (DRR), and ships durable WAL records to ClickHouse through a checkpointed shipper that also reclaims fully shipped WAL segments.
 
+FairGate provides crash-recoverable event ingestion with idempotent batch retries. Events are persisted in the WAL, ClickHouse inserts are retried using stable batch deduplication tokens, and successfully processed batches are checkpointed. Integration tests against a Docker-hosted ClickHouse verify duplicate suppression when a batch is replayed after a checkpoint failure. These deduplication guarantees are subject to ClickHouse's configured insert-deduplication window and storage behavior, so delivery remains at-least-once rather than exactly-once.
+
 The project explores fair resource sharing in event-ingestion systems: keeping producers isolated from one another through bounded buffering, admission limits, and fair scheduling. FairGate is being developed as an open-source foundation that can be extended with different storage backends and downstream processing components.
 
 > [!IMPORTANT]
@@ -71,6 +73,7 @@ The project explores fair resource sharing in event-ingestion systems: keeping p
 - **Store interface.** `InsertBatch(ctx, token, events)` and `Close()` separate storage from the processing pipeline.
 - **ClickHouse adapter.** Official Go client with configurable authentication, `Ping` health checks, batched inserts through `PrepareBatch` and `Send`, and graceful cleanup. Each row includes an `event_id` computed from `producer_id`, `producer_epoch`, `seq`, and `idx` using an unambiguous encoding, and stores the epoch in its own column. The adapter rejects an empty token for a non-empty batch and passes the token to ClickHouse as `insert_deduplication_token`.
 - **Optional ClickHouse integration test.** Environment-gated test covering connectivity, batch insertion, retrieval, and re-inserting the same batch with the same token. It checks that each event appears exactly once, uses a 30-second timeout, and quotes the configured database name in its queries.
+- **Crash-replay integration tests.** Integration tests run against a Docker-hosted ClickHouse and verify that a batch replayed after a checkpoint failure is suppressed as a duplicate. The guarantee holds only while the batch token is within ClickHouse's insert-deduplication window and is subject to its storage behavior.
 - **Health and Prometheus endpoints.** FairGate responds with `200 OK` and `ok` at `/health` on port `9100`; Docker Compose uses this endpoint for its gateway healthcheck. Prometheus metrics for active TCP connections, accepted, rejected and invalid events, WAL append errors, and scheduler processing totals remain available at `/metrics` on port `9100`.
 - **Docker deployment.** A `Dockerfile` and Compose stack run FairGate with ClickHouse, Prometheus, and Grafana. Prometheus scrapes the gateway and Grafana provisions its Prometheus datasource and FairGate overview dashboard. `install-docker-ubuntu.sh` installs Docker Engine and the Compose plugin on Ubuntu.
 - **Acknowledgments.** Sends an accepted acknowledgment after the event has been appended to the WAL and enqueued, and also for an identical retry of an event that was already accepted.
@@ -95,6 +98,18 @@ Planned capabilities are not implied to be available in this beta.
 
 ## Recent updates
 
+### 25th October, 2026: Crash-recoverable ingestion with idempotent batch retries
+
+The write path is now covered end to end by integration tests against a real ClickHouse. Together, the WAL, stable batch tokens, and checkpointing let the gateway recover from a crash and retry a batch without inserting its rows twice, within ClickHouse's deduplication limits.
+
+- **Crash recovery.** Accepted events are persisted in the WAL before acknowledgment, and the shipper resumes from its durable checkpoint after a restart.
+- **Idempotent batch retries.** Failed inserts are retried with the same stable batch token, which the ClickHouse adapter passes as `insert_deduplication_token`.
+- **Checkpointing.** Progress is committed atomically only after a batch has been inserted successfully.
+- **Docker-hosted integration tests.** Tests run against ClickHouse in Docker and verify duplicate suppression when a batch is replayed after a checkpoint failure.
+- **Scope of the guarantee.** Deduplication depends on ClickHouse's configured insert-deduplication window (`non_replicated_deduplication_window = 1000` in the schema) and on its storage behavior. A replay outside the window is not suppressed, and delivery remains at-least-once, not exactly-once.
+
+See [Batch and event identity](#batch-and-event-identity) and [Duplicate handling](#duplicate-handling).
+
 ### 23rd October, 2026: Producer epochs, event idempotency, and TCP integration tests
 
 Events now carry a stable identity that survives producer restarts, and the server uses it to make producer retries safe. This update also adds server and scheduler test coverage, race detection in CI, and a larger frame size limit.
@@ -107,6 +122,8 @@ Events now carry a stable identity that survives producer restarts, and the serv
 - **Schema changes.** `deploy/clickhouse/schema.sql` adds a `producer_epoch` column and orders records by `event_id`. Existing tables need a migration; see the note below.
 - **Frame size.** The maximum wire frame size is raised from 1 MiB to 5 MiB.
 - **Tests.** New tests cover idempotency, acknowledgments, recovery, queue behavior, and server ingestion over TCP.
+- **CI.** The GitHub Actions workflow now runs `go test -race -v ./...`.
+- **Docs.** The README adds instructions for running the services with Apple's container runtime.
 
 > [!WARNING]
 > **Schema migration required.** `deploy/clickhouse/schema.sql` uses `CREATE TABLE IF NOT EXISTS`, so editing the schema file does not add `producer_epoch` or change the sorting key on a table that already exists. Deployments with an existing `fairgate.events` table need to migrate it (or recreate it) before running this version. Changing the sorting key of a MergeTree table generally means creating a new table and copying data into it.
@@ -747,6 +764,7 @@ The listen address is chosen by the caller. The ClickHouse store is built from t
 | Empty batch token rejected before insert | Yes |
 | Batch token passed to ClickHouse as `insert_deduplication_token` | Yes |
 | Replayed batch deduplicated by ClickHouse | Within the deduplication window only; not exactly-once |
+| Duplicate suppression on replay after a checkpoint failure verified by integration tests | Yes, against a Docker-hosted ClickHouse; subject to the deduplication window and storage behavior |
 | Batch may be inserted again after a crash before checkpoint commit | Yes (duplicates possible, with the same token and event IDs) |
 | WAL segments reclaimed after shipping | Yes; segments older than the committed checkpoint segment are removed |
 | Reclamation runs only after the checkpoint commit (and at startup against the checkpoint on disk) | Yes |
@@ -804,7 +822,7 @@ ClickHouse is the initial storage backend. The `Store` interface, ClickHouse ada
 | Reclamation | After each checkpoint commit, and once at startup against the checkpoint on disk, calls `WAL.ReclaimBefore`. Rejects checkpoints beyond the durable end with `ErrCheckpointAhead`. Otherwise deletes only segments with IDs strictly less than the checkpoint segment, keeping the checkpoint and active segments, serialized with rotation, with a directory sync afterward. |
 | `Store` interface | `InsertBatch(ctx, token, events)` and `Close()`. Backends plug in without changes to the shipper. |
 | ClickHouse adapter | Official Go client, configurable authentication, `Ping` health check, batched inserts with `PrepareBatch` and `Send`, graceful close. |
-| Integration test | Optional and environment-gated. Validates connectivity, batch insertion, retrieval, and re-insertion of the same batch with the same token, checking that each event appears exactly once. |
+| Integration test | Optional and environment-gated. Validates connectivity, batch insertion, retrieval, and re-insertion of the same batch with the same token, checking that each event appears exactly once. Tests against a Docker-hosted ClickHouse also verify duplicate suppression when a batch is replayed after a checkpoint failure. |
 
 > [!NOTE]
 > **Database delivery remains at-least-once.** The shipper resumes from its checkpoint and retries insertion failures. A process crash after a successful insert but before checkpoint commit can result in the batch being inserted again. Exactly-once delivery is not provided. Segments older than the committed checkpoint segment are reclaimed, so the WAL is not a permanent archive of every event.
@@ -1012,7 +1030,7 @@ The Compose file uses development ClickHouse credentials. Replace them before ex
 
 If you already have a `fairgate.events` table from an earlier version, migrate it to the current schema before starting this version; see [Schema](#schema). Keeping the existing `clickhouse` volume does not apply schema changes.
 
-### Native Apple Container on macOS (Coming Soon)
+### Native Apple Container on macOS
 
 On an Apple silicon Mac running macOS 26 or later, the project can run with Apple's [`container` CLI](https://github.com/apple/container) without Docker Desktop. Apple's CLI runs OCI Linux images in lightweight VMs and does not provide Docker Compose, so the project uses a launcher script, `scripts/apple-container.sh`, to build and run the same four services with equivalent ports, networking, and persistent data volumes.
 
