@@ -30,11 +30,14 @@ type eventContent struct {
 type Manager struct {
 	mu     sync.Mutex
 	events map[eventKey][sha256.Size]byte
+	//identities whose persist is running; closed when it finishes.
+	inflight map[eventKey]chan struct{}
 }
 
 func NewManager(recovered []wire.Event) (*Manager, error) {
 	m := &Manager{
-		events: make(map[eventKey][sha256.Size]byte, len(recovered)),
+		events:   make(map[eventKey][sha256.Size]byte, len(recovered)),
+		inflight: make(map[eventKey]chan struct{}),
 	}
 
 	for _, event := range recovered {
@@ -57,7 +60,8 @@ func NewManager(recovered []wire.Event) (*Manager, error) {
 }
 
 // PersistIfNew persists a new event before recording its identity.
-// Concurrent retries are serialized by the manager mutex.
+// Concurrent retries of one identity are serialized, but the manager mutex is not held
+// during persist, so different identities persist concurrently and share WAL group commits.
 func (m *Manager) PersistIfNew(
 	event wire.Event,
 	persist func() error,
@@ -68,20 +72,43 @@ func (m *Manager) PersistIfNew(
 	}
 
 	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	if existing, ok := m.events[key]; ok {
-		if existing != fingerprint {
-			return false, ErrConflict
+	for {
+		if existing, ok := m.events[key]; ok {
+			m.mu.Unlock()
+			if existing != fingerprint {
+				return false, ErrConflict
+			}
+			return true, nil
 		}
-		return true, nil
+
+		//another handler is persisting this identity; wait for it, then check again.
+		//if its persist failed, the identity is still unknown and this call persists it.
+		done, ok := m.inflight[key]
+		if !ok {
+			break
+		}
+		m.mu.Unlock()
+		<-done
+		m.mu.Lock()
 	}
 
-	if err := persist(); err != nil {
+	done := make(chan struct{})
+	m.inflight[key] = done
+	m.mu.Unlock()
+
+	err = persist()
+
+	m.mu.Lock()
+	if err == nil {
+		m.events[key] = fingerprint
+	}
+	delete(m.inflight, key)
+	m.mu.Unlock()
+	close(done)
+
+	if err != nil {
 		return false, err
 	}
-
-	m.events[key] = fingerprint
 	return false, nil
 }
 

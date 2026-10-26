@@ -4,6 +4,14 @@
 
 ## Recent updates
 
+### 26th October, 2026: Ingestion latency fix
+
+- **Concurrent WAL appends restored.** The deduplication manager held one global mutex across each WAL append, including its fsync, so every event waited for all earlier ones and group commit never batched more than one record. It now serializes only retries of the same event identity, and distinct events share group commits again. With 32 concurrent writers per CPU, the time per event in `BenchmarkPersistIfNewWAL` fell from about 11 ms to about 0.3 ms on an Apple M4.
+- **Uncapped group commit.** The WAL writer made at most 64 records durable per `Sync()`, so with hundreds of producers connected each append waited through several batches. In the [EC2 benchmark](results/2026-10-26-ec2-benchmark.md) this capped the gateway at about 7,000 events/s, with a median latency of about 100 ms at 750 producers. The writer now takes every queued request into one batch, so an append waits about one `Sync()` under load.
+- **No collection wait under load.** The writer waited up to 2 ms for more requests before every batch. It now waits only when a request arrives alone; requests already queued are written immediately.
+- **Wider group commit histogram.** `fairgate_wal_group_commit_records` buckets now reach 4,096 records instead of 64, so larger batches stay visible.
+- **Ingest benchmark.** `BenchmarkIngest` in `internal/server` drives the TCP handler with 1 to 750 producers, each sending one event at a time, and reports throughput and ACK latency percentiles.
+
 ### 26th October, 2026: Pipeline metrics, alerting, and profiling
 
 Every pipeline stage is now measured, alert rules and an Alertmanager service ship with the Compose stack, and the gateway can serve Go profiles.

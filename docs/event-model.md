@@ -9,7 +9,7 @@ Events are represented as JSON with the following fields:
 ```json
 {
   "producer_id": "sensor-01",
-  "producer_epoch": 1,
+  "producer_epoch": "1",
   "event_time": "2026-10-02T08:00:00Z",
   "seq": 1,
   "idx": 0,
@@ -21,20 +21,20 @@ Events are represented as JSON with the following fields:
 | Field | Type | Description |
 |---|---|---|
 | `producer_id` | string | Identifier of the event producer |
-| `producer_epoch` | unsigned integer | Producer epoch, part of the event identity. Required. |
+| `producer_epoch` | string | Producer epoch, part of the event identity. Required and non-empty. Send it as a JSON string (`"1"`, not `1`); a number fails decoding and the event is acknowledged as `invalid`. |
 | `event_time` | timestamp | Event timestamp |
 | `seq` | unsigned integer | Producer sequence number |
 | `idx` | unsigned integer | Event index |
 | `event_type` | string | Event category |
 | `payload` | string | Event payload |
 
-The decoder requires a non-empty producer ID, a producer epoch, a non-zero event time, and a non-empty event type.
+The decoder requires a non-empty producer ID, a non-empty producer epoch, a non-zero event time, and a non-empty event type.
 
 ```mermaid
 classDiagram
     class Event {
         +string producer_id
-        +uint producer_epoch
+        +string producer_epoch
         +timestamp event_time
         +uint seq
         +uint idx

@@ -38,7 +38,7 @@ Metrics with a `producer` label give each producer listed under [`fairness.produ
 |---|---|---|
 | `fairgate_wal_append_duration_seconds` | histogram | Time a handler waits for its append, including the group commit. |
 | `fairgate_wal_sync_duration_seconds` | histogram | Duration of each group-commit fsync. |
-| `fairgate_wal_group_commit_records` | histogram | Records made durable per group commit. |
+| `fairgate_wal_group_commit_records` | histogram | Records made durable per group commit, in buckets from 1 to 4,096. |
 | `fairgate_wal_written_bytes_total` | counter | Bytes made durable. |
 | `fairgate_wal_segment_rotations_total` | counter | Segment rotations. |
 | `fairgate_wal_segments` | gauge | Segment files on disk. |
