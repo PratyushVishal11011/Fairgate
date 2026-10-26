@@ -60,10 +60,11 @@ type WAL struct {
 }
 
 func Open(path string) (*WAL, error) {
-	return openWithSegmentSize(path, defaultSegmentSize)
+	return OpenWithSegmentSize(path, defaultSegmentSize)
 }
 
-func openWithSegmentSize(path string, segmentSize int64) (*WAL, error) {
+// OpenWithSegmentSize opens the WAL and rotates segments once they would exceed segmentSize bytes.
+func OpenWithSegmentSize(path string, segmentSize int64) (*WAL, error) {
 	if segmentSize <= 0 {
 		return nil, errors.New("segment size must be greater than zero")
 	}

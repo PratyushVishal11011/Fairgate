@@ -202,7 +202,7 @@ func TestReaderAcrossSegments(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "events.wal")
 
-	wal, err := openWithSegmentSize(path, 200)
+	wal, err := OpenWithSegmentSize(path, 200)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -248,7 +248,7 @@ func TestReaderStartsFromPosition(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "events.wal")
 
-	wal, err := openWithSegmentSize(path, 200)
+	wal, err := OpenWithSegmentSize(path, 200)
 	if err != nil {
 		t.Fatal(err)
 	}

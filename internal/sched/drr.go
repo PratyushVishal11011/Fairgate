@@ -7,22 +7,52 @@ import (
 )
 
 type DRRScheduler struct {
-	//The number of events a producer is allowed to process in each round
+	//The number of events a producer of weight 1 is allowed to process in each round
 	//Assumed equal cost for each event for now - will update later
-	quantum  int
-	deficits map[string]int
+	quantum int
+	//weight applied to producers that are not listed in weights
+	defaultWeight float64
+	//per-producer weights; a producer's share of each round is quantum * weight
+	weights map[string]float64
+	//credit a producer has left; fractional credit carries over while the producer stays backlogged
+	deficits map[string]float64
 }
 
 func NewDRRScheduler(quantum int) *DRRScheduler {
+	return NewWeightedDRRScheduler(quantum, 1, nil)
+}
+
+// NewWeightedDRRScheduler serves each backlogged producer quantum * weight events per round on average.
+// Producers missing from weights get defaultWeight. Non-positive weights fall back to the default.
+func NewWeightedDRRScheduler(quantum int, defaultWeight float64, weights map[string]float64) *DRRScheduler {
 	//Creates a new scheduler and if the provided quantum <= 0 then it makes it 8 (Arbitrary number)
 	if quantum <= 0 {
 		quantum = 8
 	}
+	if defaultWeight <= 0 {
+		defaultWeight = 1
+	}
+
+	resolved := make(map[string]float64, len(weights))
+	for producerId, weight := range weights {
+		if weight > 0 {
+			resolved[producerId] = weight
+		}
+	}
 
 	return &DRRScheduler{
-		quantum:  quantum,
-		deficits: make(map[string]int),
+		quantum:       quantum,
+		defaultWeight: defaultWeight,
+		weights:       resolved,
+		deficits:      make(map[string]float64),
 	}
+}
+
+func (s *DRRScheduler) weight(producerId string) float64 {
+	if weight, ok := s.weights[producerId]; ok {
+		return weight
+	}
+	return s.defaultWeight
 }
 
 func (s *DRRScheduler) Run(
@@ -48,13 +78,20 @@ func (s *DRRScheduler) Run(
 		didWork := false
 
 		//iterate through each producer
-		//For every producer, we add the quantum to that producer's deficit and get the producer's receive-only event channel.
+		//For every backlogged producer, we add its weighted quantum to its deficit and get the producer's receive-only event channel.
 		for _, producerId := range producerIds {
-			s.deficits[producerId] = s.quantum
 			queue := queues.Queue(producerId)
 
-			//this continues as long as the current producer has a positive deficit.
-			for s.deficits[producerId] > 0 {
+			//an idle producer does not bank credit, as in classic DRR.
+			if len(queue) == 0 {
+				s.deficits[producerId] = 0
+				continue
+			}
+
+			s.deficits[producerId] += float64(s.quantum) * s.weight(producerId)
+
+			//this continues while the current producer has credit for at least one more event.
+			for s.deficits[producerId] >= 1 {
 				//here, the code checks cancellation again. This gives it another opportunity to stop between event-processing operations.
 				select {
 				case <-ctx.Done():

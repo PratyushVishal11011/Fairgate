@@ -4,6 +4,7 @@ import (
 	"FairGate/internal/wire"
 	"context"
 	"errors"
+	"fmt"
 	"sort"
 	"sync"
 )
@@ -23,17 +24,37 @@ type Queues struct {
 	queues map[string]chan wire.Event
 	//Added another event key property for idempotency
 	seen map[EventKey]struct{}
+	//per-producer capacities that replace the default capacity.
+	capacities map[string]int
 }
 
 func NewQueues(capacity int) (*Queues, error) {
+	return NewQueuesWithCapacities(capacity, nil)
+}
+
+// NewQueuesWithCapacities gives every producer a queue of capacity events, except those listed in capacities.
+// A zero entry keeps the default capacity.
+func NewQueuesWithCapacities(capacity int, capacities map[string]int) (*Queues, error) {
 	if capacity <= 0 {
 		return nil, errors.New("queue capacity must be greater than zero")
 	}
 
+	resolved := make(map[string]int, len(capacities))
+	for producerId, producerCapacity := range capacities {
+		if producerCapacity < 0 {
+			return nil, fmt.Errorf("queue capacity for producer %q cannot be negative", producerId)
+		}
+		if producerCapacity == 0 {
+			producerCapacity = capacity
+		}
+		resolved[producerId] = producerCapacity
+	}
+
 	return &Queues{
-		capacity: capacity,
-		queues:   make(map[string]chan wire.Event),
-		seen:     make(map[EventKey]struct{}),
+		capacity:   capacity,
+		queues:     make(map[string]chan wire.Event),
+		seen:       make(map[EventKey]struct{}),
+		capacities: resolved,
 	}, nil
 }
 
@@ -46,7 +67,11 @@ func (q *Queues) getOrCreate(producerId string) chan wire.Event {
 
 	//Create a queue if it does not exist
 	if !exists {
-		queue = make(chan wire.Event, q.capacity)
+		capacity := q.capacity
+		if producerCapacity, ok := q.capacities[producerId]; ok {
+			capacity = producerCapacity
+		}
+		queue = make(chan wire.Event, capacity)
 		q.queues[producerId] = queue
 	}
 
@@ -113,6 +138,9 @@ func (q *Queues) Queue(producerId string) <-chan wire.Event {
 	if producerId == "" {
 		return nil
 	}
+	//getOrCreate expects the caller to hold the mutex, as EnqueueContext does.
+	q.mu.Lock()
+	defer q.mu.Unlock()
 	return q.getOrCreate(producerId)
 }
 
