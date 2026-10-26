@@ -41,3 +41,31 @@ func TestManagerInvalidConfig(t *testing.T) {
 		t.Fatal("expected error for zero burst")
 	}
 }
+
+func TestManagerProducerLimitOverride(t *testing.T) {
+	manager, err := NewManagerWithLimits(1, 1, map[string]Limit{
+		"bursty": {Burst: 3},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for i := 0; i < 3; i++ {
+		if !manager.Allow("bursty") {
+			t.Fatalf("expected bursty event %d to be allowed by its own burst", i+1)
+		}
+	}
+	if manager.Allow("bursty") {
+		t.Fatal("expected bursty to be limited after its burst")
+	}
+
+	if !manager.Allow("default") || manager.Allow("default") {
+		t.Fatal("expected unlisted producer to keep the default burst of 1")
+	}
+}
+
+func TestManagerRejectsNegativeLimit(t *testing.T) {
+	if _, err := NewManagerWithLimits(1, 1, map[string]Limit{"bad": {Rate: -1}}); err == nil {
+		t.Fatal("expected negative rate to be rejected")
+	}
+}

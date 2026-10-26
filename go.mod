@@ -3,8 +3,12 @@ module FairGate
 go 1.27.1
 
 require (
+	github.com/ClickHouse/clickhouse-go/v2 v2.48.0
+	gopkg.in/yaml.v3 v3.0.1
+)
+
+require (
 	github.com/ClickHouse/ch-go v0.74.0 // indirect
-	github.com/ClickHouse/clickhouse-go/v2 v2.48.0 // indirect
 	github.com/andybalholm/brotli v1.2.2 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/go-faster/city v1.0.1 // indirect

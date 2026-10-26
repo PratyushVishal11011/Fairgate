@@ -134,3 +134,21 @@ func TestQueueCapacityCancellation(t *testing.T) {
 		t.Fatalf("expected seq 1, got %d", received.Seq)
 	}
 }
+
+func TestQueueCapacityOverride(t *testing.T) {
+	queues, err := NewQueuesWithCapacities(1, map[string]int{"big": 3})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if got := cap(queues.Queue("big")); got != 3 {
+		t.Fatalf("expected overridden capacity 3, got %d", got)
+	}
+	if got := cap(queues.Queue("other")); got != 1 {
+		t.Fatalf("expected default capacity 1, got %d", got)
+	}
+
+	if _, err := NewQueuesWithCapacities(1, map[string]int{"bad": -1}); err == nil {
+		t.Fatal("expected negative capacity to be rejected")
+	}
+}

@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"FairGate/internal/config"
 	"FairGate/internal/store"
 	"FairGate/internal/wire"
 )
@@ -56,8 +57,14 @@ func startTestServer(t *testing.T) (context.CancelFunc, <-chan error, string) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	done := make(chan error, 1)
 
+	cfg, err := config.FromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.Server.ListenAddr = addr
+
 	go func() {
-		done <- runContext(ctx, addr, logger, func() (store.Store, error) {
+		done <- runContext(ctx, cfg, logger, func() (store.Store, error) {
 			return shutdownTestStore{}, nil
 		})
 	}()
@@ -97,7 +104,7 @@ func TestRunContextShutdown(t *testing.T) {
 		if err != nil {
 			t.Fatalf("RunContext returned an unexpected error: %v", err)
 		}
-	case <-time.After(shutdownGracePeriod + 3*time.Second):
+	case <-time.After(shutdownGracePeriod() + 3*time.Second):
 		t.Fatal("RunContext did not return after cancellation")
 	}
 }
@@ -113,7 +120,7 @@ func TestRunContextStopsAcceptingConnections(t *testing.T) {
 		if err != nil {
 			t.Fatalf("RunContext returned an unexpected error: %v", err)
 		}
-	case <-time.After(shutdownGracePeriod + 3*time.Second):
+	case <-time.After(shutdownGracePeriod() + 3*time.Second):
 		t.Fatal("RunContext did not stop")
 	}
 
@@ -138,7 +145,7 @@ func TestRunContextForceClosesStalledHandler(t *testing.T) {
 	cancel()
 
 	_ = conn.SetReadDeadline(
-		time.Now().Add(shutdownGracePeriod + 3*time.Second),
+		time.Now().Add(shutdownGracePeriod() + 3*time.Second),
 	)
 
 	var buf [1]byte
@@ -155,4 +162,8 @@ func TestRunContextForceClosesStalledHandler(t *testing.T) {
 	case <-time.After(3 * time.Second):
 		t.Fatal("RunContext did not return after closing stalled handler")
 	}
+}
+
+func shutdownGracePeriod() time.Duration {
+	return config.Default().Server.ShutdownGracePeriod
 }

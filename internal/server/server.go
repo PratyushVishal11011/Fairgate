@@ -2,6 +2,7 @@ package server
 
 import (
 	"FairGate/internal/admit"
+	"FairGate/internal/config"
 	"FairGate/internal/deduplication"
 	"FairGate/internal/observability"
 	"FairGate/internal/sched"
@@ -18,16 +19,16 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"path/filepath"
 	"sync"
 	"time"
 )
 
 const (
-	ackAccepted         = "accepted"
-	ackRejected         = "rejected" // refused by the gateway, retryable after backoff
-	ackError            = "error"    // server-side failure, retryable
-	ackInvalid          = "invalid"  // malformed request, do not retry unchanged
-	shutdownGracePeriod = 5 * time.Second
+	ackAccepted = "accepted"
+	ackRejected = "rejected" // refused by the gateway, retryable after backoff
+	ackError    = "error"    // server-side failure, retryable
+	ackInvalid  = "invalid"  // malformed request, do not retry unchanged
 )
 
 func sendAck(conn net.Conn, ack wire.Ack) error {
@@ -46,22 +47,37 @@ func Run(addr string, logger *slog.Logger) error {
 	return RunContext(context.Background(), addr, logger)
 }
 
+// RunContext runs the gateway on addr with the default settings and the supported environment overrides.
 func RunContext(ctx context.Context, addr string, logger *slog.Logger) error {
-	return runContext(ctx, addr, logger, func() (store.Store, error) {
+	cfg, err := config.FromEnv()
+	if err != nil {
+		return err
+	}
+	cfg.Server.ListenAddr = addr
+
+	return RunConfig(ctx, cfg, logger)
+}
+
+// RunConfig runs the gateway with a resolved configuration until ctx is canceled.
+func RunConfig(ctx context.Context, cfg config.Config, logger *slog.Logger) error {
+	return runContext(ctx, cfg, logger, func() (store.Store, error) {
 		return store.NewClickHouseStore(
-			[]string{
-				envOrDefault("CLICKHOUSE_ADDR", "localhost:9000"),
-			},
-			envOrDefault("CLICKHOUSE_DATABASE", "fairgate"),
-			envOrDefault("CLICKHOUSE_USER", "fairgate"),
-			envOrDefault("CLICKHOUSE_PASSWORD", "fairgate_dev_password"),
+			cfg.ClickHouse.Addr,
+			cfg.ClickHouse.Database,
+			cfg.ClickHouse.Username,
+			cfg.ClickHouse.Password,
 		)
 	})
 }
 
-func runContext(ctx context.Context, addr string, logger *slog.Logger, newStore func() (store.Store, error)) error {
+func runContext(ctx context.Context, cfg config.Config, logger *slog.Logger, newStore func() (store.Store, error)) error {
+	if err := cfg.Validate(); err != nil {
+		return err
+	}
+
+	addr := cfg.Server.ListenAddr
 	metrics := observability.New()
-	metricsServer := &http.Server{Addr: envOrDefault("FAIRGATE_METRICS_ADDR", ":9100"), Handler: metrics.Handler()}
+	metricsServer := &http.Server{Addr: cfg.Server.MetricsAddr, Handler: metrics.Handler()}
 	metricsListener, err := net.Listen("tcp", metricsServer.Addr)
 	if err != nil {
 		return fmt.Errorf("listen for metrics: %w", err)
@@ -81,11 +97,11 @@ func runContext(ctx context.Context, addr string, logger *slog.Logger, newStore 
 	}
 	defer listener.Close()
 
-	if err := os.MkdirAll("data", 0700); err != nil {
+	walPath := cfg.WAL.Path
+
+	if err := os.MkdirAll(filepath.Dir(walPath), 0700); err != nil {
 		return err
 	}
-
-	walPath := "data/fairgate.wal"
 
 	events, err := wal.Recover(walPath)
 	if err != nil {
@@ -102,7 +118,7 @@ func runContext(ctx context.Context, addr string, logger *slog.Logger, newStore 
 		return fmt.Errorf("initialize event deduplication: %w", err)
 	}
 
-	walLog, err := wal.Open(walPath)
+	walLog, err := wal.OpenWithSegmentSize(walPath, cfg.WAL.SegmentSize)
 	if err != nil {
 		return err
 	}
@@ -118,14 +134,13 @@ func runContext(ctx context.Context, addr string, logger *slog.Logger, newStore 
 	}
 	defer storage.Close()
 
-	checkpoint := shipper.NewCheckpointStore(
-		envOrDefault("FAIRGATE_CHECKPOINT_PATH", "data/checkpoint.json"),
-	)
+	checkpoint := shipper.NewCheckpointStore(cfg.Shipper.CheckpointPath)
+	retry := cfg.Shipper.Retry
 	backoff := shipper.NewBackoff(
-		time.Second,
-		30*time.Second,
-		2,
-		0.2,
+		retry.InitialDelay,
+		retry.MaxDelay,
+		retry.Multiplier,
+		retry.Jitter,
 		time.Now().UnixNano(),
 	)
 
@@ -135,8 +150,8 @@ func runContext(ctx context.Context, addr string, logger *slog.Logger, newStore 
 		checkpoint,
 		backoff,
 		shipper.Config{
-			BatchSize:    200,
-			PollInterval: time.Second,
+			BatchSize:    cfg.Shipper.BatchSize,
+			PollInterval: cfg.Shipper.PollInterval,
 		},
 	)
 	if err != nil {
@@ -167,14 +182,21 @@ func runContext(ctx context.Context, addr string, logger *slog.Logger, newStore 
 
 	logger.Info("server listening on", "address", addr)
 
-	admission, err := admit.NewManager(500, 1000)
+	// Per-producer fairness overrides replace the defaults at admission, buffering, and scheduling.
+	limits := make(map[string]admit.Limit, len(cfg.Fairness.Producers))
+	for producerId, producer := range cfg.Fairness.Producers {
+		if producer.Rate > 0 || producer.Burst > 0 {
+			limits[producerId] = admit.Limit{Rate: producer.Rate, Burst: producer.Burst}
+		}
+	}
+
+	admission, err := admit.NewManagerWithLimits(cfg.Admission.Rate, cfg.Admission.Burst, limits)
 	if err != nil {
 		return err
 	}
 
-	// Create one shared queue manager.
-	// For testing, each producer can buffer up to 512 events.
-	queues, err := sched.NewQueues(512)
+	// Create one shared queue manager with a bounded buffer per producer.
+	queues, err := sched.NewQueuesWithCapacities(cfg.Queues.Capacity, cfg.Fairness.QueueCapacities())
 	if err != nil {
 		return err
 	}
@@ -183,8 +205,12 @@ func runContext(ctx context.Context, addr string, logger *slog.Logger, newStore 
 	schedulerCtx, cancelScheduler := context.WithCancel(context.Background())
 	defer cancelScheduler()
 
-	// Create a scheduler object with a quantum of 8 events.
-	scheduler := sched.NewDRRScheduler(8)
+	// Create a scheduler that serves each producer quantum * weight events per round.
+	scheduler := sched.NewWeightedDRRScheduler(
+		cfg.Scheduler.Quantum,
+		cfg.Fairness.DefaultWeight,
+		cfg.Fairness.Weights(),
+	)
 
 	// Signal that the scheduler goroutine has finished executing.
 	schedulerDone := make(chan struct{})
@@ -359,7 +385,7 @@ func runContext(ctx context.Context, addr string, logger *slog.Logger, newStore 
 		close(handlersDone)
 	}()
 
-	timer := time.NewTimer(shutdownGracePeriod)
+	timer := time.NewTimer(cfg.Server.ShutdownGracePeriod)
 
 	select {
 	case <-handlersDone:
@@ -536,11 +562,4 @@ func handleConn(
 			"event_type", event.EventType,
 		)
 	}
-}
-
-func envOrDefault(key, fallback string) string {
-	if value := os.Getenv(key); value != "" {
-		return value
-	}
-	return fallback
 }
