@@ -23,7 +23,6 @@ import (
 const (
 	maxRecordSize      = 1 << 20
 	defaultSegmentSize = int64(64 << 20)
-	maxBatchSize       = 64
 	batchDelay         = 2 * time.Millisecond
 )
 
@@ -183,16 +182,14 @@ func (w *WAL) writerLoop() {
 		// Start a new batch with the first request.
 		batch := []appendRequest{first}
 
-		// Start a short timer to avoid waiting indefinitely for more
-		// requests. This allows low-traffic workloads to commit without
-		// needing to fill an entire batch.
-		timer := time.NewTimer(batchDelay)
-
-	collect:
-		// Collect additional requests until the batch reaches its
-		// maximum size, the timer expires, or the channel is closed.
-		// This replaces one Sync() per event with one Sync() per batch.
-		for len(batch) < maxBatchSize {
+		// Take every request that is already queued. These arrived while
+		// the previous batch was being written and synced, so they share
+		// the next Sync() without any extra wait. The batch has no size
+		// cap: one Sync() covers every waiting caller, so latency under
+		// load stays near one Sync() instead of growing with the number
+		// of 64-record batches queued ahead of a caller.
+	drain:
+		for {
 			select {
 			case req, ok := <-w.requests:
 				if !ok {
@@ -200,24 +197,45 @@ func (w *WAL) writerLoop() {
 					// requests, but still write the requests already
 					// collected in this batch before exiting.
 					closing = true
-					break collect
+					break drain
 				}
-
 				batch = append(batch, req)
-
-			case <-timer.C:
-				// The batching window has expired. Commit the current
-				// batch rather than waiting for more requests.
-				break collect
+			default:
+				break drain
 			}
 		}
 
-		// Stop the timer if it hasn't already expired. Drain it if
-		// necessary to prevent an unread timer event.
-		if !timer.Stop() {
-			select {
-			case <-timer.C:
-			default:
+		// Only a lone request waits for company. A short timer gives
+		// low-traffic workloads a chance to share the Sync() without
+		// waiting indefinitely.
+		if len(batch) == 1 && !closing {
+			timer := time.NewTimer(batchDelay)
+
+		collect:
+			for {
+				select {
+				case req, ok := <-w.requests:
+					if !ok {
+						closing = true
+						break collect
+					}
+
+					batch = append(batch, req)
+
+				case <-timer.C:
+					// The batching window has expired. Commit the
+					// current batch rather than waiting for more.
+					break collect
+				}
+			}
+
+			// Stop the timer if it hasn't already expired. Drain it if
+			// necessary to prevent an unread timer event.
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
 			}
 		}
 

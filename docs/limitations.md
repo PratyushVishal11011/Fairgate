@@ -18,7 +18,7 @@ Known limitations of the current beta:
 - Reclamation deletes whole segments older than the checkpoint segment. The checkpoint and active segments are retained, so some already shipped records remain on disk until a later checkpoint passes them, and reclaimed records are no longer available for recovery replay or inspection.
 - The reclamation guard compares segment IDs only. A checkpoint in the same segment as the durable end but with an offset past it is not rejected yet.
 - The ClickHouse integration tests are optional and run only when `CLICKHOUSE_ADDR` is set.
-- The maximum frame size and the WAL group commit limits are fixed in the code. The other runtime settings are set through the [config file](configuration.md).
+- The maximum frame size and the WAL group commit collection delay are fixed in the code. The other runtime settings are set through the [config file](configuration.md).
 - Every event costs the same in scheduling, whatever its size. Weights set each producer's share of events, not of bytes.
 - Per-producer fairness overrides are read at startup. Changing a weight, limit, or queue capacity needs a restart.
 - Enqueueing blocks on a full queue (cancelable during shutdown), and no load-shedding policy exists yet.
