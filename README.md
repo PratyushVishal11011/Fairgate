@@ -4,12 +4,12 @@
 
 FairGate is a modular event-ingestion gateway. It accepts framed event streams over TCP, applies admission control, deduplicates retried events by a stable event identity, persists accepted events in a segmented Write-Ahead Log (WAL) with group commit, schedules events from per-producer queues using Deficit Round Robin (DRR), and ships durable WAL records to ClickHouse through a checkpointed shipper that also reclaims fully shipped WAL segments.
 
-FairGate provides crash-recoverable event ingestion with idempotent batch retries. Events are persisted in the WAL, ClickHouse inserts are retried using stable batch deduplication tokens, and successfully processed batches are checkpointed. Integration tests against a Docker-hosted ClickHouse verify duplicate suppression when a batch is replayed after a checkpoint failure. These deduplication guarantees are subject to ClickHouse's configured insert-deduplication window and storage behavior, so delivery remains at-least-once rather than exactly-once.
+FairGate provides end-to-end exactly-once delivery from producer to ClickHouse, keyed by event identity. Events are persisted in the WAL before acknowledgment, and producers retry until acknowledged. The shipper records each batch as pending before inserting it, so a restart replays exactly the same WAL range. The ClickHouse adapter skips any event whose `event_id` is already stored before it inserts. Each event identity is stored once, regardless of crashes, replays, lost checkpoints, or ClickHouse's insert-deduplication window. Integration tests against a Docker-hosted ClickHouse verify this across a crash before checkpoint commit, a restart with more durable records, and a full re-ship of the WAL. The guarantee assumes a single gateway writes each event identity. See [Delivery semantics](#delivery-semantics) for the exact scope.
 
 The project explores fair resource sharing in event-ingestion systems: keeping producers isolated from one another through bounded buffering, admission limits, and fair scheduling. FairGate is being developed as an open-source foundation that can be extended with different storage backends and downstream processing components.
 
 > [!IMPORTANT]
-> **Beta status.** FairGate is under active development. The current implementation provides TCP ingestion, event decoding and validation, admission control, event idempotency keyed by producer ID, producer epoch, sequence number, and index, per-producer bounded queues, DRR scheduling, a segmented WAL with group commit and ordered recovery, acknowledgments, and context-aware graceful shutdown. The gateway always runs a shipper that reads durable WAL records from a persisted checkpoint, batches them for a `Store` (ClickHouse), retries failed inserts with capped exponential backoff and jitter, atomically persists progress after successful inserts, and then reclaims WAL segments older than the checkpoint segment. The gateway serves an HTTP health endpoint and Prometheus metrics, and a Docker Compose stack runs FairGate with ClickHouse, Prometheus, and Grafana. Delivery to the database is at-least-once, not exactly-once, and advanced overload control, profiling, and deep pipeline observability are not implemented.
+> **Beta status.** FairGate is under active development. The current implementation provides TCP ingestion, event decoding and validation, admission control, event idempotency keyed by producer ID, producer epoch, sequence number, and index, per-producer bounded queues, DRR scheduling, a segmented WAL with group commit and ordered recovery, acknowledgments, and context-aware graceful shutdown. The gateway always runs a shipper that reads durable WAL records from a persisted checkpoint, batches them for a `Store` (ClickHouse), retries failed inserts with capped exponential backoff and jitter, atomically persists progress after successful inserts, and then reclaims WAL segments older than the checkpoint segment. The gateway serves an HTTP health endpoint and Prometheus metrics, and a Docker Compose stack runs FairGate with ClickHouse, Prometheus, and Grafana. Delivery to the database is exactly-once per event identity (see [Delivery semantics](#delivery-semantics) for the scope), and advanced overload control, profiling, and deep pipeline observability are not implemented.
 
 ## Table of Contents
 
@@ -67,13 +67,18 @@ The project explores fair resource sharing in event-ingestion systems: keeping p
 - **WAL-backed batch shipper.** `Shipper.Run(ctx)` loads the checkpoint, reads durable records in order up to `BatchSize`, and sends each batch to the configured `Store`. At the durable WAL end it polls for new records and keeps running until its context is canceled.
 - **Always-on gateway shipper.** `RunContext` always constructs the ClickHouse store and starts the shipper alongside the server. Shutdown always cancels and joins it before the store and WAL are closed.
 - **Retry with backoff.** Retries failed batch inserts with capped exponential delay, configurable jitter, and context-aware waiting. The same batch is retried until it succeeds or the context is canceled.
-- **Durable checkpoints.** Stores the last successfully inserted record position as a segment and offset. Checkpoints are written through a synced temporary file followed by an atomic rename; a missing checkpoint starts reading at the beginning of the WAL, and invalid JSON or negative offsets are rejected.
+- **Durable checkpoints.** Stores the last successfully inserted record position as a segment and offset. Checkpoints are written through a synced temporary file, an atomic rename, and a sync of the containing directory. A missing checkpoint starts reading at the beginning of the WAL, and invalid JSON or negative offsets are rejected.
+- **Pending-batch intent.** Before each insert, the shipper durably records the batch's end position as `pending` in the checkpoint. After a crash, it first replays exactly that WAL range with the same token, even if more records have become durable or the batch size has changed. A pending end that is not a record boundary, or that lies past the durable end, is rejected before anything reaches the store.
 - **Checkpoint-based WAL reclamation.** After each committed checkpoint, and once at startup against the checkpoint already on disk, the shipper calls `WAL.ReclaimBefore`. Only segments with IDs strictly less than the checkpoint segment are deleted; the checkpoint segment and the active segment are retained. A checkpoint beyond the durable end is rejected with `ErrCheckpointAhead`, and nothing is deleted. Reclamation is serialized with rotation, and the containing directory is synced after deletion.
-- **Stable batch tokens.** Each shipped batch carries a deterministic SHA-256 token derived from its WAL start and end positions. Retries and replays of the same batch reuse the same token.
+- **Stable batch tokens.** Each shipped batch carries a deterministic SHA-256 token derived from its own WAL start and end positions. Retries and replays of the same batch reuse the same token.
 - **Store interface.** `InsertBatch(ctx, token, events)` and `Close()` separate storage from the processing pipeline.
-- **ClickHouse adapter.** Official Go client with configurable authentication, `Ping` health checks, batched inserts through `PrepareBatch` and `Send`, and graceful cleanup. Each row includes an `event_id` computed from `producer_id`, `producer_epoch`, `seq`, and `idx` using an unambiguous encoding, and stores the epoch in its own column. The adapter rejects an empty token for a non-empty batch and passes the token to ClickHouse as `insert_deduplication_token`.
-- **Optional ClickHouse integration test.** Environment-gated test covering connectivity, batch insertion, retrieval, and re-inserting the same batch with the same token. It checks that each event appears exactly once, uses a 30-second timeout, and quotes the configured database name in its queries.
-- **Crash-replay integration tests.** Integration tests run against a Docker-hosted ClickHouse and verify that a batch replayed after a checkpoint failure is suppressed as a duplicate. The guarantee holds only while the batch token is within ClickHouse's insert-deduplication window and is subject to its storage behavior.
+- **ClickHouse adapter.** Official Go client with configurable authentication, `Ping` health checks, batched inserts through `PrepareBatch` and `Send`, and graceful cleanup. Each row includes an `event_id` computed from `producer_id`, `producer_epoch`, `seq`, and `idx` using an unambiguous encoding, and stores the epoch in its own column. The adapter rejects an empty token for a non-empty batch.
+- **Exactly-once ClickHouse writes.** Before inserting, the adapter removes duplicate identities within the batch and queries which `event_id` values are already stored, then inserts only the rest. The `insert_deduplication_token` it sends is derived from the batch token and the exact rows sent. A replay of the same rows reuses the token, so an insert still in flight when a replay starts is discarded by ClickHouse. A replay that sends fewer rows, because some already landed, gets a new token and is not wrongly discarded. Inserts run synchronously (`async_insert = 0`, `insert_deduplicate = 1`), so a committed insert is visible to the next existence check.
+- **Optional ClickHouse integration tests.** Run only when `CLICKHOUSE_ADDR` is set. They cover connectivity, batch insertion, retrieval, and re-insertion of the same batch with the same token. They also cover replays under different tokens, duplicates within a batch, and partially landed batches, checking that each event appears exactly once. They use a 30-second timeout and quote the configured database name in their queries.
+- **Crash-replay integration tests.** Unit tests crash the shipper after the store accepts a batch and check that the restart replays exactly the pending range with the same token. An integration test runs the WAL, shipper, and a Docker-hosted ClickHouse through the following and checks that every event is stored exactly once:
+  - a crash before checkpoint commit;
+  - a restart with more durable records and a larger batch size;
+  - a lost checkpoint that re-ships the whole WAL.
 - **Health and Prometheus endpoints.** FairGate responds with `200 OK` and `ok` at `/health` on port `9100`; Docker Compose uses this endpoint for its gateway healthcheck. Prometheus metrics for active TCP connections, accepted, rejected and invalid events, WAL append errors, and scheduler processing totals remain available at `/metrics` on port `9100`.
 - **Docker deployment.** A `Dockerfile` and Compose stack run FairGate with ClickHouse, Prometheus, and Grafana. Prometheus scrapes the gateway and Grafana provisions its Prometheus datasource and FairGate overview dashboard. `install-docker-ubuntu.sh` installs Docker Engine and the Compose plugin on Ubuntu.
 - **Acknowledgments.** Sends an accepted acknowledgment after the event has been appended to the WAL and enqueued, and also for an identical retry of an event that was already accepted.
@@ -97,6 +102,22 @@ The project explores fair resource sharing in event-ingestion systems: keeping p
 Planned capabilities are not implied to be available in this beta.
 
 ## Recent updates
+
+### 26th October, 2026: End-to-end exactly-once delivery
+
+Delivery from producer to ClickHouse is now exactly-once per event identity. Earlier, duplicate suppression depended on ClickHouse's insert-deduplication window and on a replayed batch reproducing its original token. Two shipper bugs meant the token often did not match.
+
+- **Batch tokens use each batch's own start.** The shipper never advanced its start position after the first batch, so every token used the run's first position. A batch replayed as the first batch after a restart therefore got a different token from the original, and ClickHouse did not recognize it. Each batch now derives its token from its own range.
+- **Pending-batch intent.** After a restart, a replay could also cover a different range than the original insert, because more records had become durable. The shipper now writes the batch's end position to the checkpoint as `pending` before inserting, and on restart it replays exactly that range before reading further.
+- **Existence check in the ClickHouse adapter.** Before each insert, the adapter drops events whose `event_id` is already stored and removes duplicates within the batch. This makes the outcome independent of the deduplication window. It also covers:
+  - partially committed multi-partition inserts;
+  - lost or rewound checkpoints;
+  - events that a producer resent after their WAL segment was reclaimed.
+- **Row-bound insert token.** The `insert_deduplication_token` is now derived from the batch token and the exact rows sent. Reusing the original token for a smaller replay would let ClickHouse discard the missing rows as a duplicate block. The integration tests show that this loses events.
+- **Checkpoint directory sync.** Checkpoint commits now sync the containing directory after the rename, so an earlier checkpoint cannot reappear after a power loss.
+- **Integration tests gated on `CLICKHOUSE_ADDR`.** `go test ./...` no longer fails without a live ClickHouse. Set `CLICKHOUSE_ADDR` (for example `127.0.0.1:9000`) to run them.
+
+This supersedes the at-least-once caveats in the 25th October update and earlier entries. The scope of the guarantee is described in [Delivery semantics](#delivery-semantics).
 
 ### 25th October, 2026: Crash-recoverable ingestion with idempotent batch retries
 
@@ -308,7 +329,7 @@ The server's goroutine and context structure, including the shutdown path, is de
 
 ### WAL shipping component
 
-The shipper is always enabled and does not depend on `FAIRGATE_SHIPPER_ENABLED`. It reads durable WAL records from its checkpoint, inserts each batch through the `Store` interface, and commits the checkpoint only after insertion succeeds. It then calls `WAL.ReclaimBefore` with the committed position, which deletes segments older than the checkpoint segment. At the WAL end it polls for new durable records.
+The shipper is always enabled and does not depend on `FAIRGATE_SHIPPER_ENABLED`. It reads durable WAL records from its checkpoint, records each batch as pending, inserts it through the `Store` interface, and commits the checkpoint only after insertion succeeds. It then calls `WAL.ReclaimBefore` with the committed position, which deletes segments older than the checkpoint segment. At the WAL end it polls for new durable records.
 
 ```mermaid
 flowchart LR
@@ -336,8 +357,8 @@ flowchart LR
 | `internal/admit` | Token-bucket admission control. |
 | `internal/sched` | Per-producer bounded queues (including context-aware `EnqueueContext` and event identity tracking) and the DRR scheduler. |
 | `internal/wal` | Segmented WAL, writer goroutine with group commit, segment rotation, synchronization, ordered recovery with cross-segment validation over a possibly sparse segment set, and checkpoint-based segment reclamation (`ReclaimBefore`) with a durable-end guard (`ErrCheckpointAhead`). |
-| `internal/shipper` | Durable WAL reader, checkpoint load and atomic commit, batching, polling at the durable end, retry with capped exponential backoff and jitter, and triggering WAL reclamation after each commit and at startup. |
-| `internal/store` | `Store` interface and the ClickHouse adapter, including `event_id` computation from the event identity. |
+| `internal/shipper` | Durable WAL reader, checkpoint load and atomic commit, pending-batch intent and exact-range replay, batching, polling at the durable end, retry with capped exponential backoff and jitter, and triggering WAL reclamation after each commit and at startup. |
+| `internal/store` | `Store` interface and the ClickHouse adapter, including `event_id` computation from the event identity, skipping already stored events, and row-bound insert tokens. |
 
 ## Event lifecycle
 
@@ -763,19 +784,32 @@ The listen address is chosen by the caller. The ClickHouse store is built from t
 | Deterministic `event_id` written with each ClickHouse row | Yes; hash of producer ID, epoch, sequence number, and index |
 | Empty batch token rejected before insert | Yes |
 | Batch token passed to ClickHouse as `insert_deduplication_token` | Yes |
-| Replayed batch deduplicated by ClickHouse | Within the deduplication window only; not exactly-once |
+| Batch recorded as pending before insert | Yes; a restart replays exactly that WAL range with the same token |
+| Each batch token derived from that batch's own WAL range | Yes |
+| Events already stored skipped before insert | Yes; by `event_id`, independent of the deduplication window |
+| Duplicate identities within a batch inserted once | Yes |
+| Replayed batch deduplicated by ClickHouse | Yes; by the existence check, with the row-bound token covering an insert still in flight |
 | Duplicate suppression on replay after a checkpoint failure verified by integration tests | Yes, against a Docker-hosted ClickHouse; subject to the deduplication window and storage behavior |
-| Batch may be inserted again after a crash before checkpoint commit | Yes (duplicates possible, with the same token and event IDs) |
+| Batch may be submitted again after a crash before checkpoint commit | Yes; already stored events are skipped, so no duplicate rows result |
+| Lost or rewound checkpoint causes duplicate rows | No; the re-shipped events are skipped |
 | WAL segments reclaimed after shipping | Yes; segments older than the committed checkpoint segment are removed |
 | Reclamation runs only after the checkpoint commit (and at startup against the checkpoint on disk) | Yes |
 | Reclamation rejects checkpoints beyond the durable end | Yes (`ErrCheckpointAhead`) |
 | Checkpoint segment or active segment reclaimed | No |
 | Unshipped records removed by reclamation | No |
 | WAL retains full event history | No |
-| Acknowledgment implies database storage | No |
-| End-to-end exactly-once delivery | No |
+| Acknowledgment implies database storage | No; it implies WAL durability, and the shipper later stores the event exactly once |
+| End-to-end exactly-once delivery (per event identity) | Yes, within the scope below |
 
-Do not treat the current beta as a production-ready, exactly-once event delivery system.
+Exactly-once here means that every acknowledged event identity (`producer_id`, `producer_epoch`, `seq`, `idx`) appears as exactly one row in `fairgate.events`, without `FINAL` and without waiting for merges. The producer side is at-least-once: it retries until it receives an `accepted` ACK. The gateway turns this into exactly-once storage in two layers. The first is the deduplication manager, which covers identities still in the WAL. The second, authoritative layer is the adapter's existence check, which covers everything else.
+
+The guarantee holds under these conditions:
+
+- **Single writer per identity.** Each event identity is written by a single gateway, with one WAL and one shipper. The existence check reads before it inserts, so two gateways shipping the same identity at the same moment could both insert it. Route each producer to one gateway.
+- **First write wins for identity reuse after reclamation.** Identity reuse with different content is rejected only while the original is still in the WAL. After reclamation, a conflicting event is acknowledged and then dropped by the adapter, because the first stored version wins.
+- **TTL expiry.** Rows removed by the table's 30-day TTL no longer count as stored. A resend of an expired event would be stored again, and then expire on the same TTL.
+
+FairGate is still a beta. Validate it under your own load and failure modes before production use.
 
 ## Configuration
 
@@ -818,18 +852,18 @@ ClickHouse is the initial storage backend. The `Store` interface, ClickHouse ada
 |---|---|
 | Shipper | Reads from the WAL at the saved position, forms batches up to `BatchSize`, derives a stable batch token, and inserts the batch through the `Store`. `Run(ctx)` polls for newly durable records and runs until its context is canceled. |
 | Retry policy | Retries insertion errors with exponential backoff capped at a maximum delay, optional symmetric jitter, and context-aware cancellation. |
-| Checkpoint | JSON segment and byte offset. Missing files mean the beginning of the WAL; writes sync a temporary file and atomically rename it after each successful batch. |
+| Checkpoint | JSON segment and byte offset, plus an optional `pending` batch end. Missing files mean the beginning of the WAL. Each write syncs a temporary file, atomically renames it, and syncs the directory. The pending end is written before each insert and cleared by the commit after it. |
 | Reclamation | After each checkpoint commit, and once at startup against the checkpoint on disk, calls `WAL.ReclaimBefore`. Rejects checkpoints beyond the durable end with `ErrCheckpointAhead`. Otherwise deletes only segments with IDs strictly less than the checkpoint segment, keeping the checkpoint and active segments, serialized with rotation, with a directory sync afterward. |
 | `Store` interface | `InsertBatch(ctx, token, events)` and `Close()`. Backends plug in without changes to the shipper. |
-| ClickHouse adapter | Official Go client, configurable authentication, `Ping` health check, batched inserts with `PrepareBatch` and `Send`, graceful close. |
-| Integration test | Optional and environment-gated. Validates connectivity, batch insertion, retrieval, and re-insertion of the same batch with the same token, checking that each event appears exactly once. Tests against a Docker-hosted ClickHouse also verify duplicate suppression when a batch is replayed after a checkpoint failure. |
+| ClickHouse adapter | Official Go client, configurable authentication, `Ping` health check, batched inserts with `PrepareBatch` and `Send`, graceful close. Skips events whose `event_id` is already stored, and sends a token bound to the exact rows inserted. |
+| Integration tests | Run only when `CLICKHOUSE_ADDR` is set. They validate connectivity, batch insertion, retrieval, and re-insertion under the same and different tokens. They also cover a full WAL, shipper, and ClickHouse run through a crash before checkpoint commit, a restart, and a lost checkpoint, checking that each event appears exactly once. |
 
 > [!NOTE]
-> **Database delivery remains at-least-once.** The shipper resumes from its checkpoint and retries insertion failures. A process crash after a successful insert but before checkpoint commit can result in the batch being inserted again. Exactly-once delivery is not provided. Segments older than the committed checkpoint segment are reclaimed, so the WAL is not a permanent archive of every event.
+> **Database delivery is exactly-once per event identity.** The shipper resumes from its checkpoint, replays any pending batch over exactly its original range, and retries insertion failures. A batch submitted again after a crash is filtered against the events already stored, so it adds no duplicate rows. This assumes a single gateway writes each event identity; see [Delivery semantics](#delivery-semantics). Segments older than the committed checkpoint segment are reclaimed, so the WAL is not a permanent archive of every event.
 
 ### Shipper ordering
 
-Producer acknowledgments remain based on WAL durability. The shipper loads its checkpoint, reclaims segments already behind it, reads batches from that position up to the durable WAL end, and delivers each batch to the store. It writes the checkpoint only after a batch insert succeeds, reclaims segments behind the new checkpoint, and then polls for later appends.
+Producer acknowledgments remain based on WAL durability. The shipper loads its checkpoint and reclaims segments already behind it. If the checkpoint holds a pending batch, the shipper replays exactly that range first. It then reads batches from the current position up to the durable WAL end. For each batch, it records the batch end as pending, delivers the batch to the store, commits the checkpoint, and reclaims segments behind it. At the durable end it polls for later appends.
 
 ```mermaid
 sequenceDiagram
@@ -841,12 +875,18 @@ sequenceDiagram
 
     SH->>CK: Load checkpoint (start of WAL if missing)
     SH->>W: ReclaimBefore(checkpoint position)
+    opt Checkpoint has a pending batch
+        SH->>W: Read exactly the pending range
+    end
     loop While running
         SH->>W: Read next batch from current position
         alt Records available
             W-->>SH: Durable records (up to batch size or WAL end)
+            SH->>CK: Atomically persist pending batch end
             loop Until insert succeeds or context is canceled
-                SH->>DB: Insert batch with stable token
+                SH->>DB: Query which event_ids are already stored
+                DB-->>SH: Existing event_ids
+                SH->>DB: Insert remaining rows with row-bound token
                 alt Insert fails
                     DB-->>SH: Error
                     SH->>SH: Wait with exponential backoff and jitter
@@ -869,11 +909,18 @@ Each batch is identified by a SHA-256 token computed from the WAL positions wher
 
 Each row also carries an `event_id` computed from `producer_id`, `producer_epoch`, `seq`, and `idx`. The fields are encoded unambiguously before hashing, so different field combinations cannot collide through concatenation, and an event has the same identifier wherever it is written. This is the same identity the server uses for [idempotent ingestion](#event-identity-and-idempotency).
 
-The adapter rejects an empty token for a non-empty batch, so every batch that reaches ClickHouse has one. It passes the token as `insert_deduplication_token`, which lets ClickHouse discard a repeated insert of the same block while the token is still in its deduplication history. Whether duplicates are removed from query results also depends on the table's ordering key and when ClickHouse merges parts, so the README does not claim exactly-once delivery.
+The adapter rejects an empty token for a non-empty batch, so every batch that reaches ClickHouse has one. Before inserting, it keeps the first event for each `event_id` in the batch and queries which of those IDs are already stored. It then inserts only the rest. The `insert_deduplication_token` it sends is a SHA-256 of the batch token and the IDs of the rows being sent. Identical rows produce an identical token. As a result, an insert that was still in flight during a crash is discarded by ClickHouse when the replay sends the same rows. A smaller replay gets a different token, so ClickHouse does not discard it as a repeat of the original block.
+
+The existence check, not the deduplication window, is what makes storage exactly-once. The window (`non_replicated_deduplication_window = 1000`) only needs to cover the most recent inserts, for the in-flight case.
 
 ### Duplicate handling
 
-A crash between a successful insert and the checkpoint write can cause the same batch to be inserted again after restart. The replayed batch carries the same token and the same `event_id` values as the original insert. The current schema uses `ReplacingMergeTree` ordered by `event_id`, but deduplication is subject to ClickHouse merge behavior and does not make insertion exactly once.
+A crash between a successful insert and the checkpoint write leaves the batch recorded as pending. After the restart, the shipper submits the same WAL range again with the same token, and the adapter skips the events that were already stored. This also covers inserts that landed only partly. Other duplicates are caught the same way, by `event_id`:
+
+- a lost or rewound checkpoint that re-ships older batches;
+- a producer resend whose original identity was forgotten by the in-memory deduplication manager after its segment was reclaimed.
+
+The schema's `ReplacingMergeTree` ordered by `event_id` remains as a further safeguard, but correctness no longer depends on merges.
 
 ### Schema
 
@@ -889,7 +936,7 @@ The roadmap lists planned work in dependency order. Items are subject to change.
 ```mermaid
 flowchart TD
     P1["Phase 1: Core ingestion (implemented)<br/>TCP server, wire protocol, admission control<br/>Event identity and idempotent ingestion<br/>Per-producer queues, DRR scheduling<br/>Segmented WAL with group commit and ordered recovery<br/>Context-aware lifecycle and graceful shutdown<br/>Store interface, ClickHouse adapter<br/>Health endpoint, Prometheus metrics, Grafana overview"]
-    P2["Phase 2: Durable delivery (implemented)<br/>WAL shipping, checkpoints, retry and backoff<br/>Always-on runtime wiring<br/>Checkpoint-based WAL segment reclamation with durable-end guard"]
+    P2["Phase 2: Durable delivery (implemented)<br/>WAL shipping, checkpoints, retry and backoff<br/>Always-on runtime wiring<br/>Checkpoint-based WAL segment reclamation with durable-end guard<br/>End-to-end exactly-once delivery to ClickHouse"]
     P3["Phase 3: Fairness and overload control (planned)<br/>Producer weights, backlog-aware overload handling<br/>Load shedding"]
     P4["Phase 4: Operability and hardening (planned)<br/>Profiling, deeper metrics, alerting<br/>Packaged load, reconcile, and chaos tools<br/>Protocol hardening"]
 
@@ -920,6 +967,8 @@ A solid border marks implemented work. Dashed borders mark planned work.
 | Durable WAL reader and checkpoint-based batch shipping | Implemented |
 | Durable checkpoints and retry with backoff | Implemented |
 | Stable batch tokens and deterministic event IDs | Implemented |
+| Pending-batch intent and exact-range replay | Implemented |
+| Exactly-once ClickHouse writes (existence check, row-bound token) | Implemented; single writer per event identity |
 | Shipper runtime wiring and lifecycle | Implemented; shipper always runs |
 | WAL segment reclamation | Implemented for segments older than the committed checkpoint segment |
 | Durable-end guard on reclamation | Implemented (`ErrCheckpointAhead`); same-segment offset check planned |
@@ -985,7 +1034,11 @@ go test -race ./...
 
 CI runs `go test -race -v ./...` on every push through GitHub Actions.
 
-The graceful-shutdown tests use a no-op `Store` and a temporary checkpoint path, so the suite does not need a live ClickHouse service. The ClickHouse integration test runs only when its environment is configured.
+The graceful-shutdown tests use a no-op `Store` and a temporary checkpoint path, so the suite does not need a live ClickHouse service. The ClickHouse integration tests run only when `CLICKHOUSE_ADDR` is set:
+
+```bash
+CLICKHOUSE_ADDR=127.0.0.1:9000 go test -race ./internal/store/ ./internal/shipper/
+```
 
 The repository is being developed as a gateway implementation. A stable command-line interface and client SDK are planned. Check the repository's current entry point and configuration before attempting to launch a server, or use the Compose stack described in [Docker deployment](#docker-deployment).
 
@@ -1057,14 +1110,16 @@ Known limitations of the current beta:
 
 - The gateway always constructs the ClickHouse store and starts the shipper; there is no mode that runs without storage. `FAIRGATE_SHIPPER_ENABLED` is no longer read.
 - Events must now include `producer_epoch`. Producers built against the earlier event format will have their events rejected until they send it.
-- A crash after a successful database insert but before checkpoint commit can replay that batch. The replay reuses the batch token and event IDs, so storage can detect it, but duplicates are still possible in the database and end-to-end exactly-once delivery is not guaranteed.
+- Exactly-once storage assumes a single writer per event identity. The adapter's existence check reads before it inserts, so two gateways shipping the same identity at the same moment could both insert it. Route each producer to one gateway.
+- Each batch costs one extra checkpoint write (the pending intent) and one `event_id` lookup query in ClickHouse before the insert.
 - Existing ClickHouse tables created from an earlier schema must be migrated to the current `deploy/clickhouse/schema.sql` before this version writes to them. The schema file uses `CREATE TABLE IF NOT EXISTS`, so it does not add `producer_epoch` or change the sorting key on an existing table.
-- Deduplication through the batch token only covers replays within ClickHouse's deduplication window, which the schema sets to 1,000. A replay that falls outside that window is not deduplicated. Confirm the window is large enough for the replay distances you expect.
+- Reuse of an identity with different content is rejected only while the original event is still in the WAL. After its segment is reclaimed, a conflicting event is acknowledged and then dropped by the adapter (the first stored version wins).
+- Rows removed by the table's 30-day TTL no longer count as stored, so a resend of an expired event is stored again.
 - An event that was appended to the WAL but whose handler was canceled during enqueueing is not processed by the live scheduler, and a retry of it in the same process lifetime is acknowledged as a duplicate. It is replayed from the WAL on the next startup.
 - WAL retention depends on the shipper. Reclamation advances only when a batch is inserted and its checkpoint committed, so while ClickHouse is unavailable, or a batch keeps failing and is retried, segments accumulate on disk.
 - Reclamation deletes whole segments older than the checkpoint segment. The checkpoint and active segments are retained, so some already shipped records remain on disk until a later checkpoint passes them, and reclaimed records are no longer available for recovery replay or inspection.
 - The reclamation guard compares segment IDs only. A checkpoint in the same segment as the durable end but with an offset past it is not rejected yet.
-- The ClickHouse integration test is optional and runs only when the environment is configured for it.
+- The ClickHouse integration tests are optional and run only when `CLICKHOUSE_ADDR` is set.
 - Queue capacity, the admission rate and burst, the DRR quantum, the shutdown grace period, the maximum frame size, and the shipper's batch size, poll interval, and retry policy are fixed in the code and not yet configurable.
 - All producers receive equal scheduling treatment. Weights are not yet supported.
 - Enqueueing blocks on a full queue (cancelable during shutdown), and no load-shedding policy exists yet.

@@ -99,6 +99,26 @@ func (s *Shipper) Run(ctx context.Context) error {
 	poll := time.NewTicker(s.config.PollInterval)
 	defer poll.Stop()
 
+	//a pending batch may already be in the store, possibly only partially.
+	//replay exactly that WAL range first so the store sees the same rows under the same token.
+	if checkpoint.Pending != nil {
+		end := wal.Position{
+			SegmentId: checkpoint.Pending.Segment,
+			Offset:    checkpoint.Pending.Offset,
+		}
+
+		batch, err := s.readPendingBatch(ctx, reader, end)
+		if err != nil {
+			return err
+		}
+
+		if err := s.shipBatch(ctx, batch, start, end); err != nil {
+			return err
+		}
+
+		start = end
+	}
+
 	for {
 		batch, end, err := s.readBatch(ctx, reader)
 		if err != nil {
@@ -115,17 +135,92 @@ func (s *Shipper) Run(ctx context.Context) error {
 			}
 		}
 
-		if err := s.writeBatch(ctx, batch, start, end); err != nil {
+		if err := s.shipBatch(ctx, batch, start, end); err != nil {
 			return err
 		}
 
-		if err := s.checkpoint.Commit(positionCheckpoint(end)); err != nil {
-			return err
+		//the next batch starts where this one ended, so its token is derived from its own range.
+		start = end
+	}
+}
+
+// shipBatch records the batch as pending, inserts it, then commits its end position.
+func (s *Shipper) shipBatch(
+	ctx context.Context,
+	batch []wire.Event,
+	start wal.Position,
+	end wal.Position,
+) error {
+	intent := positionCheckpoint(start)
+	intent.Pending = &PendingBatch{
+		Segment: end.SegmentId,
+		Offset:  end.Offset,
+	}
+
+	if err := s.checkpoint.Commit(intent); err != nil {
+		return err
+	}
+
+	if err := s.writeBatch(ctx, batch, start, end); err != nil {
+		return err
+	}
+
+	if err := s.checkpoint.Commit(positionCheckpoint(end)); err != nil {
+		return err
+	}
+
+	return s.wal.ReclaimBefore(end)
+}
+
+// readPendingBatch reads every record up to and including the one ending at end.
+// The batch was formed from durable records, so the range must still be readable and end on a record boundary.
+func (s *Shipper) readPendingBatch(
+	ctx context.Context,
+	reader *wal.Reader,
+	end wal.Position,
+) ([]wire.Event, error) {
+	var batch []wire.Event
+
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, err
 		}
-		if err := s.wal.ReclaimBefore(end); err != nil {
-			return err
+
+		record, err := reader.Next()
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				return nil, fmt.Errorf(
+					"pending batch end %d:%d is beyond the durable WAL end",
+					end.SegmentId,
+					end.Offset,
+				)
+			}
+
+			return nil, err
+		}
+
+		batch = append(batch, record.Event)
+
+		if record.End == end {
+			return batch, nil
+		}
+
+		if positionAfter(record.End, end) {
+			return nil, fmt.Errorf(
+				"pending batch end %d:%d is not a WAL record boundary",
+				end.SegmentId,
+				end.Offset,
+			)
 		}
 	}
+}
+
+func positionAfter(a, b wal.Position) bool {
+	if a.SegmentId != b.SegmentId {
+		return a.SegmentId > b.SegmentId
+	}
+
+	return a.Offset > b.Offset
 }
 
 func (s *Shipper) readBatch(
