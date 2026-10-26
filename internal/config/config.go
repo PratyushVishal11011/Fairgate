@@ -11,6 +11,7 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"sort"
 	"strings"
 	"time"
 
@@ -22,6 +23,7 @@ type Config struct {
 	Admission  Admission  `yaml:"admission"`
 	Queues     Queues     `yaml:"queues"`
 	Scheduler  Scheduler  `yaml:"scheduler"`
+	Fairness   Fairness   `yaml:"fairness"`
 	WAL        WAL        `yaml:"wal"`
 	Shipper    Shipper    `yaml:"shipper"`
 	ClickHouse ClickHouse `yaml:"clickhouse"`
@@ -52,6 +54,47 @@ type Queues struct {
 type Scheduler struct {
 	//maximum events served from one producer queue per DRR visit.
 	Quantum int `yaml:"quantum"`
+}
+
+// Fairness controls how producers share each stage of the pipeline.
+type Fairness struct {
+	//DRR weight for producers that are not listed in Producers.
+	DefaultWeight float64 `yaml:"default_weight"`
+	//per-producer overrides keyed by producer_id; omitted or zero fields keep the defaults.
+	Producers map[string]ProducerFairness `yaml:"producers"`
+}
+
+type ProducerFairness struct {
+	//share of each DRR round relative to other producers: quantum * weight events per round.
+	Weight float64 `yaml:"weight"`
+	//admission token-bucket refill rate in events per second, replacing admission.rate.
+	Rate float64 `yaml:"rate"`
+	//admission token-bucket capacity, replacing admission.burst.
+	Burst int `yaml:"burst"`
+	//queue capacity in events, replacing queues.capacity.
+	QueueCapacity int `yaml:"queue_capacity"`
+}
+
+// Weights returns the per-producer DRR weights that are set.
+func (f Fairness) Weights() map[string]float64 {
+	weights := make(map[string]float64)
+	for producerId, producer := range f.Producers {
+		if producer.Weight > 0 {
+			weights[producerId] = producer.Weight
+		}
+	}
+	return weights
+}
+
+// QueueCapacities returns the per-producer queue capacities that are set.
+func (f Fairness) QueueCapacities() map[string]int {
+	capacities := make(map[string]int)
+	for producerId, producer := range f.Producers {
+		if producer.QueueCapacity > 0 {
+			capacities[producerId] = producer.QueueCapacity
+		}
+	}
+	return capacities
 }
 
 type WAL struct {
@@ -105,6 +148,9 @@ func Default() Config {
 		},
 		Scheduler: Scheduler{
 			Quantum: 8,
+		},
+		Fairness: Fairness{
+			DefaultWeight: 1,
 		},
 		WAL: WAL{
 			Path:        "data/fairgate.wal",
@@ -226,6 +272,17 @@ func (c Config) Validate() error {
 	check(c.Queues.Capacity > 0, "queues.capacity must be greater than zero")
 	check(c.Scheduler.Quantum > 0, "scheduler.quantum must be greater than zero")
 
+	check(c.Fairness.DefaultWeight > 0, "fairness.default_weight must be greater than zero")
+	for _, producerId := range sortedKeys(c.Fairness.Producers) {
+		producer := c.Fairness.Producers[producerId]
+		prefix := fmt.Sprintf("fairness.producers.%s", producerId)
+		check(producerId != "", "fairness.producers keys must be non-empty producer IDs")
+		check(producer.Weight >= 0, "%s.weight cannot be negative", prefix)
+		check(producer.Rate >= 0, "%s.rate cannot be negative", prefix)
+		check(producer.Burst >= 0, "%s.burst cannot be negative", prefix)
+		check(producer.QueueCapacity >= 0, "%s.queue_capacity cannot be negative", prefix)
+	}
+
 	check(c.WAL.Path != "", "wal.path is required")
 	check(c.WAL.SegmentSize > 0, "wal.segment_size must be greater than zero")
 
@@ -253,6 +310,15 @@ func (c Config) Validate() error {
 	}
 
 	return nil
+}
+
+func sortedKeys[V any](values map[string]V) []string {
+	keys := make([]string, 0, len(values))
+	for key := range values {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return keys
 }
 
 // LogLevel parses Log.Level.

@@ -25,10 +25,10 @@ import (
 )
 
 const (
-	ackAccepted         = "accepted"
-	ackRejected         = "rejected" // refused by the gateway, retryable after backoff
-	ackError            = "error"    // server-side failure, retryable
-	ackInvalid          = "invalid"  // malformed request, do not retry unchanged
+	ackAccepted = "accepted"
+	ackRejected = "rejected" // refused by the gateway, retryable after backoff
+	ackError    = "error"    // server-side failure, retryable
+	ackInvalid  = "invalid"  // malformed request, do not retry unchanged
 )
 
 func sendAck(conn net.Conn, ack wire.Ack) error {
@@ -182,13 +182,21 @@ func runContext(ctx context.Context, cfg config.Config, logger *slog.Logger, new
 
 	logger.Info("server listening on", "address", addr)
 
-	admission, err := admit.NewManager(cfg.Admission.Rate, cfg.Admission.Burst)
+	// Per-producer fairness overrides replace the defaults at admission, buffering, and scheduling.
+	limits := make(map[string]admit.Limit, len(cfg.Fairness.Producers))
+	for producerId, producer := range cfg.Fairness.Producers {
+		if producer.Rate > 0 || producer.Burst > 0 {
+			limits[producerId] = admit.Limit{Rate: producer.Rate, Burst: producer.Burst}
+		}
+	}
+
+	admission, err := admit.NewManagerWithLimits(cfg.Admission.Rate, cfg.Admission.Burst, limits)
 	if err != nil {
 		return err
 	}
 
 	// Create one shared queue manager with a bounded buffer per producer.
-	queues, err := sched.NewQueues(cfg.Queues.Capacity)
+	queues, err := sched.NewQueuesWithCapacities(cfg.Queues.Capacity, cfg.Fairness.QueueCapacities())
 	if err != nil {
 		return err
 	}
@@ -197,8 +205,12 @@ func runContext(ctx context.Context, cfg config.Config, logger *slog.Logger, new
 	schedulerCtx, cancelScheduler := context.WithCancel(context.Background())
 	defer cancelScheduler()
 
-	// Create a scheduler that serves up to the configured quantum per producer visit.
-	scheduler := sched.NewDRRScheduler(cfg.Scheduler.Quantum)
+	// Create a scheduler that serves each producer quantum * weight events per round.
+	scheduler := sched.NewWeightedDRRScheduler(
+		cfg.Scheduler.Quantum,
+		cfg.Fairness.DefaultWeight,
+		cfg.Fairness.Weights(),
+	)
 
 	// Signal that the scheduler goroutine has finished executing.
 	schedulerDone := make(chan struct{})

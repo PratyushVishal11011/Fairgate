@@ -198,3 +198,61 @@ log:
 		}
 	}
 }
+
+func TestLoadFairnessOverrides(t *testing.T) {
+	clearEnv(t)
+
+	cfg, err := Load(writeConfig(t, `
+fairness:
+  default_weight: 2
+  producers:
+    payments:
+      weight: 4
+      rate: 2000
+      burst: 4000
+      queue_capacity: 2048
+    importer:
+      weight: 0.25
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if cfg.Fairness.DefaultWeight != 2 {
+		t.Fatalf("default_weight: got %v", cfg.Fairness.DefaultWeight)
+	}
+	if got := cfg.Fairness.Weights(); !reflect.DeepEqual(got, map[string]float64{"payments": 4, "importer": 0.25}) {
+		t.Fatalf("weights: got %v", got)
+	}
+	if got := cfg.Fairness.QueueCapacities(); !reflect.DeepEqual(got, map[string]int{"payments": 2048}) {
+		t.Fatalf("queue capacities: got %v", got)
+	}
+	if payments := cfg.Fairness.Producers["payments"]; payments.Rate != 2000 || payments.Burst != 4000 {
+		t.Fatalf("admission override: got %+v", payments)
+	}
+}
+
+func TestValidateRejectsInvalidFairness(t *testing.T) {
+	clearEnv(t)
+
+	_, err := Load(writeConfig(t, `
+fairness:
+  default_weight: 0
+  producers:
+    noisy:
+      weight: -1
+      queue_capacity: -5
+`))
+	if err == nil {
+		t.Fatal("expected validation error")
+	}
+	for _, want := range []string{
+		"fairness.default_weight",
+		"fairness.producers.noisy.weight",
+		"fairness.producers.noisy.queue_capacity",
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("validation error does not mention %s:\n%v", want, err)
+		}
+	}
+}

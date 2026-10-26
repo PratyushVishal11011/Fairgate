@@ -32,8 +32,26 @@ queues:
   capacity: 512
 
 scheduler:
-  # Maximum events served from one producer queue per DRR visit.
+  # Events served per DRR round to a producer of weight 1. A producer of weight w gets quantum * w.
   quantum: 8
+
+fairness:
+  # DRR weight for producers that have no entry under `producers`.
+  default_weight: 1
+  # Per-producer overrides, keyed by producer_id. Each field is optional; an omitted field keeps the
+  # default above (admission.rate, admission.burst, queues.capacity, fairness.default_weight).
+  #   weight          share of each scheduling round relative to other producers (fractions allowed)
+  #   rate, burst     admission token-bucket limit for this producer
+  #   queue_capacity  events buffered for this producer before enqueueing blocks
+  # producers:
+  #   payments-service:
+  #     weight: 4
+  #     rate: 2000
+  #     burst: 4000
+  #     queue_capacity: 2048
+  #   batch-importer:
+  #     weight: 0.25
+  #     rate: 100
 
 wal:
   # Path of the first WAL segment. Later segments are created next to it.
