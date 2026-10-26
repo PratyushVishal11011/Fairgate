@@ -10,26 +10,36 @@ import (
 	"FairGate/internal/wire"
 )
 
-func TestClickHouseInsertBatchIntegration(t *testing.T) {
-	addr := os.Getenv("CLICKHOUSE_ADDR")
+// integrationConfig returns the ClickHouse settings for integration tests.
+// The tests run only when CLICKHOUSE_ADDR is set, so the default suite needs no live ClickHouse.
+func integrationConfig(t *testing.T) (addr, database, username, password string) {
+	t.Helper()
+
+	addr = os.Getenv("CLICKHOUSE_ADDR")
 	if addr == "" {
-		addr = "127.0.0.1:9000"
+		t.Skip("set CLICKHOUSE_ADDR to run ClickHouse integration tests")
 	}
 
-	database := os.Getenv("CLICKHOUSE_DATABASE")
+	database = os.Getenv("CLICKHOUSE_DATABASE")
 	if database == "" {
 		database = "fairgate"
 	}
 
-	username := os.Getenv("CLICKHOUSE_USER")
+	username = os.Getenv("CLICKHOUSE_USER")
 	if username == "" {
 		username = "fairgate"
 	}
 
-	password := os.Getenv("CLICKHOUSE_PASSWORD")
+	password = os.Getenv("CLICKHOUSE_PASSWORD")
 	if password == "" {
 		password = "fairgate_dev_password"
 	}
+
+	return addr, database, username, password
+}
+
+func TestClickHouseInsertBatchIntegration(t *testing.T) {
+	addr, database, username, password := integrationConfig(t)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -179,4 +189,74 @@ func quoteIdentifier(identifier string) string {
 		panic("empty ClickHouse database identifier")
 	}
 	return "`" + identifier + "`"
+}
+
+// TestClickHouseInsertBatchSkipsStoredEventsIntegration replays events under tokens that
+// ClickHouse's insert deduplication cannot match, as happens when a replay covers a different
+// WAL range or falls outside the deduplication window. Each event must still be stored once.
+func TestClickHouseInsertBatchSkipsStoredEventsIntegration(t *testing.T) {
+	addr, database, username, password := integrationConfig(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	ch, err := NewClickHouseStore([]string{addr}, database, username, password)
+	if err != nil {
+		t.Fatalf("connect to ClickHouse: %v", err)
+	}
+	defer ch.Close()
+
+	now := time.Now().UnixNano()
+	producerID := fmt.Sprintf("exactly-once-test-%d", now)
+	eventTime := time.Now().UTC().Truncate(time.Millisecond)
+
+	event := func(seq uint64) wire.Event {
+		return wire.Event{
+			ProducerId:    producerID,
+			ProducerEpoch: "epoch-1",
+			EventTime:     eventTime,
+			Seq:           seq,
+			EventType:     "integration_test",
+			Payload:       fmt.Sprintf("event-%d", seq),
+		}
+	}
+
+	steps := []struct {
+		token  string
+		events []wire.Event
+	}{
+		{"token-a", []wire.Event{event(1), event(2)}},
+		// A wider replay under a new token: 1 and 2 are already stored.
+		{"token-b", []wire.Event{event(1), event(2), event(3)}},
+		// Duplicates inside one batch.
+		{"token-c", []wire.Event{event(4), event(4)}},
+		// The same batch token after only part of the batch landed: 5 is stored, 6 is not.
+		// Sending 6 under the original token would be discarded as a duplicate block.
+		{"token-d", []wire.Event{event(5)}},
+		{"token-d", []wire.Event{event(5), event(6)}},
+	}
+
+	for i, step := range steps {
+		if err := ch.InsertBatch(ctx, step.events, step.token); err != nil {
+			t.Fatalf("InsertBatch step %d failed: %v", i+1, err)
+		}
+	}
+
+	for seq := uint64(1); seq <= 6; seq++ {
+		var count uint64
+		err := ch.conn.QueryRow(
+			ctx,
+			fmt.Sprintf(
+				`SELECT count() FROM %s.events WHERE producer_id = ? AND seq = ?`,
+				quoteIdentifier(database),
+			),
+			producerID, seq,
+		).Scan(&count)
+		if err != nil {
+			t.Fatalf("count event seq=%d: %v", seq, err)
+		}
+		if count != 1 {
+			t.Errorf("expected exactly one copy of event seq=%d, got %d", seq, count)
+		}
+	}
 }
