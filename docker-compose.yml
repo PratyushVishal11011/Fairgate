@@ -6,6 +6,7 @@ services:
       dockerfile: Dockerfile
     container_name: fairgate-server
     environment:
+      FAIRGATE_CONFIG: /etc/fairgate/fairgate.yaml
       FAIRGATE_CHECKPOINT_PATH: /app/data/checkpoint.json
       CLICKHOUSE_ADDR: clickhouse:9000
       CLICKHOUSE_DATABASE: fairgate
@@ -16,6 +17,7 @@ services:
       - "9100:9100"
     volumes:
       - fairgate_wal:/app/data
+      - ./deploy/fairgate.yaml:/etc/fairgate/fairgate.yaml:ro
     depends_on:
       clickhouse:
         condition: service_healthy

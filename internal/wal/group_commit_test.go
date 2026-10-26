@@ -13,7 +13,7 @@ import (
 func TestConcurrentAppendAndRecovery(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "events.wal")
 
-	w, err := openWithSegmentSize(path, 4096)
+	w, err := OpenWithSegmentSize(path, 4096)
 	if err != nil {
 		t.Fatal(err)
 	}

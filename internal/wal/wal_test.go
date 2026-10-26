@@ -75,7 +75,7 @@ func TestReclaimBeforeKeepsCheckpointAndActiveSegments(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "wal")
 
-	w, err := openWithSegmentSize(path, 256) // tiny segments force rotation
+	w, err := OpenWithSegmentSize(path, 256) // tiny segments force rotation
 	if err != nil {
 		t.Fatal(err)
 	}

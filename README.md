@@ -84,6 +84,7 @@ The project explores fair resource sharing in event-ingestion systems: keeping p
 - **Acknowledgments.** Sends an accepted acknowledgment after the event has been appended to the WAL and enqueued, and also for an identical retry of an event that was already accepted.
 - **Concurrent connections.** Handles client connections in separate goroutines and tracks them for coordinated shutdown.
 - **Context-aware lifecycle.** `RunContext` lets the caller control server lifetime through a `context.Context`.
+- **Config file.** An optional YAML file sets addresses, admission limits, queue capacity, DRR quantum, WAL path and segment size, shipper batching and retry, the ClickHouse connection, and the log level. Environment variables override it, and unknown keys or invalid values stop startup. See [Configuration](#configuration).
 - **Graceful shutdown.** Stops accepting clients, waits for active handlers within a grace period, forces closure of blocked connections afterward, stops the scheduler and shipper, and then closes the store and WAL.
 - **Cancelable enqueueing.** A handler blocked on a full producer queue can be interrupted during shutdown.
 - **Scheduler error propagation.** An unexpected scheduler failure is reported to the caller instead of being silently lost.
@@ -102,6 +103,19 @@ The project explores fair resource sharing in event-ingestion systems: keeping p
 Planned capabilities are not implied to be available in this beta.
 
 ## Recent updates
+
+### 26th October, 2026: Configuration file
+
+Runtime settings that were fixed in the code can now be set in an optional YAML config file, so a deployment can be tuned without rebuilding.
+
+- **Config file.** Pass it with `-config` or `FAIRGATE_CONFIG`. It covers the ingestion and metrics addresses, the shutdown grace period, admission rate and burst, queue capacity, DRR quantum, WAL path and segment size, the shipper's checkpoint path, batch size, poll interval, and retry policy, the ClickHouse connection, and the log level.
+- **Defaults.** Without a file, every setting keeps its previous value.
+- **Strict parsing and validation.** Unknown keys and invalid values stop startup with a message that lists every problem.
+- **Environment overrides.** The existing `FAIRGATE_*` and `CLICKHOUSE_*` variables still work and override the file, so secrets can stay out of it. `CLICKHOUSE_ADDR` now accepts a comma-separated list.
+- **Reference file.** [`deploy/fairgate.yaml`](deploy/fairgate.yaml) documents every setting. Docker Compose mounts it at `/etc/fairgate/fairgate.yaml`.
+- **Embedding.** `server.RunConfig(ctx, cfg, logger)` runs the gateway with a resolved `config.Config`. `RunContext(ctx, addr, logger)` still works and uses the defaults plus environment overrides.
+
+See [Configuration](#configuration).
 
 ### 26th October, 2026: End-to-end exactly-once delivery
 
@@ -358,6 +372,7 @@ flowchart LR
 | `internal/sched` | Per-producer bounded queues (including context-aware `EnqueueContext` and event identity tracking) and the DRR scheduler. |
 | `internal/wal` | Segmented WAL, writer goroutine with group commit, segment rotation, synchronization, ordered recovery with cross-segment validation over a possibly sparse segment set, and checkpoint-based segment reclamation (`ReclaimBefore`) with a durable-end guard (`ErrCheckpointAhead`). |
 | `internal/shipper` | Durable WAL reader, checkpoint load and atomic commit, pending-batch intent and exact-range replay, batching, polling at the durable end, retry with capped exponential backoff and jitter, and triggering WAL reclamation after each commit and at startup. |
+| `internal/config` | Defaults, YAML config file loading with unknown-key rejection, environment overrides, and validation. |
 | `internal/store` | `Store` interface and the ClickHouse adapter, including `event_id` computation from the event identity, skipping already stored events, and row-bound insert tokens. |
 
 ## Event lifecycle
@@ -737,12 +752,18 @@ From within the module, for example in a `cmd/` entry point:
 ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 defer stop()
 
-if err := server.RunContext(ctx, ":9000", logger); err != nil {
+cfg, err := config.Load("/etc/fairgate/fairgate.yaml") // "" for defaults plus environment overrides
+if err != nil {
+logger.Error("invalid configuration", "error", err)
+return
+}
+
+if err := server.RunConfig(ctx, cfg, logger); err != nil {
 logger.Error("server stopped", "error", err)
 }
 ```
 
-The listen address is chosen by the caller. The ClickHouse store is built from the environment variables listed under [Configuration](#configuration), and the shipper always starts with it. The Docker Compose stack publishes port `9001`; see [Docker deployment](#docker-deployment).
+`RunConfig` takes every setting from the resolved `config.Config`; see [Configuration](#configuration). `RunContext(ctx, addr, logger)` is still available: it uses the defaults and environment overrides with the given listen address. In both cases the shipper always starts with a ClickHouse store built from the `clickhouse` settings. The Docker Compose stack publishes port `9001`; see [Docker deployment](#docker-deployment).
 
 ### Limitations
 
@@ -813,34 +834,72 @@ FairGate is still a beta. Validate it under your own load and failure modes befo
 
 ## Configuration
 
-The following values are currently fixed in the server and are expected to become configurable.
+FairGate reads an optional YAML config file. Settings are resolved in three layers, each overriding the one before:
 
-| Setting | Current value | Description |
+1. Built-in defaults.
+2. The config file, passed with `-config` or `FAIRGATE_CONFIG`. `-config` wins if both are set.
+3. Environment variables (see [Environment overrides](#environment-overrides)).
+
+Without a config file, the gateway runs with the defaults below, which match its behavior before the file existed. Every key in the file is optional, and a key you leave out keeps its default.
+
+```bash
+fairgate -config /etc/fairgate/fairgate.yaml
+FAIRGATE_CONFIG=/etc/fairgate/fairgate.yaml fairgate
+```
+
+[`deploy/fairgate.yaml`](deploy/fairgate.yaml) is the reference file. It lists every setting with its default and a comment, and Docker Compose mounts it into the gateway container. A test checks that its values match the built-in defaults. Copy it as a starting point and remove the settings you don't change.
+
+Unknown keys are rejected, so a misspelled setting stops startup instead of being silently ignored. Invalid values are also rejected at startup, and every problem is reported at once.
+
+### Settings
+
+| Key | Default | Description |
 |---|---|---|
-| Queue capacity | 512 events per producer | Bound on each producer's queue. |
-| Admission rate / burst | 500 requests per second / 1,000 burst | Token-bucket limit applied by admission control. |
-| DRR quantum | 8 | Maximum events served from a producer queue per visit. |
-| Shutdown grace period | 5 seconds | Time active handlers have to finish before connections are forcibly closed. |
-| Maximum frame size | 5 MiB | Largest frame the wire codec accepts. |
+| `server.listen_addr` | `:9001` | TCP address for event ingestion. |
+| `server.metrics_addr` | `:9100` | HTTP address for `/health` and `/metrics`. If you change it, update the Compose port mapping, healthcheck, and Prometheus target to match. |
+| `server.shutdown_grace_period` | `5s` | Time active handlers get to finish before their connections are closed. |
+| `admission.rate` | `500` | Token-bucket refill rate per producer, in events per second. |
+| `admission.burst` | `1000` | Token-bucket capacity per producer. |
+| `queues.capacity` | `512` | Events buffered per producer before enqueueing blocks. |
+| `scheduler.quantum` | `8` | Maximum events served from one producer queue per DRR visit. |
+| `wal.path` | `data/fairgate.wal` | Path of the first WAL segment. Later segments are created next to it. |
+| `wal.segment_size` | `67108864` (64 MiB) | Segment size in bytes before the writer rotates. Reclamation deletes whole segments, so smaller segments free disk space sooner. |
+| `shipper.checkpoint_path` | `data/checkpoint.json` | Checkpoint file. Keep it on the same persistent volume as the WAL. |
+| `shipper.batch_size` | `200` | Maximum events per ClickHouse insert. |
+| `shipper.poll_interval` | `1s` | How often the shipper checks for new durable WAL records once it has caught up. |
+| `shipper.retry.initial_delay` | `1s` | First retry delay after a failed insert. |
+| `shipper.retry.max_delay` | `30s` | Cap on the retry delay. Must be at least `initial_delay`. |
+| `shipper.retry.multiplier` | `2` | Growth factor between attempts. Must be at least 1. |
+| `shipper.retry.jitter` | `0.2` | Symmetric jitter as a fraction of each delay, between 0 and 1. |
+| `clickhouse.addr` | `[localhost:9000]` | One or more ClickHouse native-protocol addresses. |
+| `clickhouse.database` | `fairgate` | Default database of the ClickHouse connection. The adapter always writes to the `fairgate.events` table. |
+| `clickhouse.username` | `fairgate` | ClickHouse user. |
+| `clickhouse.password` | `fairgate_dev_password` | ClickHouse password. Prefer `CLICKHOUSE_PASSWORD` to keep it out of the file. |
+| `log.level` | `info` | One of `debug`, `info`, `warn`, `error`. |
 
-The WAL segment size is configurable. Group commit batching is bounded by a maximum request count and a short collection delay; refer to the `wal` package for the current options and defaults. Segment reclamation has no separate switch: it is driven by the shipper's checkpoint.
+Durations use Go syntax, for example `500ms`, `5s`, or `1m30s`. Relative paths resolve against the gateway's working directory, which is `/app` in the Docker image.
 
-### Shipper and ClickHouse
+These limits are not configurable:
 
-The shipper and its ClickHouse store are configured through environment variables, which are read on every gateway start.
+- The maximum frame size (5 MiB) is part of the wire protocol.
+- WAL group commit batching is bounded by a fixed maximum request count and a short collection delay; refer to the `wal` package for the values.
+- Segment reclamation has no separate switch: it is driven by the shipper's checkpoint.
 
-| Variable | Description |
+### Environment overrides
+
+These environment variables override the config file. They suit secrets and per-host values, and they are the same variables FairGate read before the file existed.
+
+| Variable | Overrides |
 |---|---|
-| `FAIRGATE_CHECKPOINT_PATH` | Checkpoint file location. Defaults to `data/checkpoint.json`. |
-| `CLICKHOUSE_ADDR` | ClickHouse address. |
-| `CLICKHOUSE_DATABASE` | ClickHouse database. |
-| `CLICKHOUSE_USER` | ClickHouse user. |
-| `CLICKHOUSE_PASSWORD` | ClickHouse password. |
-| `FAIRGATE_METRICS_ADDR` | Listener address for the HTTP `/health` and `/metrics` endpoints (port `9100`). If you change it, update the Compose port mapping, healthcheck, and Prometheus target to match. |
+| `FAIRGATE_CONFIG` | Config file path, used when `-config` is not given. |
+| `FAIRGATE_METRICS_ADDR` | `server.metrics_addr` |
+| `FAIRGATE_CHECKPOINT_PATH` | `shipper.checkpoint_path` |
+| `CLICKHOUSE_ADDR` | `clickhouse.addr` (comma-separated for several addresses) |
+| `CLICKHOUSE_DATABASE` | `clickhouse.database` |
+| `CLICKHOUSE_USER` | `clickhouse.username` |
+| `CLICKHOUSE_PASSWORD` | `clickhouse.password` |
 
-`FAIRGATE_SHIPPER_ENABLED` is no longer read. The shipper always runs, and the setting was removed from Docker Compose; it can be deleted from existing environments.
-
-The gateway runtime configures the shipper with a batch size of 200 and a one-second WAL polling interval. The retry policy starts at one second, caps at 30 seconds, doubles between attempts, and applies 20% symmetric jitter. These shipper values are currently fixed in the runtime. After each successful checkpoint commit, WAL segments older than the checkpoint segment are reclaimed.
+An empty variable counts as unset. `FAIRGATE_SHIPPER_ENABLED` is no longer read. The shipper always runs, and the setting was removed from Docker Compose; it can be deleted from existing environments.
 
 ## Storage integration
 
@@ -987,12 +1046,14 @@ A solid border marks implemented work. Dashed borders mark planned work.
 FairGate/
 ├── internal/
 │   ├── admit/       # Admission control
+│   ├── config/      # Config file, environment overrides, validation
 │   ├── sched/       # Producer queues and DRR scheduler
 │   ├── server/      # TCP listener, connection handling, shipper lifecycle
 │   ├── shipper/     # WAL reader loop, checkpoints, retry/backoff, reclamation trigger
 │   ├── store/       # Storage interface and ClickHouse adapter
 │   ├── wal/         # Segmented WAL, group commit, recovery, and reclamation
 │   └── wire/        # Frame codec, event and ACK types
+├── deploy/          # Reference config (fairgate.yaml), ClickHouse schema, Prometheus, Grafana
 ├── data/            # Local WAL data and checkpoint (runtime; do not commit)
 ├── Dockerfile
 ├── docker-compose.yml
@@ -1045,6 +1106,8 @@ The repository is being developed as a gateway implementation. A stable command-
 ## Docker deployment
 
 The Compose stack starts the FairGate TCP server and its health and metrics endpoint, ClickHouse, Prometheus, and Grafana. Prometheus and Grafana use pinned image versions. FairGate waits for ClickHouse's health check before starting, Compose checks the gateway through `GET /health` on port `9100`, the shipper runs as part of the gateway (no enabling setting is needed), and the WAL and checkpoint persist in the `fairgate_wal` volume. As the shipper's checkpoint advances, older WAL segments in that volume are deleted automatically. Prometheus scrapes FairGate at `fairgate:9100`; Grafana automatically loads the Prometheus datasource and the FairGate Overview dashboard.
+
+Compose mounts [`deploy/fairgate.yaml`](deploy/fairgate.yaml) read-only at `/etc/fairgate/fairgate.yaml` and points `FAIRGATE_CONFIG` at it. To tune the gateway, edit that file and restart the service with `sudo docker compose restart fairgate`. The ClickHouse address and credentials still come from the `CLICKHOUSE_*` variables in `docker-compose.yml`, which override the file. If you change `server.listen_addr` or `server.metrics_addr`, update the published ports, the healthcheck, and the Prometheus target to match. See [Configuration](#configuration).
 
 ```bash
 sudo docker compose up --build -d
@@ -1120,7 +1183,7 @@ Known limitations of the current beta:
 - Reclamation deletes whole segments older than the checkpoint segment. The checkpoint and active segments are retained, so some already shipped records remain on disk until a later checkpoint passes them, and reclaimed records are no longer available for recovery replay or inspection.
 - The reclamation guard compares segment IDs only. A checkpoint in the same segment as the durable end but with an offset past it is not rejected yet.
 - The ClickHouse integration tests are optional and run only when `CLICKHOUSE_ADDR` is set.
-- Queue capacity, the admission rate and burst, the DRR quantum, the shutdown grace period, the maximum frame size, and the shipper's batch size, poll interval, and retry policy are fixed in the code and not yet configurable.
+- The maximum frame size and the WAL group commit limits are fixed in the code. The other runtime settings are set through the [config file](#configuration).
 - All producers receive equal scheduling treatment. Weights are not yet supported.
 - Enqueueing blocks on a full queue (cancelable during shutdown), and no load-shedding policy exists yet.
 - A WAL write, rotation, or sync failure is fatal: later appends are rejected until the WAL is reopened.

@@ -13,7 +13,7 @@ import (
 func TestSegmentRotationAndRecovery(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "events.wal")
 
-	w, err := openWithSegmentSize(path, 900)
+	w, err := OpenWithSegmentSize(path, 900)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -68,7 +68,7 @@ func TestSegmentRotationAndRecovery(t *testing.T) {
 func TestAppendAfterReopen(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "events.wal")
 
-	w, err := openWithSegmentSize(path, 900)
+	w, err := OpenWithSegmentSize(path, 900)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -88,7 +88,7 @@ func TestAppendAfterReopen(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	w, err = openWithSegmentSize(path, 900)
+	w, err = OpenWithSegmentSize(path, 900)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -125,7 +125,7 @@ func TestAppendAfterReopen(t *testing.T) {
 func TestIncompleteTailInFinalSegment(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "events.wal")
 
-	w, err := openWithSegmentSize(path, 900)
+	w, err := OpenWithSegmentSize(path, 900)
 	if err != nil {
 		t.Fatal(err)
 	}
