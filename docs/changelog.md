@@ -4,6 +4,11 @@
 
 ## Recent updates
 
+### 26th October, 2026: Oversized events no longer reported as WAL failures
+
+- **Oversized events are rejected as invalid.** An event larger than the WAL's 1 MiB record limit but within the 5 MiB frame limit used to fail inside the WAL. The handler counted that in `fairgate_wal_append_errors_total`, which fired the critical `FairGateWALAppendErrors` alert, sent `error` / `wal_append_failed`, and closed the connection, though the WAL was healthy. In the [EC2 benchmark](results/2026-10-26-ec2-benchmark.md) this happened 62 times, all from the oversized-event anomaly producers. These events now get `invalid` / `payload_too_large`, count in `fairgate_events_invalid_total`, and the connection stays open.
+- **Records are encoded before they reach the WAL writer.** `WAL.Append` now encodes and size-checks the event on the caller's goroutine and returns `wal.ErrRecordTooLarge` for oversized records. The single writer goroutine only writes and syncs.
+
 ### 26th October, 2026: Ingestion latency fix
 
 - **Concurrent WAL appends restored.** The deduplication manager held one global mutex across each WAL append, including its fsync, so every event waited for all earlier ones and group commit never batched more than one record. It now serializes only retries of the same event identity, and distinct events share group commits again. With 32 concurrent writers per CPU, the time per event in `BenchmarkPersistIfNewWAL` fell from about 11 ms to about 0.3 ms on an Apple M4.

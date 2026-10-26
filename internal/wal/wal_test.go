@@ -7,6 +7,7 @@ import (
 	"hash/crc32"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -119,4 +120,36 @@ func containsSegment(segs []segment, id uint64) bool {
 		}
 	}
 	return false
+}
+
+func TestAppendRejectsOversizedRecordAndStaysUsable(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "events.wal")
+
+	w, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+
+	oversized := wire.Event{
+		ProducerId: "producer-001",
+		EventTime:  time.Now().UTC(),
+		Seq:        1,
+		EventType:  "test",
+		Payload:    strings.Repeat("x", maxRecordSize),
+	}
+	if err := w.Append(oversized); !errors.Is(err, ErrRecordTooLarge) {
+		t.Fatalf("expected ErrRecordTooLarge, got %v", err)
+	}
+	if end := w.DurableEnd(); end.Offset != 0 {
+		t.Fatalf("oversized record reached the WAL: durable end %+v", end)
+	}
+
+	//the rejection is not fatal: the next append must still succeed.
+	valid := oversized
+	valid.Seq = 2
+	valid.Payload = "hello"
+	if err := w.Append(valid); err != nil {
+		t.Fatalf("append after oversized record: %v", err)
+	}
 }

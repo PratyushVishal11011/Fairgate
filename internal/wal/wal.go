@@ -26,9 +26,14 @@ const (
 	batchDelay         = 2 * time.Millisecond
 )
 
+// ErrRecordTooLarge reports an event whose encoded record exceeds the WAL's record limit.
+// It is a property of the event, not a WAL failure: the WAL stays usable.
+var ErrRecordTooLarge = errors.New("wal: record exceeds maximum size")
+
 type appendRequest struct {
-	event wire.Event
-	done  chan error
+	header  [8]byte
+	payload []byte
+	done    chan error
 }
 
 type WAL struct {
@@ -141,7 +146,12 @@ func OpenWithSegmentSize(path string, segmentSize int64) (*WAL, error) {
 }
 
 func (w *WAL) Append(event wire.Event) error {
-	req := appendRequest{event: event, done: make(chan error, 1)}
+	//encode and validate on the caller's goroutine, so a bad event never reaches the
+	//writer and the single writer goroutine spends its time on I/O, not JSON.
+	req, err := encodeRecord(event)
+	if err != nil {
+		return err
+	}
 
 	//prevent close from closing requests while an append is being submitted
 	w.submitMu.RLock()
@@ -154,6 +164,40 @@ func (w *WAL) Append(event wire.Event) error {
 	w.submitMu.RUnlock()
 
 	return <-req.done
+}
+
+// encodeRecord converts an event into a WAL record: an 8-byte header followed by the JSON payload.
+func encodeRecord(event wire.Event) (appendRequest, error) {
+	// Convert the event struct into JSON so it can be stored
+	// persistently and reconstructed during WAL recovery.
+	payload, err := json.Marshal(event)
+	if err != nil {
+		return appendRequest{}, err
+	}
+
+	// Reject records that exceed the maximum allowed payload size.
+	// Recovery refuses records above this limit.
+	if len(payload) > maxRecordSize {
+		return appendRequest{}, fmt.Errorf("%w: %d bytes, limit %d", ErrRecordTooLarge, len(payload), maxRecordSize)
+	}
+
+	req := appendRequest{payload: payload, done: make(chan error, 1)}
+
+	// Store the payload length in the first four bytes of the header
+	// using big-endian byte order. Recovery uses this value to
+	// determine how many bytes belong to the record.
+	binary.BigEndian.PutUint32(req.header[:4], uint32(len(payload)))
+
+	// Calculate a CRC32 checksum of the payload and store it in
+	// the final four bytes of the header. Recovery recalculates
+	// this checksum to detect corrupted records.
+	binary.BigEndian.PutUint32(req.header[4:8], crc32.ChecksumIEEE(payload))
+
+	return req, nil
+}
+
+func (r appendRequest) size() int64 {
+	return int64(len(r.header) + len(r.payload))
 }
 
 // writerLoop is the dedicated goroutine responsible for writing events
@@ -282,76 +326,18 @@ func (w *WAL) writeBatch(batch []appendRequest) {
 		return
 	}
 
-	// Stores a request after its event has been encoded into the
-	// format used by the WAL.
-	type encodeRequest struct {
-		req     appendRequest
-		header  [8]byte
-		payload []byte
-		size    int64
-	}
-
-	// Prepare all valid requests before writing them to disk.
-	// This separates serialization and validation from file I/O.
-	encoded := make([]encodeRequest, 0, len(batch))
-
-	for _, req := range batch {
-
-		// Convert the event struct into JSON so it can be stored
-		// persistently and reconstructed during WAL recovery.
-		payload, err := json.Marshal(req.event)
-		if err != nil {
-			// Serialization failed for this event. Notify its caller
-			// and continue processing the remaining requests.
-			req.done <- err
-			continue
-		}
-
-		// Reject records that exceed the maximum allowed payload size.
-		// This prevents oversized records from being written to the WAL.
-		if len(payload) > maxRecordSize {
-			req.done <- errors.New("payload too large")
-			continue
-		}
-
-		var header [8]byte
-
-		// Store the payload length in the first four bytes of the header
-		// using big-endian byte order. Recovery uses this value to
-		// determine how many bytes belong to the record.
-		binary.BigEndian.PutUint32(header[:4], uint32(len(payload)))
-
-		// Calculate a CRC32 checksum of the payload and store it in
-		// the final four bytes of the header. Recovery recalculates
-		// this checksum to detect corrupted records.
-		binary.BigEndian.PutUint32(header[4:8], crc32.ChecksumIEEE(payload))
-
-		// Add the encoded record to the batch. The total record size
-		// includes both the 8-byte header and the JSON payload.
-		encoded = append(encoded, encodeRequest{
-			req:     req,
-			header:  header,
-			payload: payload,
-			size:    int64(len(payload) + len(header)),
-		})
-	}
-
-	// If all requests failed serialization or validation, there is
-	// nothing left to write to the WAL.
-	if len(encoded) == 0 {
-		return
-	}
-
-	// Write each encoded record to the active WAL segment.
+	// Records arrive already encoded and validated by Append().
+	// Write each one to the active WAL segment.
 	// Segment rotation is handled here when the next record would
 	// exceed the configured segment size.
-	for _, item := range encoded {
+	var bytes int64
+	for _, item := range batch {
 
 		// Rotate only if the current segment already contains data
 		// and adding this record would exceed the segment size.
 		// This allows a single record to exceed a small segment limit
 		// used in tests without creating an empty segment repeatedly.
-		if w.size > 0 && w.size+item.size > w.maxSegmentSize {
+		if w.size > 0 && w.size+item.size() > w.maxSegmentSize {
 			if err := w.rotate(); err != nil {
 				// A rotation failure prevents the batch from being
 				// safely completed. Store the error so future batches
@@ -381,7 +367,8 @@ func (w *WAL) writeBatch(batch []appendRequest) {
 
 		// Update the active segment's size only after the complete
 		// header and payload have been written successfully.
-		w.size += item.size
+		w.size += item.size()
+		bytes += item.size()
 	}
 
 	// Only synchronize the file if all records were written without
@@ -401,21 +388,17 @@ func (w *WAL) writeBatch(batch []appendRequest) {
 			w.stateMu.Unlock()
 
 			if box := w.observer.Load(); box != nil {
-				var bytes int64
-				for _, item := range encoded {
-					bytes += item.size
-				}
-				box.BatchCommitted(len(encoded), bytes, time.Since(syncStart))
+				box.BatchCommitted(len(batch), bytes, time.Since(syncStart))
 			}
 		}
 	}
 
-	// Notify every request that was successfully encoded.
+	// Notify every request in the batch.
 	// A nil error indicates that the batch was written and synced.
 	// If any write, rotation, or Sync() operation failed, return
 	// the WAL's fatal error rather than confirming success.
-	for _, item := range encoded {
-		item.req.done <- w.fatalError
+	for _, item := range batch {
+		item.done <- w.fatalError
 	}
 }
 
