@@ -118,7 +118,7 @@ func NewWithOptions(opts Options) *Metrics {
 	m.walSyncDuration = histogram("fairgate_wal_sync_duration_seconds",
 		"Duration of each group commit fsync.", latency)
 	m.walBatchRecords = histogram("fairgate_wal_group_commit_records",
-		"Records made durable by one group commit.", prometheus.ExponentialBuckets(1, 2, 7))
+		"Records made durable by one group commit.", prometheus.ExponentialBuckets(1, 2, 13))
 	m.walWrittenBytes = counter("fairgate_wal_written_bytes_total", "Bytes made durable in the WAL.")
 	m.walRotations = counter("fairgate_wal_segment_rotations_total", "WAL segment rotations.")
 

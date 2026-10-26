@@ -20,14 +20,23 @@ Segment IDs increase as the writer rotates, but the set of segments on disk is n
 
 ## Writer and group commit
 
-A dedicated `writerLoop` goroutine owns all WAL file operations. Callers of `Append()` submit a request to a shared channel and wait for the result, rather than writing to disk themselves. The writer collects requests into a batch, bounded by a maximum request count and a short collection delay, writes the records, and performs one `Sync()` for the whole batch. Every caller in the batch is then released, so no `Append()` returns before its record has been synchronized.
+A dedicated `writerLoop` goroutine owns all WAL file operations. Callers of `Append()` submit a request to a shared channel and wait for the result, rather than writing to disk themselves. The writer collects requests into a batch, writes the records, and performs one `Sync()` for the whole batch. Every caller in the batch is then released, so no `Append()` returns before its record has been synchronized.
+
+Batches are formed as follows:
+
+- The writer takes every request already waiting in the channel. These arrived while the previous batch was being written and synchronized, so they share the next `Sync()` with no extra wait.
+- Batches have no size limit. Under load, one `Sync()` covers every waiting caller, so an append waits about one `Sync()` however many handlers are appending.
+- Only a request that arrives alone waits for others: the writer collects for up to 2 ms before writing, so light traffic can still share a `Sync()`.
 
 ```mermaid
 flowchart TD
     H["Handler goroutines<br/>Append()"] -->|"submit request"| CH["Shared request channel"]
     CH --> WL["writerLoop"]
-    WL --> BT["Collect batch<br/>max requests or short delay"]
-    BT --> SZ{"Next record fits<br/>in active segment?"}
+    WL --> DR["Take every queued request"]
+    DR --> ONE{"Only one request?"}
+    ONE -->|"Yes"| WT["Collect for up to 2 ms"]
+    ONE -->|"No"| SZ{"Next record fits<br/>in active segment?"}
+    WT --> SZ
     SZ -->|"No"| RT["Rotate to new segment"]
     SZ -->|"Yes"| WR["Write record"]
     RT --> WR

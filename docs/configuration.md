@@ -82,7 +82,7 @@ Durations use Go syntax, for example `500ms`, `5s`, or `1m30s`. Relative paths r
 These limits are not configurable:
 
 - The maximum frame size (5 MiB) is part of the wire protocol.
-- WAL group commit batching is bounded by a fixed maximum request count and a short collection delay; refer to the `wal` package for the values.
+- WAL group commit has no batch size limit, and its 2 ms collection delay for a lone request is fixed; see [Write-Ahead Log](wal.md#writer-and-group-commit).
 - Segment reclamation has no separate switch: it is driven by the shipper's checkpoint.
 
 ## Environment overrides
