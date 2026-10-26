@@ -533,6 +533,23 @@ func handleConn(
 				continue
 			}
 
+			//an event over the WAL record limit is a client error; the WAL is still healthy,
+			//so reject the event and keep the connection open.
+			if errors.Is(err, wal.ErrRecordTooLarge) {
+				metrics.EventInvalid()
+				if err := sendAck(conn, wire.Ack{
+					ProducerId: event.ProducerId,
+					Seq:        event.Seq,
+					Idx:        event.Idx,
+					Status:     ackInvalid,
+					Message:    "payload_too_large",
+				}); err != nil {
+					logger.Warn("Failed to send NACK", "error", err)
+					return
+				}
+				continue
+			}
+
 			metrics.WALAppendError(event.ProducerId)
 			logger.Error("Failed to append to WAL",
 				"producer_id", event.ProducerId,

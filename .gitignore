@@ -11,3 +11,4 @@ run-ec2-benchmark.sh
 scripts
 cleanup-benchmark-artifacts.sh
 docs/results
+benchmarks/
