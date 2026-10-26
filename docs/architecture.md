@@ -42,6 +42,7 @@ flowchart TD
         C["Event callback<br/>currently logs producer ID and sequence"]
         SH["WAL shipper<br/>always enabled"]
         M["HTTP :9100<br/>/health and /metrics"]
+        PP["HTTP :6060 (optional)<br/>/debug/pprof"]
 
         S --> A
         A --> DD
@@ -59,6 +60,7 @@ flowchart TD
     SH -->|"batched inserts"| CHDB[("ClickHouse")]
     PROM["Prometheus<br/>scrapes every 5 s"] -.->|"GET /metrics"| M
     GRAF["Grafana<br/>FairGate Overview"] --> PROM
+    PROM -->|"firing alerts"| AM["Alertmanager"]
 ```
 
 Accepted events are checked for duplicates, appended to the WAL, enqueued, and then acknowledged to the client. An identical retry of an event that was already accepted is acknowledged without being appended again. The scheduler callback logs selected events. The server always runs a WAL shipper that writes batches to ClickHouse independently of the scheduler and reclaims WAL segments once they are fully shipped. Alongside the TCP listener, the gateway serves `/health` and Prometheus `/metrics` on port `9100`; in the Compose stack Prometheus scrapes it and Grafana visualizes the result.
@@ -97,6 +99,7 @@ flowchart LR
 | `internal/wal` | Segmented WAL, writer goroutine with group commit, segment rotation, synchronization, ordered recovery with cross-segment validation over a possibly sparse segment set, and checkpoint-based segment reclamation (`ReclaimBefore`) with a durable-end guard (`ErrCheckpointAhead`). |
 | `internal/shipper` | Durable WAL reader, checkpoint load and atomic commit, pending-batch intent and exact-range replay, batching, polling at the durable end, retry with capped exponential backoff and jitter, and triggering WAL reclamation after each commit and at startup. |
 | `internal/config` | Defaults, YAML config file loading with unknown-key rejection, environment overrides, and validation. |
+| `internal/observability` | Prometheus metric set and collectors for every pipeline stage, bounded per-producer labels, the `/health` and `/metrics` handler, and the `pprof` handler. |
 | `internal/store` | `Store` interface and the ClickHouse adapter, including `event_id` computation from the event identity, skipping already stored events, and row-bound insert tokens. |
 
 ## Event lifecycle

@@ -256,3 +256,23 @@ fairness:
 		}
 	}
 }
+
+func TestValidateRejectsInvalidProfiling(t *testing.T) {
+	clearEnv(t)
+
+	_, err := Load(writeConfig(t, `
+profiling:
+  enabled: true
+  addr: ""
+  block_profile_rate: -1
+  mutex_profile_fraction: -1
+`))
+	if err == nil {
+		t.Fatal("expected validation error")
+	}
+	for _, want := range []string{"profiling.addr", "profiling.block_profile_rate", "profiling.mutex_profile_fraction"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("validation error does not mention %s:\n%v", want, err)
+		}
+	}
+}

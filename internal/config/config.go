@@ -28,6 +28,7 @@ type Config struct {
 	Shipper    Shipper    `yaml:"shipper"`
 	ClickHouse ClickHouse `yaml:"clickhouse"`
 	Log        Log        `yaml:"log"`
+	Profiling  Profiling  `yaml:"profiling"`
 }
 
 type Server struct {
@@ -126,6 +127,18 @@ type ClickHouse struct {
 	Password string   `yaml:"password"`
 }
 
+// Profiling controls the net/http/pprof endpoints.
+type Profiling struct {
+	//serve /debug/pprof/ on Addr; off by default because profiles expose internals and cost CPU.
+	Enabled bool `yaml:"enabled"`
+	//listener for the pprof endpoints, separate from server.metrics_addr.
+	Addr string `yaml:"addr"`
+	//runtime.SetBlockProfileRate: record one blocking event per this many nanoseconds blocked; 0 disables.
+	BlockProfileRate int `yaml:"block_profile_rate"`
+	//runtime.SetMutexProfileFraction: sample one in this many mutex contention events; 0 disables.
+	MutexProfileFraction int `yaml:"mutex_profile_fraction"`
+}
+
 type Log struct {
 	//one of debug, info, warn, error.
 	Level string `yaml:"level"`
@@ -175,6 +188,10 @@ func Default() Config {
 		},
 		Log: Log{
 			Level: "info",
+		},
+		Profiling: Profiling{
+			Enabled: false,
+			Addr:    "127.0.0.1:6060",
 		},
 	}
 }
@@ -301,6 +318,10 @@ func (c Config) Validate() error {
 		check(addr != "", "clickhouse.addr entries must not be empty")
 	}
 	check(c.ClickHouse.Database != "", "clickhouse.database is required")
+
+	check(!c.Profiling.Enabled || c.Profiling.Addr != "", "profiling.addr is required when profiling is enabled")
+	check(c.Profiling.BlockProfileRate >= 0, "profiling.block_profile_rate cannot be negative")
+	check(c.Profiling.MutexProfileFraction >= 0, "profiling.mutex_profile_fraction cannot be negative")
 
 	_, err := c.LogLevel()
 	check(err == nil, "log.level must be one of debug, info, warn, error")

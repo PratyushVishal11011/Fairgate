@@ -159,3 +159,23 @@ func (q *Queues) ProducerIds() []string {
 	sort.Strings(ids)
 	return ids
 }
+
+// QueueStat is a point-in-time view of one producer queue.
+type QueueStat struct {
+	ProducerId string
+	Depth      int
+	Capacity   int
+}
+
+// Stats returns the depth and capacity of every producer queue, sorted by producer ID.
+func (q *Queues) Stats() []QueueStat {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+
+	stats := make([]QueueStat, 0, len(q.queues))
+	for id, queue := range q.queues {
+		stats = append(stats, QueueStat{ProducerId: id, Depth: len(queue), Capacity: cap(queue)})
+	}
+	sort.Slice(stats, func(i, j int) bool { return stats[i].ProducerId < stats[j].ProducerId })
+	return stats
+}

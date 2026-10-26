@@ -4,6 +4,26 @@
 
 ## Recent updates
 
+### 26th October, 2026: Pipeline metrics, alerting, and profiling
+
+Every pipeline stage is now measured, alert rules and an Alertmanager service ship with the Compose stack, and the gateway can serve Go profiles.
+
+- **Pipeline metrics.** Metrics now cover:
+  - ingestion latency and per-outcome counts;
+  - WAL append and fsync latency, group-commit size, bytes written, rotations, segments, and disk usage;
+  - queue depth, fill, and per-producer depth and capacity;
+  - per-producer scheduler throughput;
+  - shipper lag, insert latency, failures, consecutive failures, and progress timestamps;
+  - build info, and the Go runtime and process metrics.
+- **Bounded per-producer labels.** Producers listed in `fairness.producers` get their own `producer` label; all others share `other`.
+- **Compatible metric names.** The existing metric names and their meanings are unchanged. The metrics are now produced by the Prometheus Go client.
+- **Alerting.** [`deploy/prometheus-alerts.yml`](../deploy/prometheus-alerts.yml) adds twelve rules for availability, durability, delivery, pipeline stalls, and producer behavior. Compose runs Alertmanager on port `9093` with [`deploy/alertmanager.yml`](../deploy/alertmanager.yml), which has commented receiver examples.
+- **Dashboard.** FairGate Overview gains summary stats, a firing-alerts table, and sections for ingestion, fairness, the WAL, the shipper, and the Go runtime.
+- **Profiling.** The new `profiling` config section serves `pprof` on its own listener (`127.0.0.1:6060`), with optional block and mutex sampling. It is off by default.
+- **Consistency test.** A test fails if the alert rules or the dashboard reference a `fairgate_*` metric the gateway does not export.
+
+See [Observability](observability.md).
+
 ### 26th October, 2026: Producer weights and fairness controls
 
 Producers no longer all get the same treatment. Each one can now get its own share of scheduling, admission, and buffering through the config file.

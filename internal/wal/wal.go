@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -57,6 +58,29 @@ type WAL struct {
 	size           int64
 	maxSegmentSize int64
 	fatalError     error
+
+	//optional instrumentation hooks; read by the writer goroutine.
+	observer atomic.Pointer[observerBox]
+}
+
+// Observer receives WAL events for instrumentation. Its methods run on the writer goroutine,
+// so they must be cheap and must not call back into the WAL.
+type Observer interface {
+	//BatchCommitted reports a group commit: how many records and bytes it made durable and how long Sync took.
+	BatchCommitted(records int, bytes int64, sync time.Duration)
+	//SegmentRotated reports that the writer moved to a new segment.
+	SegmentRotated()
+}
+
+type observerBox struct{ Observer }
+
+// SetObserver installs an observer; nil removes it.
+func (w *WAL) SetObserver(observer Observer) {
+	if observer == nil {
+		w.observer.Store(nil)
+		return
+	}
+	w.observer.Store(&observerBox{observer})
 }
 
 func Open(path string) (*WAL, error) {
@@ -346,6 +370,7 @@ func (w *WAL) writeBatch(batch []appendRequest) {
 	// an error. One Sync() makes the entire successfully written batch
 	// durable before the callers receive successful acknowledgements.
 	if w.fatalError == nil {
+		syncStart := time.Now()
 		if err := w.file.Sync(); err != nil {
 			//A Sync() failure means the durability of the batch cannot be confirmed. Treat the WAL as failed.
 			w.fatalError = err
@@ -356,6 +381,14 @@ func (w *WAL) writeBatch(batch []appendRequest) {
 				Offset:    w.size,
 			}
 			w.stateMu.Unlock()
+
+			if box := w.observer.Load(); box != nil {
+				var bytes int64
+				for _, item := range encoded {
+					bytes += item.size
+				}
+				box.BatchCommitted(len(encoded), bytes, time.Since(syncStart))
+			}
 		}
 	}
 
@@ -393,6 +426,10 @@ func (w *WAL) rotate() error {
 	w.file = file
 	w.segmentId = nextId
 	w.size = 0
+
+	if box := w.observer.Load(); box != nil {
+		box.SegmentRotated()
+	}
 
 	return nil
 }
@@ -543,4 +580,81 @@ func (w *WAL) DurableEnd() Position {
 	defer w.stateMu.RUnlock()
 
 	return w.durableEnd
+}
+
+// Stats describes the WAL's footprint on disk.
+type Stats struct {
+	//number of segment files on disk
+	Segments int
+	//total size of those segment files in bytes
+	Bytes int64
+	//end of the synchronized data
+	DurableEnd Position
+}
+
+// Stats lists the segment files on disk. It is safe to call concurrently with appends.
+func (w *WAL) Stats() (Stats, error) {
+	w.segmentMu.Lock()
+	defer w.segmentMu.Unlock()
+
+	segments, err := listSegments(w.path)
+	if err != nil {
+		return Stats{}, err
+	}
+
+	stats := Stats{Segments: len(segments), DurableEnd: w.DurableEnd()}
+	for _, seg := range segments {
+		info, err := os.Stat(seg.path)
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			return Stats{}, err
+		}
+		stats.Bytes += info.Size()
+	}
+
+	return stats, nil
+}
+
+// BytesAfter returns how many durable bytes lie after position, across segments.
+// The shipper uses it to report how far its checkpoint trails the WAL.
+func (w *WAL) BytesAfter(position Position) (int64, error) {
+	w.segmentMu.Lock()
+	defer w.segmentMu.Unlock()
+
+	durable := w.DurableEnd()
+	segments, err := listSegments(w.path)
+	if err != nil {
+		return 0, err
+	}
+
+	var total int64
+	for _, seg := range segments {
+		if seg.id < position.SegmentId || seg.id > durable.SegmentId {
+			continue
+		}
+
+		end := durable.Offset
+		if seg.id != durable.SegmentId {
+			info, err := os.Stat(seg.path)
+			if err != nil {
+				if os.IsNotExist(err) {
+					continue
+				}
+				return 0, err
+			}
+			end = info.Size()
+		}
+
+		start := int64(0)
+		if seg.id == position.SegmentId {
+			start = position.Offset
+		}
+		if end > start {
+			total += end - start
+		}
+	}
+
+	return total, nil
 }

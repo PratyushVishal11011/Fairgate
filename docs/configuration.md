@@ -49,6 +49,10 @@ Unknown keys are rejected, so a misspelled setting stops startup instead of bein
 | `clickhouse.username` | `fairgate` | ClickHouse user. |
 | `clickhouse.password` | `fairgate_dev_password` | ClickHouse password. Prefer `CLICKHOUSE_PASSWORD` to keep it out of the file. |
 | `log.level` | `info` | One of `debug`, `info`, `warn`, `error`. |
+| `profiling.enabled` | `false` | Serve the `pprof` endpoints under `/debug/pprof/`. |
+| `profiling.addr` | `127.0.0.1:6060` | Listener for the `pprof` endpoints, separate from `server.metrics_addr`. |
+| `profiling.block_profile_rate` | `0` | Sample one blocking event per this many nanoseconds blocked; `0` leaves the block profile empty. |
+| `profiling.mutex_profile_fraction` | `0` | Sample one in this many mutex contention events; `0` leaves the mutex profile empty. |
 
 ## Fairness
 
@@ -68,6 +72,8 @@ fairness:
 ```
 
 See [Backpressure, scheduling, and fairness](scheduling.md) for how weights translate into each producer's share.
+
+Producers listed under `fairness.producers` also get their own `producer` label in the per-producer metrics. Every other producer is reported as `other`, so list a producer here (even with no overrides, as `my-producer: {}`) to monitor it individually. See [Observability](observability.md#per-producer-labels).
 
 ## Paths and durations
 
