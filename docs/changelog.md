@@ -4,6 +4,10 @@
 
 ## Recent updates
 
+### 26th October, 2026: Ingestion latency fix
+
+- **Concurrent WAL appends restored.** The deduplication manager held one global mutex across each WAL append, including its fsync, so every event waited for all earlier ones and group commit never batched more than one record. It now serializes only retries of the same event identity, and distinct events share group commits again. With 32 concurrent writers per CPU, the time per event in `BenchmarkPersistIfNewWAL` fell from about 11 ms to about 0.3 ms on an Apple M4.
+
 ### 26th October, 2026: Pipeline metrics, alerting, and profiling
 
 Every pipeline stage is now measured, alert rules and an Alertmanager service ship with the Compose stack, and the gateway can serve Go profiles.
