@@ -1,0 +1,132 @@
+# Prometheus alerting rules for FairGate.
+#
+# Loaded by deploy/prometheus.yml and delivered through Alertmanager (deploy/alertmanager.yml).
+# Thresholds are starting points: tune them to your traffic and hardware. See docs/observability.md.
+#
+# Severities:
+#   critical  data is not flowing or not being made durable; act now
+#   warning   degradation that will become critical if it continues
+#   info      producer-side problems worth investigating
+
+groups:
+  - name: fairgate-availability
+    rules:
+      - alert: FairGateDown
+        expr: up{job="fairgate"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "FairGate {{ $labels.instance }} is not reachable"
+          description: "Prometheus has failed to scrape {{ $labels.instance }} for over a minute. The gateway may be down or its metrics listener unreachable."
+
+  - name: fairgate-durability
+    rules:
+      - alert: FairGateWALAppendErrors
+        expr: increase(fairgate_wal_append_errors_total[5m]) > 0
+        labels:
+          severity: critical
+        annotations:
+          summary: "FairGate WAL appends are failing"
+          description: "{{ $value | humanize }} WAL append errors in the last 5 minutes. A WAL write or sync failure is fatal: later appends are rejected until the gateway restarts. Check disk space and the data volume."
+
+      - alert: FairGateWALSyncSlow
+        expr: histogram_quantile(0.99, sum by (instance, le) (rate(fairgate_wal_sync_duration_seconds_bucket[5m]))) > 0.1
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "FairGate WAL fsync is slow"
+          description: "p99 group-commit fsync on {{ $labels.instance }} is {{ $value | humanizeDuration }}. Every accepted ACK waits for fsync, so producer latency rises with it."
+
+      - alert: FairGateWALDiskHigh
+        expr: fairgate_wal_disk_bytes > 1073741824
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "FairGate WAL is using {{ $value | humanize1024 }}B of disk"
+          description: "Segments are reclaimed only after the shipper's checkpoint passes them. Growing WAL usage usually means delivery to ClickHouse is falling behind."
+
+  - name: fairgate-delivery
+    rules:
+      - alert: FairGateShipperInsertsFailing
+        expr: fairgate_shipper_consecutive_failures >= 5
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "FairGate cannot insert into ClickHouse"
+          description: "The current batch on {{ $labels.instance }} has failed {{ $value }} times in a row. The shipper keeps retrying with backoff; check ClickHouse availability and credentials."
+
+      - alert: FairGateShipperStalled
+        expr: fairgate_shipper_lag_bytes > 0 and (time() - fairgate_shipper_last_checkpoint_timestamp_seconds) > 300
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "FairGate delivery to ClickHouse has stalled"
+          description: "{{ $labels.instance }} has undelivered WAL data and has not committed a checkpoint for over 5 minutes. Accepted events are safe in the WAL but are not reaching ClickHouse."
+
+      - alert: FairGateShipperLagHigh
+        expr: fairgate_shipper_lag_bytes > 268435456
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "FairGate delivery lag is {{ $value | humanize1024 }}B"
+          description: "The shipper's checkpoint on {{ $labels.instance }} trails the durable WAL end by more than 256 MiB. Ingestion is outpacing delivery."
+
+  - name: fairgate-pipeline
+    rules:
+      - alert: FairGateSchedulerStalled
+        expr: fairgate_queue_depth_events > 0 and rate(fairgate_events_processed_total[2m]) == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "FairGate scheduler is not processing queued events"
+          description: "{{ $labels.instance }} has events queued but the DRR scheduler processed none in the last 2 minutes."
+
+      - alert: FairGateQueueSaturated
+        expr: fairgate_queue_fill_ratio_max > 0.9
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "A FairGate producer queue is over 90% full"
+          description: "The fullest producer queue on {{ $labels.instance }} is at {{ $value | humanizePercentage }}. Producers whose queue is full are held back (backpressure). Check fairgate_producer_queue_depth_events to see which."
+
+      - alert: FairGateIngestLatencyHigh
+        expr: histogram_quantile(0.99, sum by (instance, le) (rate(fairgate_ingest_duration_seconds_bucket[5m]))) > 0.25
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "FairGate ingestion p99 latency is {{ $value | humanizeDuration }}"
+          description: "Time from reading an event to sending its ACK on {{ $labels.instance }} is high. Compare with fairgate_wal_append_duration_seconds to see whether the WAL is the cause."
+
+  - name: fairgate-producers
+    rules:
+      - alert: FairGateHighRejectionRate
+        expr: |
+          (
+            rate(fairgate_events_rejected_total[5m])
+              / (rate(fairgate_events_accepted_total[5m]) + rate(fairgate_events_rejected_total[5m]))
+          ) > 0.2
+          and rate(fairgate_events_rejected_total[5m]) > 1
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "FairGate is rate-limiting {{ $value | humanizePercentage }} of events"
+          description: "Admission control on {{ $labels.instance }} is rejecting a large share of events. Check fairgate_producer_events_total{outcome=\"rate_limited\"} and the admission and fairness settings."
+
+      - alert: FairGateInvalidEvents
+        expr: rate(fairgate_events_invalid_total[5m]) > 1
+        for: 10m
+        labels:
+          severity: info
+        annotations:
+          summary: "Producers are sending invalid events"
+          description: "{{ $labels.instance }} is rejecting more than one event per second as malformed or as a reused identity with different content. Check fairgate_producer_events_total{outcome=\"conflict\"}."

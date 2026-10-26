@@ -14,11 +14,11 @@ FairGate accepts framed event streams over TCP and keeps producers isolated from
 - **Safe producer retries.** Each event has a stable identity. An identical retry is acknowledged without being stored twice, and reuse of an identity with different content is rejected. [More](docs/event-model.md)
 - **Exactly-once delivery to ClickHouse.** Each event identity is stored once, through crashes, replays, and lost checkpoints. [More](docs/delivery-semantics.md)
 - **One config file.** Optional YAML config with strict validation. Environment variables override it for secrets. [More](docs/configuration.md)
-- **Observable.** `/health` and Prometheus `/metrics` endpoints, plus a provisioned Grafana dashboard. [More](docs/deployment.md)
+- **Observable.** Prometheus metrics for every pipeline stage, ready-made alert rules with Alertmanager, a provisioned Grafana dashboard, and optional `pprof` profiling. [More](docs/observability.md)
 
 ## Quick start
 
-Run the full stack (FairGate, ClickHouse, Prometheus, and Grafana) with Docker Compose:
+Run the full stack (FairGate, ClickHouse, Prometheus, Alertmanager, and Grafana) with Docker Compose:
 
 ```bash
 git clone https://github.com/PratyushVishal11011/Fairgate.git
@@ -32,6 +32,7 @@ sudo docker compose up --build -d
 | Health and metrics | [http://localhost:9100/health](http://localhost:9100/health), [/metrics](http://localhost:9100/metrics) |
 | Grafana (`admin` / `admin`) | [http://localhost:3001](http://localhost:3001) |
 | Prometheus | [http://localhost:9090](http://localhost:9090) |
+| Alertmanager | [http://localhost:9093](http://localhost:9093) |
 
 The Compose file ships with development credentials. Replace them, and restrict the published ports, before any non-development use. See [Deployment](docs/deployment.md).
 
@@ -72,6 +73,7 @@ See [Configuration](docs/configuration.md) for all settings and environment over
 | [Deployment](docs/deployment.md) | Docker Compose, ports, remote access, Apple Container. |
 | [Configuration](docs/configuration.md) | Config file, settings, fairness overrides, environment variables. |
 | [Backpressure, scheduling, and fairness](docs/scheduling.md) | Queues, weighted DRR, per-producer limits. |
+| [Observability](docs/observability.md) | Metrics, dashboard, alerting, profiling. |
 | [Delivery semantics](docs/delivery-semantics.md) | ACK meaning and the exactly-once guarantee. |
 | [Event model and identity](docs/event-model.md) | Event fields, identity, idempotent retries. |
 | [Wire protocol](docs/wire-protocol.md) | Frame format and acknowledgments. |

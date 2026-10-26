@@ -43,6 +43,8 @@ fairness:
   #   weight          share of each scheduling round relative to other producers (fractions allowed)
   #   rate, burst     admission token-bucket limit for this producer
   #   queue_capacity  events buffered for this producer before enqueueing blocks
+  # Listed producers also get their own `producer` label in metrics; all others are reported as
+  # "other". To monitor a producer without changing its limits, list it with no fields: `my-producer: {}`.
   # producers:
   #   payments-service:
   #     weight: 4
@@ -88,3 +90,16 @@ clickhouse:
 log:
   # One of debug, info, warn, error.
   level: info
+
+profiling:
+  # Serve Go's net/http/pprof endpoints under /debug/pprof/ on their own listener.
+  # Off by default: profiles expose internals, and collecting them costs CPU.
+  enabled: false
+  # Keep this on loopback unless you restrict access some other way. In a container, use ":6060"
+  # and publish it to the host's loopback only, for example "127.0.0.1:6060:6060".
+  addr: "127.0.0.1:6060"
+  # Block and mutex profiles are empty unless sampling is turned on. Both cost CPU while enabled.
+  # block_profile_rate: one sample per this many nanoseconds spent blocked (1 records everything).
+  # mutex_profile_fraction: sample one in this many contention events (1 records everything).
+  block_profile_rate: 0
+  mutex_profile_fraction: 0

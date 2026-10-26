@@ -33,8 +33,19 @@
   - a crash before checkpoint commit;
   - a restart with more durable records and a larger batch size;
   - a lost checkpoint that re-ships the whole WAL.
-- **Health and Prometheus endpoints.** FairGate responds with `200 OK` and `ok` at `/health` on port `9100`; Docker Compose uses this endpoint for its gateway healthcheck. Prometheus metrics for active TCP connections, accepted, rejected and invalid events, WAL append errors, and scheduler processing totals remain available at `/metrics` on port `9100`.
-- **Docker deployment.** A `Dockerfile` and Compose stack run FairGate with ClickHouse, Prometheus, and Grafana. Prometheus scrapes the gateway and Grafana provisions its Prometheus datasource and FairGate overview dashboard. `install-docker-ubuntu.sh` installs Docker Engine and the Compose plugin on Ubuntu.
+- **Health endpoint.** FairGate responds with `200 OK` and `ok` at `/health` on port `9100`; Docker Compose uses this endpoint for its gateway healthcheck.
+- **Pipeline metrics.** Prometheus metrics at `/metrics` on port `9100` cover every stage:
+  - ingestion outcomes and latency;
+  - WAL append and fsync latency, group-commit size, disk usage, and segments;
+  - queue depth and fill;
+  - scheduler throughput;
+  - shipper lag, insert latency, failures, and progress timestamps;
+  - Go runtime and process metrics.
+
+  Producers listed in `fairness.producers` get their own `producer` label, and all others share `other`. See [Observability](observability.md#metrics).
+- **Alerting.** Twelve Prometheus alert rules cover availability, durability, delivery, pipeline stalls, and producer behavior. An Alertmanager service with commented receiver examples is included. See [Observability](observability.md#alerting).
+- **Profiling.** Optional `pprof` endpoints on their own listener, with configurable block and mutex sampling. Off by default. See [Observability](observability.md#profiling).
+- **Docker deployment.** A `Dockerfile` and Compose stack run FairGate with ClickHouse, Prometheus, Alertmanager, and Grafana. Prometheus scrapes the gateway and evaluates the alert rules, and Grafana provisions its Prometheus datasource and the FairGate Overview dashboard, which has panels for every pipeline stage. `install-docker-ubuntu.sh` installs Docker Engine and the Compose plugin on Ubuntu.
 - **Acknowledgments.** Sends an accepted acknowledgment after the event has been appended to the WAL and enqueued, and also for an identical retry of an event that was already accepted.
 - **Concurrent connections.** Handles client connections in separate goroutines and tracks them for coordinated shutdown.
 - **Context-aware lifecycle.** `RunContext` lets the caller control server lifetime through a `context.Context`.

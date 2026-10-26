@@ -25,6 +25,8 @@ Known limitations of the current beta:
 - A WAL write, rotation, or sync failure is fatal: later appends are rejected until the WAL is reopened.
 - Startup recovery fails on an incomplete record in any non-final segment, rather than repairing it.
 - Shutdown has no explicit queue-drain confirmation, and a handler stuck in an operation that ignores connection closure and context cancellation can delay it beyond the grace period.
-- The Compose file ships with development credentials and publishes the FairGate, ClickHouse, Prometheus, and Grafana ports; restrict inbound access to trusted addresses as described in [Docker deployment](deployment.md) and replace the credentials before any non-development use.
+- The Compose file ships with development credentials and publishes the FairGate, ClickHouse, Prometheus, Alertmanager, and Grafana ports; restrict inbound access to trusted addresses as described in [Docker deployment](deployment.md) and replace the credentials before any non-development use.
 - The Apple Container launcher script is not tracked in the repository, so the macOS instructions do not work from a clean checkout.
-- FairGate currently exposes a basic Prometheus metrics set (active connections, accepted, rejected and invalid events, WAL append errors, scheduler totals), a `/health` endpoint, and a provisioned Grafana overview dashboard. Profiling, per-stage latency metrics, queue-depth metrics, and shipper lag metrics are not available yet.
+- Per-producer metrics label only the producers listed in `fairness.producers`; all other producers share the `other` series.
+- Alertmanager sends no notifications until a receiver is configured, and the alert thresholds are generic starting points.
+- There is no metric for time spent waiting in the scheduler queue, or for events the ClickHouse adapter skipped as already stored.
