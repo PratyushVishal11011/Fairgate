@@ -1,0 +1,42 @@
+# Alertmanager configuration for FairGate's alerts (deploy/prometheus-alerts.yml).
+#
+# Out of the box no notifications are sent: alerts are visible in the Alertmanager UI
+# (http://localhost:9093) and in Prometheus, and appear on the Grafana dashboard.
+# Add a receiver below and point the route at it to get notified.
+# Reference: https://prometheus.io/docs/alerting/latest/configuration/
+
+route:
+  receiver: default
+  group_by: [alertname, severity]
+  group_wait: 30s
+  group_interval: 5m
+  repeat_interval: 4h
+  # Example: send critical alerts to a pager receiver.
+  # routes:
+  #   - matchers: [severity="critical"]
+  #     receiver: pager
+
+receivers:
+  - name: default
+    # Uncomment one of these, or add your own:
+    #
+    # webhook_configs:
+    #   - url: http://my-alert-handler:8080/alerts
+    #
+    # slack_configs:
+    #   - api_url: https://hooks.slack.com/services/XXX/YYY/ZZZ
+    #     channel: "#fairgate-alerts"
+    #     send_resolved: true
+    #
+    # email_configs:
+    #   - to: oncall@example.com
+    #     from: alertmanager@example.com
+    #     smarthost: smtp.example.com:587
+    #     auth_username: alertmanager@example.com
+    #     auth_password: change-me
+
+inhibit_rules:
+  # While a gateway is down, its other alerts are stale; only report that it is down.
+  - source_matchers: [alertname="FairGateDown"]
+    target_matchers: [severity=~"warning|info"]
+    equal: [instance]

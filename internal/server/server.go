@@ -20,9 +20,13 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sync"
 	"time"
 )
+
+// Version is reported in logs and by fairgate_build_info.
+const Version = "0.1.0"
 
 const (
 	ackAccepted = "accepted"
@@ -76,7 +80,14 @@ func runContext(ctx context.Context, cfg config.Config, logger *slog.Logger, new
 	}
 
 	addr := cfg.Server.ListenAddr
-	metrics := observability.New()
+	labelled := make([]string, 0, len(cfg.Fairness.Producers))
+	for producerId := range cfg.Fairness.Producers {
+		labelled = append(labelled, producerId)
+	}
+	metrics := observability.NewWithOptions(observability.Options{
+		Version:   Version,
+		Producers: labelled,
+	})
 	metricsServer := &http.Server{Addr: cfg.Server.MetricsAddr, Handler: metrics.Handler()}
 	metricsListener, err := net.Listen("tcp", metricsServer.Addr)
 	if err != nil {
@@ -89,6 +100,24 @@ func runContext(ctx context.Context, cfg config.Config, logger *slog.Logger, new
 		}
 	}()
 	defer func() { _ = metricsServer.Close() }()
+
+	if cfg.Profiling.Enabled {
+		runtime.SetBlockProfileRate(cfg.Profiling.BlockProfileRate)
+		runtime.SetMutexProfileFraction(cfg.Profiling.MutexProfileFraction)
+
+		profilingServer := &http.Server{Addr: cfg.Profiling.Addr, Handler: observability.ProfilingHandler()}
+		profilingListener, err := net.Listen("tcp", profilingServer.Addr)
+		if err != nil {
+			return fmt.Errorf("listen for profiling: %w", err)
+		}
+		go func() {
+			if err := profilingServer.Serve(profilingListener); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				logger.Error("profiling server stopped", "error", err)
+			}
+		}()
+		defer func() { _ = profilingServer.Close() }()
+		logger.Info("profiling enabled", "address", profilingListener.Addr().String())
+	}
 
 	// Open a TCP listener on the specified address.
 	listener, err := net.Listen("tcp", addr)
@@ -123,6 +152,8 @@ func runContext(ctx context.Context, cfg config.Config, logger *slog.Logger, new
 		return err
 	}
 	defer walLog.Close()
+	walLog.SetObserver(metrics)
+	metrics.RegisterWAL(walLog)
 
 	shipperErr := make(chan error, 1)
 	shipperDone := make(chan struct{})
@@ -152,11 +183,13 @@ func runContext(ctx context.Context, cfg config.Config, logger *slog.Logger, new
 		shipper.Config{
 			BatchSize:    cfg.Shipper.BatchSize,
 			PollInterval: cfg.Shipper.PollInterval,
+			Observer:     metrics,
 		},
 	)
 	if err != nil {
 		return fmt.Errorf("create shipper: %w", err)
 	}
+	metrics.RegisterShipper(eventShipper, walLog)
 
 	shipperCtx, stopShipper := context.WithCancel(context.Background())
 	cancelShipper = stopShipper
@@ -200,6 +233,7 @@ func runContext(ctx context.Context, cfg config.Config, logger *slog.Logger, new
 	if err != nil {
 		return err
 	}
+	metrics.RegisterQueues(queues)
 
 	// Create a context to control the scheduler's lifecycle.
 	schedulerCtx, cancelScheduler := context.WithCancel(context.Background())
@@ -222,7 +256,7 @@ func runContext(ctx context.Context, cfg config.Config, logger *slog.Logger, new
 		defer close(schedulerDone)
 
 		err := scheduler.Run(schedulerCtx, queues, func(event wire.Event) error {
-			metrics.EventProcessed()
+			metrics.EventProcessed(event.ProducerId)
 			logger.Info("Event processed by DRR",
 				"producer_id", event.ProducerId,
 				"seq", event.Seq,
@@ -446,6 +480,8 @@ func handleConn(
 			continue
 		}
 
+		received := time.Now()
+
 		event, err := wire.DecodeEvent(frame.Payload)
 		if err != nil {
 			metrics.EventInvalid()
@@ -460,7 +496,7 @@ func handleConn(
 		}
 
 		if !admission.Allow(event.ProducerId) {
-			metrics.EventRejected()
+			metrics.EventRejected(event.ProducerId)
 			if err := sendAck(conn, wire.Ack{
 				ProducerId: event.ProducerId,
 				Seq:        event.Seq,
@@ -475,12 +511,15 @@ func handleConn(
 		}
 
 		duplicate, err := dedupManager.PersistIfNew(event, func() error {
-			return walLog.Append(event)
+			appendStart := time.Now()
+			err := walLog.Append(event)
+			metrics.ObserveWALAppend(time.Since(appendStart))
+			return err
 		})
 		if err != nil {
 			if errors.Is(err, deduplication.ErrConflict) ||
 				errors.Is(err, deduplication.ErrInvalid) {
-				metrics.EventInvalid()
+				metrics.EventConflict(event.ProducerId)
 				if err := sendAck(conn, wire.Ack{
 					ProducerId: event.ProducerId,
 					Seq:        event.Seq,
@@ -494,7 +533,7 @@ func handleConn(
 				continue
 			}
 
-			metrics.WALAppendError()
+			metrics.WALAppendError(event.ProducerId)
 			logger.Error("Failed to append to WAL",
 				"producer_id", event.ProducerId,
 				"seq", event.Seq,
@@ -523,7 +562,8 @@ func handleConn(
 				logger.Warn("Failed to send duplicate ACK", "error", err)
 				return
 			}
-			metrics.EventAccepted()
+			metrics.EventDuplicate(event.ProducerId)
+			metrics.ObserveIngest(time.Since(received))
 			continue
 		}
 
@@ -554,7 +594,8 @@ func handleConn(
 			return
 		}
 
-		metrics.EventAccepted()
+		metrics.EventAccepted(event.ProducerId)
+		metrics.ObserveIngest(time.Since(received))
 		logger.Info("Event admitted",
 			"remote_addr", remoteAddr,
 			"producer_id", event.ProducerId,

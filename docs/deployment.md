@@ -2,7 +2,7 @@
 
 # Docker deployment
 
-The Compose stack starts the FairGate TCP server and its health and metrics endpoint, ClickHouse, Prometheus, and Grafana. Prometheus and Grafana use pinned image versions. FairGate waits for ClickHouse's health check before starting, Compose checks the gateway through `GET /health` on port `9100`, the shipper runs as part of the gateway (no enabling setting is needed), and the WAL and checkpoint persist in the `fairgate_wal` volume. As the shipper's checkpoint advances, older WAL segments in that volume are deleted automatically. Prometheus scrapes FairGate at `fairgate:9100`; Grafana automatically loads the Prometheus datasource and the FairGate Overview dashboard.
+The Compose stack starts the FairGate TCP server and its health and metrics endpoint, ClickHouse, Prometheus, Alertmanager, and Grafana. Prometheus, Alertmanager, and Grafana use pinned image versions. FairGate waits for ClickHouse's health check before starting, Compose checks the gateway through `GET /health` on port `9100`, the shipper runs as part of the gateway (no enabling setting is needed), and the WAL and checkpoint persist in the `fairgate_wal` volume. As the shipper's checkpoint advances, older WAL segments in that volume are deleted automatically. Prometheus scrapes FairGate at `fairgate:9100`, evaluates the alert rules in [`deploy/prometheus-alerts.yml`](../deploy/prometheus-alerts.yml), and sends firing alerts to Alertmanager. Grafana automatically loads the Prometheus datasource and the FairGate Overview dashboard. Alertmanager sends no notifications until you add a receiver; see [Observability](observability.md#notifications).
 
 Compose mounts [`deploy/fairgate.yaml`](../deploy/fairgate.yaml) read-only at `/etc/fairgate/fairgate.yaml` and points `FAIRGATE_CONFIG` at it. To tune the gateway, edit that file and restart the service with `sudo docker compose restart fairgate`. The ClickHouse address and credentials still come from the `CLICKHOUSE_*` variables in `docker-compose.yml`, which override the file. If you change `server.listen_addr` or `server.metrics_addr`, update the published ports, the healthcheck, and the Prometheus target to match. See [Configuration](configuration.md).
 
@@ -12,7 +12,7 @@ sudo docker compose ps
 sudo docker compose logs -f fairgate clickhouse
 ```
 
-Open Grafana at [http://localhost:3001](http://localhost:3001) (default login `admin` / `admin`; change the password at first login). The standalone Next.js dashboard uses port `3000`. Prometheus is at [http://localhost:9090](http://localhost:9090); its host port is published for the remote dashboard, so restrict inbound TCP `9090` to trusted source addresses in the host firewall/security group. The gateway metrics endpoint is at [http://localhost:9100/metrics](http://localhost:9100/metrics), bound to loopback by default. `FAIRGATE_METRICS_ADDR` changes the gateway's metrics listener; if you change it, update the Compose port mapping and Prometheus target to match.
+Open Grafana at [http://localhost:3001](http://localhost:3001) (default login `admin` / `admin`; change the password at first login). The standalone Next.js dashboard uses port `3000`. Prometheus is at [http://localhost:9090](http://localhost:9090); its host port is published for the remote dashboard, so restrict inbound TCP `9090` to trusted source addresses in the host firewall/security group. Alertmanager is at [http://localhost:9093](http://localhost:9093); restrict inbound TCP `9093` the same way. The gateway metrics endpoint is at [http://localhost:9100/metrics](http://localhost:9100/metrics), bound to loopback by default. `FAIRGATE_METRICS_ADDR` changes the gateway's metrics listener; if you change it, update the Compose port mapping and Prometheus target to match.
 
 Published ports:
 
@@ -22,7 +22,10 @@ Published ports:
 | `9100` | FairGate HTTP: `/health` and `/metrics` |
 | `9000` | ClickHouse native protocol |
 | `9090` | Prometheus |
+| `9093` | Alertmanager |
 | `3001` | Grafana |
+
+Profiling is off by default and not published. To profile the containerized gateway, see [Observability](observability.md#profiling).
 
 For access from outside the host, if your `fairgate` port mapping is still bound to loopback, edit it in `docker-compose.yml` from the loopback-only binding to:
 

@@ -314,3 +314,75 @@ func waitForCommittedEnd(t *testing.T, checkpointStore *CheckpointStore, end wal
 		}
 	}
 }
+
+type recordingObserver struct {
+	mu          sync.Mutex
+	inserted    []int
+	failures    []int
+	checkpoints []wal.Position
+}
+
+func (o *recordingObserver) BatchInserted(events int, _ time.Duration) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.inserted = append(o.inserted, events)
+}
+
+func (o *recordingObserver) InsertFailed(consecutive int) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.failures = append(o.failures, consecutive)
+}
+
+func (o *recordingObserver) CheckpointCommitted(position wal.Position) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.checkpoints = append(o.checkpoints, position)
+}
+
+func TestShipperReportsToObserver(t *testing.T) {
+	dir := t.TempDir()
+	w, err := wal.Open(filepath.Join(dir, "events.wal"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+
+	for i := uint64(1); i <= 2; i++ {
+		if err := w.Append(testShipperEvent(i, "event")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	end := w.DurableEnd()
+
+	checkpointStore := NewCheckpointStore(filepath.Join(dir, "checkpoint.json"))
+	observer := &recordingObserver{}
+	s, err := New(&fakeStore{failuresRemaining: 2}, w, checkpointStore, newTestBackoff(), Config{
+		BatchSize: 10, PollInterval: 5 * time.Millisecond, Observer: observer,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- s.Run(ctx) }()
+	waitForCommittedEnd(t, checkpointStore, end)
+	cancel()
+	<-done
+
+	observer.mu.Lock()
+	defer observer.mu.Unlock()
+	if !reflect.DeepEqual(observer.failures, []int{1, 2}) {
+		t.Errorf("failures: got %v, want [1 2]", observer.failures)
+	}
+	if !reflect.DeepEqual(observer.inserted, []int{2}) {
+		t.Errorf("inserted: got %v, want [2]", observer.inserted)
+	}
+	if !reflect.DeepEqual(observer.checkpoints, []wal.Position{end}) {
+		t.Errorf("checkpoints: got %v, want [%v]", observer.checkpoints, end)
+	}
+	if s.Committed() != end {
+		t.Errorf("Committed() = %+v, want %+v", s.Committed(), end)
+	}
+}

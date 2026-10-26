@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"sync"
 	"time"
 )
 
@@ -23,7 +24,25 @@ type Config struct {
 	//Capacity of the internal buffered channel that holds events waiting to be processed by the shipper.
 	QueueSize    int
 	PollInterval time.Duration
+	//Observer receives instrumentation events; nil disables them.
+	Observer Observer
 }
+
+// Observer receives shipper events for instrumentation. Methods run on the shipper goroutine and must be cheap.
+type Observer interface {
+	//BatchInserted reports a successful store insert and how long that attempt took.
+	BatchInserted(events int, duration time.Duration)
+	//InsertFailed reports a failed insert attempt and how many attempts in a row have failed for this batch.
+	InsertFailed(consecutiveFailures int)
+	//CheckpointCommitted reports that the checkpoint advanced to position.
+	CheckpointCommitted(position wal.Position)
+}
+
+type noopObserver struct{}
+
+func (noopObserver) BatchInserted(int, time.Duration) {}
+func (noopObserver) InsertFailed(int)                 {}
+func (noopObserver) CheckpointCommitted(wal.Position) {}
 
 type Shipper struct {
 	//Store interface used to persist event batches.
@@ -35,6 +54,24 @@ type Shipper struct {
 	wal        *wal.WAL
 	checkpoint *CheckpointStore
 	backoff    *Backoff
+	observer   Observer
+
+	//last committed position, read by metrics while Run advances it.
+	committedMu sync.Mutex
+	committed   wal.Position
+}
+
+// Committed returns the last checkpoint position this shipper loaded or committed.
+func (s *Shipper) Committed() wal.Position {
+	s.committedMu.Lock()
+	defer s.committedMu.Unlock()
+	return s.committed
+}
+
+func (s *Shipper) setCommitted(position wal.Position) {
+	s.committedMu.Lock()
+	s.committed = position
+	s.committedMu.Unlock()
 }
 
 func New(
@@ -63,12 +100,18 @@ func New(
 		return nil, errors.New("the poll interval must be greater than zero")
 	}
 
+	observer := config.Observer
+	if observer == nil {
+		observer = noopObserver{}
+	}
+
 	return &Shipper{
 		store:      storage,
 		wal:        w,
 		checkpoint: checkpoint,
 		backoff:    backoff,
 		config:     config,
+		observer:   observer,
 	}, nil
 }
 
@@ -95,6 +138,7 @@ func (s *Shipper) Run(ctx context.Context) error {
 		return err
 	}
 	start := checkpointPosition(checkpoint)
+	s.setCommitted(start)
 	reader := wal.NewReader(s.wal, start)
 	poll := time.NewTicker(s.config.PollInterval)
 	defer poll.Stop()
@@ -168,6 +212,8 @@ func (s *Shipper) shipBatch(
 	if err := s.checkpoint.Commit(positionCheckpoint(end)); err != nil {
 		return err
 	}
+	s.setCommitted(end)
+	s.observer.CheckpointCommitted(end)
 
 	return s.wal.ReclaimBefore(end)
 }
@@ -266,14 +312,18 @@ func (s *Shipper) writeBatch(
 ) error {
 	for attempt := 0; ; attempt++ {
 		token := batchToken(start, end)
+		attemptStart := time.Now()
 		err := s.store.InsertBatch(ctx, batch, token)
 		if err == nil {
+			s.observer.BatchInserted(len(batch), time.Since(attemptStart))
 			return nil
 		}
 
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
+
+		s.observer.InsertFailed(attempt + 1)
 
 		if err := s.backoff.Wait(ctx, attempt); err != nil {
 			return err

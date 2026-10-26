@@ -9,6 +9,7 @@ FairGate/
 ├── internal/
 │   ├── admit/       # Admission control
 │   ├── config/      # Config file, environment overrides, validation
+│   ├── observability/ # Prometheus metrics, collectors, pprof handler
 │   ├── sched/       # Producer queues and DRR scheduler
 │   ├── server/      # TCP listener, connection handling, shipper lifecycle
 │   ├── shipper/     # WAL reader loop, checkpoints, retry/backoff, reclamation trigger
@@ -16,7 +17,7 @@ FairGate/
 │   ├── wal/         # Segmented WAL, group commit, recovery, and reclamation
 │   └── wire/        # Frame codec, event and ACK types
 ├── docs/            # Detailed documentation
-├── deploy/          # Reference config (fairgate.yaml), ClickHouse schema, Prometheus, Grafana
+├── deploy/          # Reference config, ClickHouse schema, Prometheus rules, Alertmanager, Grafana
 ├── data/            # Local WAL data and checkpoint (runtime; do not commit)
 ├── Dockerfile
 ├── docker-compose.yml

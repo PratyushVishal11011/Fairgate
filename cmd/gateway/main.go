@@ -57,7 +57,7 @@ func run(logger *slog.Logger, cfg config.Config, configPath string) error {
 	//this releases the resources used by signal.NotifyContext and unregisters its signal handling.
 	defer stop()
 	logger.Info("FairGate starting",
-		"Version", "0.1.0",
+		"Version", server.Version,
 		"Status", "Initializing",
 		"Config", configPath,
 	)
