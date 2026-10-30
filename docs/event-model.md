@@ -28,7 +28,7 @@ Events are represented as JSON with the following fields:
 | `event_type` | string | Event category |
 | `payload` | string | Event payload |
 
-The decoder requires a non-empty producer ID, a non-empty producer epoch, a non-zero event time, and a non-empty event type.
+The decoder requires a non-empty producer ID, a non-empty producer epoch, a non-zero event time, and a non-empty event type. The producer ID, producer epoch, and event type may each be at most 256 bytes, because the gateway keeps them in memory for every event it tracks. An event that breaks any of these rules gets an `invalid` / `invalid_payload` ACK.
 
 ```mermaid
 classDiagram

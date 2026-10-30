@@ -69,7 +69,7 @@ func benchmarkIngest(b *testing.B, producers int) {
 			if err != nil {
 				return
 			}
-			go handleConn(ctx, conn, logger, admission, queues, walLog, metrics, dedupManager, nil)
+			go handleConn(ctx, conn, logger, admission, queues, walLog, metrics, dedupManager, nil, protocolLimits{})
 		}
 	}()
 

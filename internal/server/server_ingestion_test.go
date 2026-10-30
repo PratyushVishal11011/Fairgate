@@ -74,6 +74,7 @@ func TestTCPIngestionPersistsEventsToWAL(t *testing.T) {
 			metrics,
 			dedupManager,
 			nil,
+			protocolLimits{},
 		)
 	}()
 

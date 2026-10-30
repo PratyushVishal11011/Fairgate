@@ -5,7 +5,8 @@
 ## Currently implemented
 
 - **TCP event ingestion.** Accepts client connections and reads length-prefixed frames.
-- **Framed wire protocol.** Identifies event and acknowledgment frames using frame types. The maximum frame size is 5 MiB.
+- **Framed wire protocol.** Identifies event and acknowledgment frames using frame types. The maximum frame size is configurable (5 MiB by default).
+- **Protocol hardening.** Every frame the gateway cannot handle gets exactly one `invalid` ACK, so pipelining clients stay in step: an unsupported frame type or an oversized frame is skipped and the connection kept, while a malformed length prefix closes the connection. Frame bodies are buffered as they arrive, never at the size a client claims. A frame that stalls past `server.frame_timeout`, an idle connection past `server.idle_timeout`, and a client that stops reading ACKs past `server.write_timeout` are disconnected. Identifier fields are limited to 256 bytes. Each case is counted in `fairgate_protocol_errors_total`. See [Error handling](wire-protocol.md#error-handling).
 - **JSON event decoding.** Decodes events and checks required fields, including `producer_epoch`.
 - **Admission control.** Applies token-bucket limits to incoming events per producer (500 events per second with a burst of 1,000 by default), with optional per-producer rate and burst.
 - **Event idempotency.** A deduplication manager identifies each event by producer ID, producer epoch, sequence number, and index. An identical retry is acknowledged without being appended to the WAL again. Reusing an identity with a different event time, type, or payload is rejected. A new identity is recorded only after the event has been persisted to the WAL.
@@ -44,7 +45,7 @@
   - Go runtime and process metrics.
 
   Producers listed in `fairness.producers` get their own `producer` label, and all others share `other`. See [Observability](observability.md#metrics).
-- **Alerting.** Twelve Prometheus alert rules cover availability, durability, delivery, pipeline stalls, and producer behavior. An Alertmanager service with commented receiver examples is included. See [Observability](observability.md#alerting).
+- **Alerting.** Fourteen Prometheus alert rules cover availability, durability, delivery, pipeline stalls, and producer behavior. An Alertmanager service with commented receiver examples is included. See [Observability](observability.md#alerting).
 - **Profiling.** Optional `pprof` endpoints on their own listener, with configurable block and mutex sampling. Off by default. See [Observability](observability.md#profiling).
 - **Docker deployment.** A `Dockerfile` and Compose stack run FairGate with ClickHouse, Prometheus, Alertmanager, and Grafana. Prometheus scrapes the gateway and evaluates the alert rules, and Grafana provisions its Prometheus datasource and the FairGate Overview dashboard, which has panels for every pipeline stage. `install-docker-ubuntu.sh` installs Docker Engine and the Compose plugin on Ubuntu.
 - **Acknowledgments.** Sends an accepted acknowledgment after the event has been appended to the WAL and enqueued, and also for an identical retry of an event that was already accepted.

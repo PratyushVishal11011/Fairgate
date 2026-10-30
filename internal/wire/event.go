@@ -3,6 +3,7 @@ package wire
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"time"
 )
 
@@ -24,6 +25,10 @@ type Event struct {
 	Payload string `json:"payload"`
 }
 
+// MaxIdentifierLength bounds producer_id, producer_epoch, and event_type in bytes. They are kept in
+// deduplication and queue maps for every event, so an unbounded value would cost unbounded memory.
+const MaxIdentifierLength = 256
+
 func DecodeEvent(data []byte) (Event, error) {
 	var event Event
 	if err := json.Unmarshal(data, &event); err != nil {
@@ -44,6 +49,16 @@ func DecodeEvent(data []byte) (Event, error) {
 
 	if event.ProducerEpoch == "" {
 		return Event{}, errors.New("Producer epoch is required")
+	}
+
+	for _, field := range []struct{ name, value string }{
+		{"producer_id", event.ProducerId},
+		{"producer_epoch", event.ProducerEpoch},
+		{"event_type", event.EventType},
+	} {
+		if len(field.value) > MaxIdentifierLength {
+			return Event{}, fmt.Errorf("%s is longer than %d bytes", field.name, MaxIdentifierLength)
+		}
 	}
 
 	return event, nil

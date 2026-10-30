@@ -1,6 +1,8 @@
 package wire
 
 import (
+	"encoding/json"
+	"strings"
 	"testing"
 	"time"
 )
@@ -95,5 +97,19 @@ func TestDecodeEventWithoutProducerEpoch(t *testing.T) {
 	_, err := DecodeEvent(data)
 	if err == nil {
 		t.Fatal("expected an error when producer epoch is missing")
+	}
+}
+
+func TestDecodeEventRejectsOverlongIdentifiers(t *testing.T) {
+	long := strings.Repeat("x", MaxIdentifierLength+1)
+	for _, field := range []string{"producer_id", "producer_epoch", "event_type"} {
+		event := map[string]any{
+			"producer_id": "p", "producer_epoch": "1", "event_time": "2026-10-02T09:00:00Z", "event_type": "t",
+		}
+		event[field] = long
+		data, _ := json.Marshal(event)
+		if _, err := DecodeEvent(data); err == nil || !strings.Contains(err.Error(), field) {
+			t.Fatalf("%s: expected an error naming the field, got %v", field, err)
+		}
 	}
 }
