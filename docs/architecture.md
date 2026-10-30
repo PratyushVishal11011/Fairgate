@@ -92,8 +92,8 @@ flowchart LR
 
 | Package | Responsibility |
 |---|---|
-| `internal/server` | TCP listener, per-connection goroutines, connection tracking, frame handling, idempotent event handling (deduplication check, duplicate ACKs), acknowledgment delivery, server lifecycle (`RunContext`), required shipper startup and shutdown, graceful shutdown, and the HTTP health and Prometheus metrics endpoint. |
-| `internal/wire` | Frame codec (5 MiB maximum frame size), event and acknowledgment types, validation including `producer_epoch`. |
+| `internal/server` | TCP listener, per-connection goroutines, connection tracking, frame handling and protocol limits (oversized, malformed, unsupported, and stalled frames; ACK write timeouts), idempotent event handling (deduplication check, duplicate ACKs), acknowledgment delivery, server lifecycle (`RunContext`), required shipper startup and shutdown, graceful shutdown, and the HTTP health and Prometheus metrics endpoint. |
+| `internal/wire` | Frame codec with a configurable size limit, incremental body reads, and typed errors for malformed and oversized frames; event and acknowledgment types; validation including `producer_epoch` and identifier lengths. |
 | `internal/admit` | Token-bucket admission control, with optional per-producer rate and burst. |
 | `internal/overload` | Backlog-aware overload control: refuses events before the WAL append when the producer's queue, the gateway's total queue, or the shipper lag is over its limit, with hysteresis on the sampled gateway-wide signals. |
 | `internal/sched` | Per-producer bounded queues with optional per-producer capacities (including context-aware `EnqueueContext` and event identity tracking) and the weighted DRR scheduler. |

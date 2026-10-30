@@ -68,7 +68,7 @@ func TestBackloggedQueueIsRejectedBeforeWALAppend(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		handleConn(context.Background(), serverConn, logger, admission, queues, walLog, metrics, dedupManager, overloadCtl)
+		handleConn(context.Background(), serverConn, logger, admission, queues, walLog, metrics, dedupManager, overloadCtl, protocolLimits{})
 	}()
 
 	send := func(producerId string, seq uint64) wire.Ack {

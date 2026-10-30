@@ -15,7 +15,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -332,6 +331,8 @@ func runContext(ctx context.Context, cfg config.Config, logger *slog.Logger, new
 		<-overloadDone
 	}()
 
+	protocol := protocolLimitsFrom(cfg.Server)
+
 	// The handler context is canceled only if the grace period expires.
 	handlerCtx, cancelHandler := context.WithCancel(context.Background())
 	defer cancelHandler()
@@ -439,6 +440,7 @@ func runContext(ctx context.Context, cfg config.Config, logger *slog.Logger, new
 				metrics,
 				dedupManager,
 				overloadCtl,
+				protocol,
 			)
 		}(conn)
 	}
@@ -541,30 +543,22 @@ func handleConn(
 	metrics *observability.Metrics,
 	dedupManager *deduplication.Manager,
 	overloadCtl *overload.Controller,
+	limits protocolLimits,
 ) {
 	defer conn.Close()
 
 	remoteAddr := conn.RemoteAddr().String()
 	logger.Info("Client connected", "remote_addr", remoteAddr)
 
-	for {
-		frame, err := wire.ReadFrame(conn)
-		if err != nil {
-			if !errors.Is(err, io.EOF) {
-				logger.Warn("Error reading frame",
-					"remote_addr", remoteAddr,
-					"error", err,
-				)
-			}
-			return
-		}
+	acks := &ackWriter{conn: conn, timeout: limits.writeTimeout, metrics: metrics}
+	frames := newFrameReader(conn, limits, acks, logger, metrics)
 
-		if frame.Type != 1 {
-			logger.Warn("Unsupported frame type",
-				"remote_addr", remoteAddr,
-				"type", frame.Type,
-			)
-			continue
+	for {
+		//next answers and skips frames that are oversized or of another type,
+		//and reports false once the connection cannot continue.
+		frame, ok := frames.next()
+		if !ok {
+			return
 		}
 
 		received := time.Now()
@@ -572,7 +566,7 @@ func handleConn(
 		event, err := wire.DecodeEvent(frame.Payload)
 		if err != nil {
 			metrics.EventInvalid()
-			if err := sendAck(conn, wire.Ack{
+			if err := acks.send(wire.Ack{
 				Status:  ackInvalid,
 				Message: "invalid_payload",
 			}); err != nil {
@@ -584,7 +578,7 @@ func handleConn(
 
 		if !admission.Allow(event.ProducerId) {
 			metrics.EventRejected(event.ProducerId)
-			if err := sendAck(conn, wire.Ack{
+			if err := acks.send(wire.Ack{
 				ProducerId: event.ProducerId,
 				Seq:        event.Seq,
 				Idx:        event.Idx,
@@ -615,7 +609,7 @@ func handleConn(
 			var rejection *overload.Rejection
 			if errors.As(err, &rejection) {
 				metrics.EventOverloaded(event.ProducerId, rejection.Reason)
-				if err := sendAck(conn, wire.Ack{
+				if err := acks.send(wire.Ack{
 					ProducerId: event.ProducerId,
 					Seq:        event.Seq,
 					Idx:        event.Idx,
@@ -631,7 +625,7 @@ func handleConn(
 			if errors.Is(err, deduplication.ErrConflict) ||
 				errors.Is(err, deduplication.ErrInvalid) {
 				metrics.EventConflict(event.ProducerId)
-				if err := sendAck(conn, wire.Ack{
+				if err := acks.send(wire.Ack{
 					ProducerId: event.ProducerId,
 					Seq:        event.Seq,
 					Idx:        event.Idx,
@@ -648,7 +642,7 @@ func handleConn(
 			//so reject the event and keep the connection open.
 			if errors.Is(err, wal.ErrRecordTooLarge) {
 				metrics.EventInvalid()
-				if err := sendAck(conn, wire.Ack{
+				if err := acks.send(wire.Ack{
 					ProducerId: event.ProducerId,
 					Seq:        event.Seq,
 					Idx:        event.Idx,
@@ -667,7 +661,7 @@ func handleConn(
 				"seq", event.Seq,
 				"error", err,
 			)
-			if err := sendAck(conn, wire.Ack{
+			if err := acks.send(wire.Ack{
 				ProducerId: event.ProducerId,
 				Seq:        event.Seq,
 				Idx:        event.Idx,
@@ -680,7 +674,7 @@ func handleConn(
 		}
 
 		if duplicate {
-			if err := sendAck(conn, wire.Ack{
+			if err := acks.send(wire.Ack{
 				ProducerId: event.ProducerId,
 				Seq:        event.Seq,
 				Idx:        event.Idx,
@@ -711,7 +705,7 @@ func handleConn(
 			continue
 		}
 
-		if err := sendAck(conn, wire.Ack{
+		if err := acks.send(wire.Ack{
 			ProducerId: event.ProducerId,
 			Seq:        event.Seq,
 			Idx:        event.Idx,

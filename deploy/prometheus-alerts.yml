@@ -139,3 +139,12 @@ groups:
         annotations:
           summary: "Producers are sending invalid events"
           description: "{{ $labels.instance }} is rejecting more than one event per second as malformed or as a reused identity with different content. Check fairgate_producer_events_total{outcome=\"conflict\"}."
+
+      - alert: FairGateProtocolErrors
+        expr: sum by (instance) (rate(fairgate_protocol_errors_total[5m])) > 1
+        for: 10m
+        labels:
+          severity: info
+        annotations:
+          summary: "Clients are breaking the wire protocol"
+          description: "{{ $labels.instance }} is refusing more than one frame or connection per second for malformed, oversized, unsupported, truncated, or stalled frames, or for ACKs clients do not read. Check fairgate_protocol_errors_total by reason."

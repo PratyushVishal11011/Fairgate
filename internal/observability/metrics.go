@@ -43,6 +43,7 @@ type Metrics struct {
 	walErrors   prometheus.Counter
 	processed   prometheus.Counter
 	overloaded  *prometheus.CounterVec
+	protocolErr *prometheus.CounterVec
 
 	producerEvents    *prometheus.CounterVec
 	producerProcessed *prometheus.CounterVec
@@ -112,6 +113,14 @@ func NewWithOptions(opts Options) *Metrics {
 		m.overloaded.WithLabelValues(reason)
 	}
 
+	m.protocolErr = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "fairgate_protocol_errors_total",
+		Help: "Frames or connections the gateway refused or closed for breaking the wire protocol, by reason.",
+	}, []string{"reason"})
+	for _, reason := range ProtocolErrorReasons {
+		m.protocolErr.WithLabelValues(reason)
+	}
+
 	m.producerEvents = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "fairgate_producer_events_total",
 		Help: "Ingestion outcomes per producer. Producers not listed in fairness.producers are reported as \"other\".",
@@ -155,7 +164,7 @@ func NewWithOptions(opts Options) *Metrics {
 		collectors.NewGoCollector(),
 		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
 		buildInfo,
-		m.connections, m.accepted, m.rejected, m.invalid, m.duplicates, m.walErrors, m.processed, m.overloaded,
+		m.connections, m.accepted, m.rejected, m.invalid, m.duplicates, m.walErrors, m.processed, m.overloaded, m.protocolErr,
 		m.producerEvents, m.producerProcessed,
 		m.ingestDuration, m.walAppendDuration, m.walSyncDuration, m.walBatchRecords, m.walWrittenBytes, m.walRotations,
 		m.shipperBatches, m.shipperEvents, m.shipperFailures, m.shipperInsertDuration,
@@ -186,6 +195,31 @@ func (m *Metrics) producer(id string) string {
 func (m *Metrics) ConnectionOpened() { m.connections.Inc() }
 func (m *Metrics) ConnectionClosed() { m.connections.Dec() }
 func (m *Metrics) EventInvalid()     { m.invalid.Inc() }
+
+// Reasons for fairgate_protocol_errors_total.
+const (
+	//a length prefix shorter than the type and flags bytes; the connection is closed.
+	ProtocolMalformedFrame = "malformed_frame"
+	//a length prefix over server.max_frame_bytes.
+	ProtocolFrameTooLarge = "frame_too_large"
+	//a frame type other than event.
+	ProtocolUnsupportedFrameType = "unsupported_frame_type"
+	//the connection ended inside a frame.
+	ProtocolTruncatedFrame = "truncated_frame"
+	//no new frame within server.idle_timeout.
+	ProtocolIdleTimeout = "idle_timeout"
+	//the rest of a frame did not arrive within server.frame_timeout.
+	ProtocolFrameTimeout = "frame_timeout"
+	//an ACK could not be written within server.write_timeout.
+	ProtocolWriteTimeout = "write_timeout"
+)
+
+var ProtocolErrorReasons = []string{
+	ProtocolMalformedFrame, ProtocolFrameTooLarge, ProtocolUnsupportedFrameType,
+	ProtocolTruncatedFrame, ProtocolIdleTimeout, ProtocolFrameTimeout, ProtocolWriteTimeout,
+}
+
+func (m *Metrics) ProtocolError(reason string) { m.protocolErr.WithLabelValues(reason).Inc() }
 
 func (m *Metrics) EventAccepted(producer string) {
 	m.accepted.Inc()

@@ -18,10 +18,12 @@ Known limitations of the current beta:
 - Reclamation deletes whole segments older than the checkpoint segment. The checkpoint and active segments are retained, so some already shipped records remain on disk until a later checkpoint passes them, and reclaimed records are no longer available for recovery replay or inspection.
 - The reclamation guard compares segment IDs only. A checkpoint in the same segment as the durable end but with an offset past it is not rejected yet.
 - The ClickHouse integration tests are optional and run only when `CLICKHOUSE_ADDR` is set.
-- The maximum frame size and the WAL group commit collection delay are fixed in the code. The other runtime settings are set through the [config file](configuration.md).
+- The WAL record limit (1 MiB) and the WAL group commit collection delay are fixed in the code. The other runtime settings, including the maximum frame size, are set through the [config file](configuration.md).
+- An oversized frame more than four times `server.max_frame_bytes` is answered and its connection closed without reading the body. If the client is still writing that body, the close can reset the connection before the client reads the `frame_too_large` ACK.
+- `server.idle_timeout` is off by default, so idle connections are held until the client closes them. There is no limit on the number of connections.
 - Every event costs the same in scheduling, whatever its size. Weights set each producer's share of events, not of bytes.
 - Per-producer fairness overrides are read at startup. Changing a weight, limit, or queue capacity needs a restart.
-- Overload handling refuses new events but never drops events that were already accepted, and no load-shedding policy exists yet. If a queue fills despite the high-water mark (several connections of one producer appending at once), enqueueing still blocks, cancelable during shutdown.
+- Overload handling refuses new events but never drops events that were already accepted. If a queue fills despite the high-water mark (several connections of one producer appending at once), enqueueing still blocks, cancelable during shutdown.
 - The gateway-wide overload signals are sampled every `overload.sample_interval`, so a sudden burst can pass `max_queued_events` or `max_shipper_lag_bytes` by up to one interval's worth of events before refusals start.
 - Overload limits, like the other settings, are read at startup.
 - A WAL write, rotation, or sync failure is fatal: later appends are rejected until the WAL is reopened.

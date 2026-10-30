@@ -31,6 +31,7 @@ Metrics with a `producer` label give each producer listed under [`fairness.produ
 | `fairgate_events_overloaded_total{reason}` | counter | Events refused before the WAL append because a backlog was over its limit. `reason` is `queue_backlogged`, `gateway_backlogged`, or `storage_backlogged`. See [Overload handling](scheduling.md#overload-handling). |
 | `fairgate_overload_active{signal}` | gauge | `1` while a gateway-wide backlog is over its limit, else `0`. `signal` is `gateway_queue` or `storage`. |
 | `fairgate_events_invalid_total` | counter | Events rejected as malformed payloads or as identity conflicts. |
+| `fairgate_protocol_errors_total{reason}` | counter | Frames or connections refused or closed for breaking the wire protocol. `reason` is `malformed_frame`, `frame_too_large`, `unsupported_frame_type`, `truncated_frame`, `idle_timeout`, `frame_timeout`, or `write_timeout`. See [Error handling](wire-protocol.md#error-handling). |
 | `fairgate_producer_events_total{producer, outcome}` | counter | Ingestion outcome per producer. `outcome` is `accepted`, `duplicate`, `rate_limited`, `queue_backlogged`, `gateway_backlogged`, `storage_backlogged`, `conflict`, or `wal_error`. Malformed payloads have no producer and appear only in `fairgate_events_invalid_total`. |
 | `fairgate_ingest_duration_seconds` | histogram | Time from reading an event frame to sending its accepted ACK, including the WAL append. |
 
@@ -125,6 +126,7 @@ time() - fairgate_shipper_last_checkpoint_timestamp_seconds
 | `FairGateIngestLatencyHigh` | warning | p99 ingestion latency is over 250 ms for 10 minutes. |
 | `FairGateHighRejectionRate` | warning | Over 20% of events, and more than 1 per second, are rate-limited for 10 minutes. |
 | `FairGateInvalidEvents` | info | More than 1 invalid or conflicting event per second for 10 minutes. |
+| `FairGateProtocolErrors` | info | More than 1 protocol error per second, of any reason, for 10 minutes. |
 
 The thresholds are starting points. Tune them in the rules file to match your traffic, disk, and latency targets, then restart Prometheus (`sudo docker compose restart prometheus`).
 

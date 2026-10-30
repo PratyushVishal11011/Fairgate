@@ -65,6 +65,7 @@ func TestAcknowledgment(t *testing.T) {
 			metrics,
 			dedupManager,
 			nil,
+			protocolLimits{},
 		)
 	}()
 
