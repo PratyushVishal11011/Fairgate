@@ -174,6 +174,18 @@ func (q *Queues) Depth(producerId string) (depth, capacity int) {
 	return 0, q.capacity
 }
 
+// Len returns the number of events queued across all producers.
+func (q *Queues) Len() int {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+
+	total := 0
+	for _, queue := range q.queues {
+		total += len(queue)
+	}
+	return total
+}
+
 // QueueStat is a point-in-time view of one producer queue.
 type QueueStat struct {
 	ProducerId string

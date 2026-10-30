@@ -21,6 +21,9 @@ server:
   metrics_addr: ":9100"
   # Time active handlers get to finish on shutdown before their connections are closed.
   shutdown_grace_period: 5s
+  # Then time to empty the producer queues and ship every WAL record to ClickHouse before exiting.
+  # Whatever is left stays in the WAL and is shipped after the next start. 0 skips the drain.
+  drain_timeout: 10s
 
 admission:
   # Token-bucket limit per producer: refill rate in events per second, and bucket capacity.

@@ -39,6 +39,8 @@ type Server struct {
 	MetricsAddr string `yaml:"metrics_addr"`
 	//time active handlers get to finish before their connections are closed.
 	ShutdownGracePeriod time.Duration `yaml:"shutdown_grace_period"`
+	//after handlers stop, time to empty the producer queues and ship the WAL to ClickHouse; 0 skips the drain.
+	DrainTimeout time.Duration `yaml:"drain_timeout"`
 }
 
 type Admission struct {
@@ -167,6 +169,7 @@ func Default() Config {
 			ListenAddr:          ":9001",
 			MetricsAddr:         ":9100",
 			ShutdownGracePeriod: 5 * time.Second,
+			DrainTimeout:        10 * time.Second,
 		},
 		Admission: Admission{
 			Rate:  500,
@@ -305,6 +308,7 @@ func (c Config) Validate() error {
 	check(c.Server.ListenAddr != "", "server.listen_addr is required")
 	check(c.Server.MetricsAddr != "", "server.metrics_addr is required")
 	check(c.Server.ShutdownGracePeriod > 0, "server.shutdown_grace_period must be greater than zero")
+	check(c.Server.DrainTimeout >= 0, "server.drain_timeout cannot be negative")
 
 	check(c.Admission.Rate > 0, "admission.rate must be greater than zero")
 	check(c.Admission.Burst > 0, "admission.burst must be greater than zero")

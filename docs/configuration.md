@@ -26,6 +26,7 @@ Unknown keys are rejected, so a misspelled setting stops startup instead of bein
 | `server.listen_addr` | `:9001` | TCP address for event ingestion. |
 | `server.metrics_addr` | `:9100` | HTTP address for `/health` and `/metrics`. If you change it, update the Compose port mapping, healthcheck, and Prometheus target to match. |
 | `server.shutdown_grace_period` | `5s` | Time active handlers get to finish before their connections are closed. |
+| `server.drain_timeout` | `10s` | After handlers stop, time to empty the producer queues and ship every WAL record to ClickHouse before exiting. Whatever is left stays in the WAL for the next start. `0` skips the drain. See [Queue-drain confirmation](server-lifecycle.md#queue-drain-confirmation). |
 | `admission.rate` | `500` | Token-bucket refill rate per producer, in events per second. |
 | `admission.burst` | `1000` | Token-bucket capacity per producer. |
 | `queues.capacity` | `512` | Events buffered per producer. See also `overload.queue_high_water`. |

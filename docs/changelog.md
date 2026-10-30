@@ -4,6 +4,14 @@
 
 ## Recent updates
 
+### 30th October, 2026: Queue-drain confirmation on shutdown
+
+- **Shutdown drains the pipeline before stopping it.** Once handlers have exited, the gateway waits until the scheduler has emptied every producer queue, then wakes the shipper until its checkpoint reaches the durable WAL end, so a clean stop leaves every acknowledged event in ClickHouse. Previously the scheduler and shipper were canceled as soon as the handlers exited, and events accepted since the shipper's last poll waited in the WAL for the next start.
+- **Explicit result.** The outcome is logged once: `Shutdown drain complete` with the queued events processed and bytes shipped, or a `Shutdown drain incomplete` warning with each stage's outcome (`timed_out` or `stopped`) and the queued events and unshipped bytes left. Nothing is lost either way; leftovers are replayed from the WAL on the next start.
+- **Configuration.** The new `server.drain_timeout` (10 s) bounds both stages together. `0` restores the previous behavior. See [Queue-drain confirmation](server-lifecycle.md#queue-drain-confirmation).
+- **Shipper wake-up.** `Shipper.Wake` lets a shipper waiting at the WAL end check for new records at once, instead of at its next `shipper.poll_interval`.
+- **Compose.** The gateway service gets `stop_grace_period: 30s`, so Docker does not kill it during the grace period and drain.
+
 ### 30th October, 2026: Load, reconcile, and chaos tools
 
 The load generator, reconciliation, and chaos tooling now ship with FairGate as Go commands, so correctness under load and failure can be checked from a FairGate checkout alone.

@@ -26,7 +26,8 @@ Known limitations of the current beta:
 - Overload limits, like the other settings, are read at startup.
 - A WAL write, rotation, or sync failure is fatal: later appends are rejected until the WAL is reopened.
 - Startup recovery fails on an incomplete record in any non-final segment, rather than repairing it.
-- Shutdown has no explicit queue-drain confirmation, and a handler stuck in an operation that ignores connection closure and context cancellation can delay it beyond the grace period.
+- A handler stuck in an operation that ignores connection closure and context cancellation can delay shutdown beyond the grace period.
+- The shutdown drain waits for the shipper only up to `server.drain_timeout`. During a ClickHouse outage it times out and the backlog stays in the WAL for the next start; it confirms queue processing by the scheduler, not by any downstream consumer of the queues.
 - The Compose file ships with development credentials and publishes the FairGate, ClickHouse, Prometheus, Alertmanager, and Grafana ports; restrict inbound access to trusted addresses as described in [Docker deployment](deployment.md) and replace the credentials before any non-development use.
 - The Apple Container launcher script is not tracked in the repository, so the macOS instructions do not work from a clean checkout.
 - `reconcile` counts rows without `FINAL`. A background merge of the `ReplacingMergeTree` can collapse duplicate rows of one identity, so a duplicate merged away before reconciliation is not detected.

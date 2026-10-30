@@ -59,6 +59,18 @@ type Shipper struct {
 	//last committed position, read by metrics while Run advances it.
 	committedMu sync.Mutex
 	committed   wal.Position
+
+	//wake cuts short the poll wait at the durable WAL end.
+	wake chan struct{}
+}
+
+// Wake makes a shipper that is waiting at the durable WAL end check for new records now,
+// instead of at its next poll. It never blocks; the shutdown drain uses it.
+func (s *Shipper) Wake() {
+	select {
+	case s.wake <- struct{}{}:
+	default:
+	}
 }
 
 // Committed returns the last checkpoint position this shipper loaded or committed.
@@ -112,6 +124,7 @@ func New(
 		backoff:    backoff,
 		config:     config,
 		observer:   observer,
+		wake:       make(chan struct{}, 1),
 	}, nil
 }
 
@@ -175,6 +188,8 @@ func (s *Shipper) Run(ctx context.Context) error {
 			case <-ctx.Done():
 				return ctx.Err()
 			case <-poll.C:
+				continue
+			case <-s.wake:
 				continue
 			}
 		}
