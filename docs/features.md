@@ -66,4 +66,4 @@
 
 ## Planned
 
-Planned work is tracked in the [roadmap](roadmap.md). Planned capabilities are not implied to be available in this beta.
+Planned work is tracked in the [roadmap](roadmap.md). Planned capabilities are not available until a release lists them in the [changelog](changelog.md).

@@ -2,7 +2,7 @@
 
 # Roadmap
 
-The roadmap lists planned work in dependency order. Items are subject to change.
+The roadmap lists work in dependency order. All four phases are implemented as of 1.0.0. Items still marked planned in the table below are subject to change.
 
 ```mermaid
 flowchart TD

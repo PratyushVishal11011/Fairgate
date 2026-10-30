@@ -46,6 +46,17 @@ The Compose file uses development ClickHouse credentials. Replace them before ex
 
 If you already have a `fairgate.events` table from an earlier version, migrate it to the current schema before starting this version; see [Schema](storage.md#schema). Keeping the existing `clickhouse` volume does not apply schema changes.
 
+## Running more than one gateway
+
+FairGate stores each acknowledged event exactly once only while a single gateway writes each event identity (see [Delivery semantics](delivery-semantics.md)). The ClickHouse adapter checks which events are already stored before it inserts, so two gateways shipping the same event at the same moment can both insert it. To scale out or survive failures without breaking that:
+
+- **Give each producer one home gateway.** Partition producers across gateways, for example `gateway = hash(producer_id) mod N`, and keep each producer on its gateway, including when it retries. A TCP load balancer cannot do this, because `producer_id` is inside the event, so the producer (or its client library or configuration) must pick the gateway. The [overload](scheduling.md#overload-handling) and fairness limits then also apply per gateway.
+- **Get high availability by restarting, not by replicating.** Run one gateway per partition and restart it in place on the same persistent volume, which holds its WAL and checkpoint. In Kubernetes, a StatefulSet pod with a `ReadWriteOnce` volume does this: the replacement pod mounts the same volume, and the volume can be mounted by only one pod at a time, which keeps a single writer. Producers already retry while the gateway restarts. Point readiness probes at `/ready`, and let a WAL exit (status `3`, see [Write and sync failures](wal.md#write-and-sync-failures)) trigger the restart.
+- **Never share a WAL directory between running gateways.** Each gateway needs its own `wal.path` and `shipper.checkpoint_path`. Nothing locks the directory, so two gateways on one volume corrupt each other's WAL.
+- **Do not run a second active copy for the same producers.** Sending a producer to another gateway during an outage of its home gateway is exactly the case that can store an event twice.
+
+If a producer may ever reach two gateways, readers can still see each event once: `fairgate.events` is a `ReplacingMergeTree` ordered by `event_id`, so `SELECT ... FROM fairgate.events FINAL`, or `LIMIT 1 BY event_id`, returns one row per event. Both cost more than a plain read.
+
 ## Native Apple Container on macOS
 
 On an Apple silicon Mac running macOS 26 or later, the project can run with Apple's [`container` CLI](https://github.com/apple/container) without Docker Desktop. Apple's CLI runs OCI Linux images in lightweight VMs and does not provide Docker Compose, so the project uses a launcher script, `scripts/apple-container.sh`, to build and run the same four services with equivalent ports, networking, and persistent data volumes.

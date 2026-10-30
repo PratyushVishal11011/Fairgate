@@ -5,7 +5,7 @@
 FairGate accepts framed event streams over TCP and keeps producers isolated from one another. Each producer has its own admission limit and its own bounded queue, and a weighted Deficit Round Robin (DRR) scheduler gives each producer its share. When queues or delivery fall behind, new events are refused with a retryable rejection instead of piling up. Accepted events are persisted in a segmented Write-Ahead Log (WAL) before they are acknowledged. A checkpointed shipper then delivers them to ClickHouse exactly once per event identity.
 
 > [!IMPORTANT]
-> **Beta status.** FairGate is under active development. Interfaces, protocol details, configuration, and storage semantics may change. See [Limitations](docs/limitations.md) before relying on it.
+> **Exactly-once delivery needs one gateway per producer.** Each producer's events must go through a single gateway at a time. If two gateways receive the same producer, for example during a failover to a second running copy, both can ship the same event and ClickHouse can store it twice. Give each producer one home gateway, for example by hashing `producer_id`, and get high availability by restarting that gateway on the same WAL volume rather than by running a second copy. Never let two running gateways share a WAL directory. See [Running more than one gateway](docs/deployment.md#running-more-than-one-gateway).
 
 ## Highlights
 
@@ -85,6 +85,10 @@ overload:
 
 See [Configuration](docs/configuration.md) for all settings and environment overrides.
 
+## Versioning
+
+FairGate follows [Semantic Versioning](https://semver.org/) from 1.0.0. Within a major version, the wire protocol (under its [compatibility rules](docs/wire-protocol.md#compatibility-rules)), the configuration keys, the WAL format, and the metric names stay backward compatible. Changes are listed in the [changelog](docs/changelog.md).
+
 ## Documentation
 
 | Document | Covers |
@@ -104,7 +108,7 @@ See [Configuration](docs/configuration.md) for all settings and environment over
 | [Server lifecycle and graceful shutdown](docs/server-lifecycle.md) | Contexts, shutdown sequence, embedding. |
 | [Features](docs/features.md) | Everything currently implemented. |
 | [Development](docs/development.md) | Project structure, building, testing. |
-| [Limitations](docs/limitations.md) | Known limitations of the beta. |
+| [Limitations](docs/limitations.md) | Known limitations. |
 | [Security](docs/SECURITY.md) | Trust model, safe deployment, reporting a vulnerability. |
 | [Roadmap](docs/roadmap.md) | Implemented and planned work. |
 | [Changelog](docs/changelog.md) | Dated updates. |

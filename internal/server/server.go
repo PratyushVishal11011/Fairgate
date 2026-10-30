@@ -25,7 +25,7 @@ import (
 )
 
 // Version is reported in logs and by fairgate_build_info.
-const Version = "0.1.0"
+const Version = "1.0.0"
 
 const (
 	ackAccepted = "accepted"
