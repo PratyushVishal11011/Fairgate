@@ -10,6 +10,7 @@ FairGate/
 │   ├── admit/       # Admission control
 │   ├── config/      # Config file, environment overrides, validation
 │   ├── observability/ # Prometheus metrics, collectors, pprof handler
+│   ├── overload/    # Backlog-aware overload control before the WAL append
 │   ├── sched/       # Producer queues and DRR scheduler
 │   ├── server/      # TCP listener, connection handling, shipper lifecycle
 │   ├── shipper/     # WAL reader loop, checkpoints, retry/backoff, reclamation trigger

@@ -28,8 +28,10 @@ Metrics with a `producer` label give each producer listed under [`fairness.produ
 | `fairgate_events_accepted_total` | counter | Events acknowledged as accepted, including identical retries. |
 | `fairgate_events_duplicate_total` | counter | Identical retries acknowledged without a second WAL append. |
 | `fairgate_events_rejected_total` | counter | Events rejected by admission control. |
+| `fairgate_events_overloaded_total{reason}` | counter | Events refused before the WAL append because a backlog was over its limit. `reason` is `queue_backlogged`, `gateway_backlogged`, or `storage_backlogged`. See [Overload handling](scheduling.md#overload-handling). |
+| `fairgate_overload_active{signal}` | gauge | `1` while a gateway-wide backlog is over its limit, else `0`. `signal` is `gateway_queue` or `storage`. |
 | `fairgate_events_invalid_total` | counter | Events rejected as malformed payloads or as identity conflicts. |
-| `fairgate_producer_events_total{producer, outcome}` | counter | Ingestion outcome per producer. `outcome` is `accepted`, `duplicate`, `rate_limited`, `conflict`, or `wal_error`. Malformed payloads have no producer and appear only in `fairgate_events_invalid_total`. |
+| `fairgate_producer_events_total{producer, outcome}` | counter | Ingestion outcome per producer. `outcome` is `accepted`, `duplicate`, `rate_limited`, `queue_backlogged`, `gateway_backlogged`, `storage_backlogged`, `conflict`, or `wal_error`. Malformed payloads have no producer and appear only in `fairgate_events_invalid_total`. |
 | `fairgate_ingest_duration_seconds` | histogram | Time from reading an event frame to sending its accepted ACK, including the WAL append. |
 
 ### Write-Ahead Log
@@ -118,6 +120,7 @@ time() - fairgate_shipper_last_checkpoint_timestamp_seconds
 | `FairGateWALDiskHigh` | warning | WAL segments use more than 1 GiB for 15 minutes. |
 | `FairGateShipperInsertsFailing` | warning | The current batch has failed 5 or more times in a row, for 2 minutes. |
 | `FairGateShipperLagHigh` | warning | Delivery lag is over 256 MiB for 10 minutes. |
+| `FairGateOverloaded` | warning | A gateway-wide backlog has been over its overload limit, refusing new events, for 2 minutes. |
 | `FairGateQueueSaturated` | warning | The fullest producer queue is over 90% for 2 minutes. |
 | `FairGateIngestLatencyHigh` | warning | p99 ingestion latency is over 250 ms for 10 minutes. |
 | `FairGateHighRejectionRate` | warning | Over 20% of events, and more than 1 per second, are rate-limited for 10 minutes. |

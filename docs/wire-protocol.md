@@ -45,6 +45,8 @@ The current frame types are:
 
 An ACK contains the producer ID, sequence number, event index, status, and an optional message. An `accepted` ACK indicates that the event was written to the WAL and enqueued, or that it is an identical retry of an event that was already accepted. It does **not** indicate that a downstream database has stored or queried the event.
 
+A `rejected` ACK means the gateway refused the event and did not persist it, and the producer should retry it after backing off. Its message says why: `rate_limited` for admission control, or `queue_backlogged`, `gateway_backlogged`, or `storage_backlogged` when a backlog is over its limit (see [Overload handling](scheduling.md#overload-handling)).
+
 An event whose JSON encoding exceeds the WAL record limit of 1 MiB is rejected with status `invalid` and message `payload_too_large`, even though its frame is within the 5 MiB frame limit. The connection stays open.
 
 Refer to the `wire` package for the current protocol implementation and exact encoding behavior.

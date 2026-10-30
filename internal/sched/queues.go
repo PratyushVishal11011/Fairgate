@@ -160,6 +160,20 @@ func (q *Queues) ProducerIds() []string {
 	return ids
 }
 
+// Depth returns how many events producerId has queued and its queue capacity, without creating a queue.
+func (q *Queues) Depth(producerId string) (depth, capacity int) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+
+	if queue, exists := q.queues[producerId]; exists {
+		return len(queue), cap(queue)
+	}
+	if producerCapacity, ok := q.capacities[producerId]; ok {
+		return 0, producerCapacity
+	}
+	return 0, q.capacity
+}
+
 // QueueStat is a point-in-time view of one producer queue.
 type QueueStat struct {
 	ProducerId string

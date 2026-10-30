@@ -24,6 +24,7 @@ type Config struct {
 	Queues     Queues     `yaml:"queues"`
 	Scheduler  Scheduler  `yaml:"scheduler"`
 	Fairness   Fairness   `yaml:"fairness"`
+	Overload   Overload   `yaml:"overload"`
 	WAL        WAL        `yaml:"wal"`
 	Shipper    Shipper    `yaml:"shipper"`
 	ClickHouse ClickHouse `yaml:"clickhouse"`
@@ -98,6 +99,21 @@ func (f Fairness) QueueCapacities() map[string]int {
 	return capacities
 }
 
+// Overload sets the backlogs at which new events are refused with a retryable rejection
+// before they are appended to the WAL. A zero limit disables that check.
+type Overload struct {
+	//refuse a producer's events once its queue holds this fraction of its capacity, from 0 to 1.
+	QueueHighWater float64 `yaml:"queue_high_water"`
+	//events queued across all producers before producers above their weighted share are refused.
+	MaxQueuedEvents int `yaml:"max_queued_events"`
+	//durable WAL bytes the shipper may trail by before every new event is refused.
+	MaxShipperLagBytes int64 `yaml:"max_shipper_lag_bytes"`
+	//a gateway-wide limit clears once its backlog falls below this fraction of it.
+	ResumeRatio float64 `yaml:"resume_ratio"`
+	//how often the gateway-wide backlogs are sampled.
+	SampleInterval time.Duration `yaml:"sample_interval"`
+}
+
 type WAL struct {
 	//path of the first WAL segment; later segments are created next to it.
 	Path string `yaml:"path"`
@@ -164,6 +180,13 @@ func Default() Config {
 		},
 		Fairness: Fairness{
 			DefaultWeight: 1,
+		},
+		Overload: Overload{
+			QueueHighWater:     0.9,
+			MaxQueuedEvents:    100000,
+			MaxShipperLagBytes: 1 << 30,
+			ResumeRatio:        0.8,
+			SampleInterval:     100 * time.Millisecond,
 		},
 		WAL: WAL{
 			Path:        "data/fairgate.wal",
@@ -299,6 +322,13 @@ func (c Config) Validate() error {
 		check(producer.Burst >= 0, "%s.burst cannot be negative", prefix)
 		check(producer.QueueCapacity >= 0, "%s.queue_capacity cannot be negative", prefix)
 	}
+
+	overload := c.Overload
+	check(overload.QueueHighWater >= 0 && overload.QueueHighWater <= 1, "overload.queue_high_water must be between 0 and 1")
+	check(overload.MaxQueuedEvents >= 0, "overload.max_queued_events cannot be negative")
+	check(overload.MaxShipperLagBytes >= 0, "overload.max_shipper_lag_bytes cannot be negative")
+	check(overload.ResumeRatio > 0 && overload.ResumeRatio <= 1, "overload.resume_ratio must be greater than 0 and at most 1")
+	check(overload.SampleInterval > 0, "overload.sample_interval must be greater than zero")
 
 	check(c.WAL.Path != "", "wal.path is required")
 	check(c.WAL.SegmentSize > 0, "wal.segment_size must be greater than zero")

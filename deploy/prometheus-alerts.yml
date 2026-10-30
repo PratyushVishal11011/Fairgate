@@ -95,7 +95,16 @@ groups:
           severity: warning
         annotations:
           summary: "A FairGate producer queue is over 90% full"
-          description: "The fullest producer queue on {{ $labels.instance }} is at {{ $value | humanizePercentage }}. Producers whose queue is full are held back (backpressure). Check fairgate_producer_queue_depth_events to see which."
+          description: "The fullest producer queue on {{ $labels.instance }} is at {{ $value | humanizePercentage }}. Producers whose queue reaches overload.queue_high_water get queue_backlogged rejections. Check fairgate_producer_queue_depth_events to see which."
+
+      - alert: FairGateOverloaded
+        expr: max by (instance, signal) (fairgate_overload_active) == 1
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "FairGate is refusing events: {{ $labels.signal }} backlog over its limit"
+          description: "{{ $labels.instance }} is rejecting new events with a retryable ACK because the {{ $labels.signal }} backlog is over its overload limit. For storage, delivery to ClickHouse is behind (see fairgate_shipper_lag_bytes); for gateway_queue, producer queues are full (see fairgate_producer_queue_depth_events). Check fairgate_events_overloaded_total by reason."
 
       - alert: FairGateIngestLatencyHigh
         expr: histogram_quantile(0.99, sum by (instance, le) (rate(fairgate_ingest_duration_seconds_bucket[5m]))) > 0.25
