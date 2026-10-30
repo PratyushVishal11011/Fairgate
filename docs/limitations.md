@@ -38,6 +38,7 @@ Known limitations of the current beta:
 - `loadgen` always sends `idx` 0, and a count-bound run without `-duration` keeps redialling a gateway that never comes up until it is stopped.
 - The fault proxy delays, fragments, and resets per chunk read from a socket, not per frame or per TCP segment, and it cannot drop or reorder bytes within a connection.
 - Chaos scenario `exec` steps run shell commands with the caller's permissions, and the shipped scenarios assume the container names from `docker-compose.yml`.
+- `server.allow_legacy_clients` is `true` by default, so clients that never send a hello are still accepted as protocol version 0.
 - Per-producer metrics label only the producers listed in `fairness.producers`; all other producers share the `other` series.
 - Alertmanager sends no notifications until a receiver is configured, and the alert thresholds are generic starting points.
 - There is no metric for time spent waiting in the scheduler queue, or for events the ClickHouse adapter skipped as already stored.

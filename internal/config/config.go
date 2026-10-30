@@ -56,6 +56,8 @@ type Server struct {
 	FrameTimeout time.Duration `yaml:"frame_timeout"`
 	//time to write one ACK before the connection is closed.
 	WriteTimeout time.Duration `yaml:"write_timeout"`
+	//accept clients that send events without a hello, speaking the original unversioned protocol.
+	AllowLegacyClients bool `yaml:"allow_legacy_clients"`
 }
 
 type Admission struct {
@@ -192,6 +194,7 @@ func Default() Config {
 			MaxFrameBytes:       5 << 20,
 			FrameTimeout:        30 * time.Second,
 			WriteTimeout:        10 * time.Second,
+			AllowLegacyClients:  true,
 		},
 		Admission: Admission{
 			Rate:  500,

@@ -34,6 +34,9 @@ server:
   frame_timeout: 30s
   # Time to write one ACK; a client that stops reading ACKs is disconnected.
   write_timeout: 10s
+  # Accept clients that send events without first sending a hello frame (protocol version 0,
+  # the original unversioned protocol). Set false once every producer negotiates a version.
+  allow_legacy_clients: true
 
 admission:
   # Token-bucket limit per producer: refill rate in events per second, and bucket capacity.
