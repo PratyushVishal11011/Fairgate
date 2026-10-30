@@ -102,6 +102,13 @@ func startAcker(t *testing.T) string {
 					if err != nil {
 						return
 					}
+					if frame.Type == wire.FrameTypeHello {
+						payload, _ := json.Marshal(wire.Welcome{Version: wire.ProtocolVersion})
+						if wire.WriteFrame(conn, wire.Frame{Type: wire.FrameTypeWelcome, Payload: payload}) != nil {
+							return
+						}
+						continue
+					}
 					event, err := wire.DecodeEvent(frame.Payload)
 					if err != nil {
 						return

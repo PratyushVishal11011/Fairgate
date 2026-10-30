@@ -5,6 +5,7 @@ import (
 	"FairGate/internal/observability"
 	"FairGate/internal/wire"
 	"bufio"
+	"encoding/json"
 	"errors"
 	"io"
 	"log/slog"
@@ -18,7 +19,12 @@ const (
 	ackMalformedFrame       = "malformed_frame"
 	ackFrameTooLarge        = "frame_too_large"
 	ackUnsupportedFrameType = "unsupported_frame_type"
+	//an event before any hello while server.allow_legacy_clients is false.
+	ackHelloRequired = "hello_required"
 )
+
+// versionUnset marks a connection whose protocol version is not settled yet.
+const versionUnset = -1
 
 // An oversized frame up to this many times server.max_frame_bytes is read and discarded so the
 // connection stays usable. A larger one is answered and the connection closed, rather than spending
@@ -35,6 +41,8 @@ type protocolLimits struct {
 	frameTimeout time.Duration
 	//time to write one ACK; 0 waits indefinitely.
 	writeTimeout time.Duration
+	//refuse clients that send events without a hello first.
+	requireHello bool
 }
 
 func protocolLimitsFrom(cfg config.Server) protocolLimits {
@@ -43,6 +51,7 @@ func protocolLimitsFrom(cfg config.Server) protocolLimits {
 		idleTimeout:   cfg.IdleTimeout,
 		frameTimeout:  cfg.FrameTimeout,
 		writeTimeout:  cfg.WriteTimeout,
+		requireHello:  !cfg.AllowLegacyClients,
 	}
 }
 
@@ -61,10 +70,26 @@ type ackWriter struct {
 }
 
 func (a *ackWriter) send(ack wire.Ack) error {
+	payload, err := json.Marshal(ack)
+	if err != nil {
+		return err
+	}
+	return a.write(wire.FrameTypeAck, payload)
+}
+
+func (a *ackWriter) sendWelcome(welcome wire.Welcome) error {
+	payload, err := json.Marshal(welcome)
+	if err != nil {
+		return err
+	}
+	return a.write(wire.FrameTypeWelcome, payload)
+}
+
+func (a *ackWriter) write(frameType uint8, payload []byte) error {
 	if a.timeout > 0 {
 		_ = a.conn.SetWriteDeadline(time.Now().Add(a.timeout))
 	}
-	err := sendAck(a.conn, ack)
+	err := wire.WriteFrame(a.conn, wire.Frame{Type: frameType, Payload: payload})
 	if isTimeout(err) {
 		a.metrics.ProtocolError(observability.ProtocolWriteTimeout)
 	}
@@ -82,6 +107,8 @@ type frameReader struct {
 	logger     *slog.Logger
 	metrics    *observability.Metrics
 	remoteAddr string
+	//negotiated protocol version, LegacyProtocolVersion, or versionUnset before the first frame.
+	version int
 }
 
 func newFrameReader(conn net.Conn, limits protocolLimits, acks *ackWriter, logger *slog.Logger, metrics *observability.Metrics) *frameReader {
@@ -93,6 +120,7 @@ func newFrameReader(conn net.Conn, limits protocolLimits, acks *ackWriter, logge
 		logger:     logger,
 		metrics:    metrics,
 		remoteAddr: conn.RemoteAddr().String(),
+		version:    versionUnset,
 	}
 }
 
@@ -161,7 +189,30 @@ func (f *frameReader) next() (wire.Frame, bool) {
 			return wire.Frame{}, false
 		}
 
-		if frame.Type != wire.FrameTypeEvent {
+		switch frame.Type {
+		case wire.FrameTypeHello:
+			if !f.handshake(frame.Payload) {
+				return wire.Frame{}, false
+			}
+			continue
+
+		case wire.FrameTypeEvent:
+			if f.version == versionUnset {
+				//a client that skips the hello speaks the original protocol.
+				if f.limits.requireHello {
+					f.metrics.ProtocolError(observability.ProtocolHelloRequired)
+					f.logger.Warn("Closing connection: events sent without a hello",
+						"remote_addr", f.remoteAddr,
+					)
+					_ = f.acks.send(wire.Ack{Status: ackInvalid, Message: ackHelloRequired})
+					return wire.Frame{}, false
+				}
+				f.version = wire.LegacyProtocolVersion
+				f.metrics.ProtocolConnection(f.version)
+			}
+			return frame, true
+
+		default:
 			f.metrics.ProtocolError(observability.ProtocolUnsupportedFrameType)
 			f.logger.Warn("Unsupported frame type",
 				"remote_addr", f.remoteAddr,
@@ -170,11 +221,50 @@ func (f *frameReader) next() (wire.Frame, bool) {
 			if err := f.acks.send(wire.Ack{Status: ackInvalid, Message: ackUnsupportedFrameType}); err != nil {
 				return wire.Frame{}, false
 			}
-			continue
 		}
-
-		return frame, true
 	}
+}
+
+// handshake answers a hello with a welcome. It reports false when the connection must close:
+// the hello is invalid, shares no version with the server, or comes after the version was settled.
+func (f *frameReader) handshake(payload []byte) bool {
+	refuse := func(reason string, welcome wire.Welcome, attrs ...any) bool {
+		f.metrics.ProtocolError(reason)
+		f.logger.Warn("Closing connection: hello refused",
+			append([]any{"remote_addr", f.remoteAddr, "reason", reason}, attrs...)...)
+		_ = f.acks.sendWelcome(welcome)
+		return false
+	}
+
+	if f.version != versionUnset {
+		return refuse(observability.ProtocolUnexpectedHello, wire.Welcome{Error: wire.WelcomeUnexpectedHello})
+	}
+	hello, err := wire.DecodeHello(payload)
+	if err != nil {
+		return refuse(observability.ProtocolInvalidHello, wire.Welcome{Error: wire.WelcomeInvalidHello}, "error", err)
+	}
+	version, ok := wire.Negotiate(hello, wire.MinProtocolVersion, wire.ProtocolVersion)
+	if !ok {
+		return refuse(observability.ProtocolUnsupportedVersion, wire.Welcome{
+			Error:               wire.WelcomeUnsupportedVersion,
+			SupportedMinVersion: wire.MinProtocolVersion,
+			SupportedMaxVersion: wire.ProtocolVersion,
+		}, "client", hello.Client, "client_min_version", hello.MinVersion, "client_max_version", hello.MaxVersion)
+	}
+
+	f.version = version
+	f.metrics.ProtocolConnection(version)
+	f.logger.Debug("Protocol negotiated",
+		"remote_addr", f.remoteAddr,
+		"client", hello.Client,
+		"version", version,
+	)
+	return f.acks.sendWelcome(wire.Welcome{
+		Version:            version,
+		Server:             "fairgate/" + Version,
+		MaxFrameBytes:      f.limits.maxFrame(),
+		MaxIdentifierBytes: wire.MaxIdentifierLength,
+	}) == nil
 }
 
 func (f *frameReader) setReadDeadline(timeout time.Duration) {

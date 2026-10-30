@@ -189,18 +189,21 @@ type countingWaker struct{ wakes atomic.Int64 }
 
 func (w *countingWaker) Wake() { w.wakes.Add(1) }
 
-// startSlowScheduler runs a DRR scheduler that takes perEvent to process each event.
-func startSlowScheduler(queues *sched.Queues, perEvent time.Duration) (context.CancelFunc, <-chan struct{}) {
+// startSlowScheduler runs a DRR scheduler that takes perEvent to process each event,
+// and counts the events it has finished processing.
+func startSlowScheduler(queues *sched.Queues, perEvent time.Duration) (context.CancelFunc, <-chan struct{}, *atomic.Int64) {
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
+	processed := &atomic.Int64{}
 	go func() {
 		defer close(done)
 		_ = sched.NewDRRScheduler(1).Run(ctx, queues, func(wire.Event) error {
 			time.Sleep(perEvent)
+			processed.Add(1)
 			return nil
 		})
 	}()
-	return cancel, done
+	return cancel, done, processed
 }
 
 func fillQueues(t *testing.T, n int) *sched.Queues {
@@ -217,7 +220,7 @@ func fillQueues(t *testing.T, n int) *sched.Queues {
 
 func TestDrainPipelineWaitsForQueuesThenShipper(t *testing.T) {
 	queues := fillQueues(t, 20)
-	cancelScheduler, schedulerDone := startSlowScheduler(queues, 5*time.Millisecond)
+	cancelScheduler, schedulerDone, processed := startSlowScheduler(queues, 5*time.Millisecond)
 	defer cancelScheduler()
 
 	waker := &countingWaker{}
@@ -233,8 +236,13 @@ func TestDrainPipelineWaitsForQueuesThenShipper(t *testing.T) {
 	}
 
 	report := drainPipeline(5*time.Second, queues, schedulerDone, cancelScheduler, waker, shipperDone, shipperLag)
-	if !report.complete() || report.queuedAtStart != 20 || report.queuedLeft != 0 {
-		t.Fatalf("expected a complete drain of 20 queued events, got %+v", report)
+	//the scheduler is already running, so it may have taken an event or two before the drain looked.
+	if !report.complete() || report.queuedAtStart < 1 || report.queuedAtStart > 20 || report.queuedLeft != 0 {
+		t.Fatalf("expected a complete drain of the queued events, got %+v", report)
+	}
+	//the drain stops the scheduler only after it has processed every event.
+	if got := processed.Load(); got != 20 {
+		t.Fatalf("scheduler processed %d of 20 events before the drain stopped it", got)
 	}
 	if report.unshippedAtStart != 4096 || report.unshippedLeft != 0 || waker.wakes.Load() < 3 {
 		t.Fatalf("expected the shipper to be woken until it caught up, got %+v (wakes %d)", report, waker.wakes.Load())
@@ -248,7 +256,7 @@ func TestDrainPipelineWaitsForQueuesThenShipper(t *testing.T) {
 
 func TestDrainPipelineReportsWhatIsLeftAtTimeout(t *testing.T) {
 	queues := fillQueues(t, 100)
-	cancelScheduler, schedulerDone := startSlowScheduler(queues, 20*time.Millisecond)
+	cancelScheduler, schedulerDone, _ := startSlowScheduler(queues, 20*time.Millisecond)
 	defer cancelScheduler()
 
 	start := time.Now()

@@ -30,6 +30,7 @@ Unknown keys are rejected, so a misspelled setting stops startup instead of bein
 | `server.idle_timeout` | `0s` | Close a connection that starts no new frame for this long. `0` keeps idle connections open. |
 | `server.frame_timeout` | `30s` | Time to receive the rest of a frame once its first byte arrives. A stalled frame closes the connection. |
 | `server.write_timeout` | `10s` | Time to write one ACK. A client that stops reading ACKs is disconnected. |
+| `server.allow_legacy_clients` | `true` | Accept clients that send events without a hello first (protocol version 0). Set `false` once every producer negotiates a version; their events are then answered `invalid` / `hello_required`. See [Handshake and versioning](wire-protocol.md#handshake-and-versioning). |
 | `server.drain_timeout` | `10s` | After handlers stop, time to empty the producer queues and ship every WAL record to ClickHouse before exiting. Whatever is left stays in the WAL for the next start. `0` skips the drain. See [Queue-drain confirmation](server-lifecycle.md#queue-drain-confirmation). |
 | `admission.rate` | `500` | Token-bucket refill rate per producer, in events per second. |
 | `admission.burst` | `1000` | Token-bucket capacity per producer. |

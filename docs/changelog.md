@@ -4,6 +4,15 @@
 
 ## Recent updates
 
+### 30th October, 2026: Wire protocol versioning
+
+- **Handshake.** A connection now opens with a hello frame (type `3`) carrying the range of protocol versions the client speaks. The server answers with a welcome frame (type `4`) naming the highest version both speak, plus its `max_frame_bytes` and `max_identifier_bytes`. A hello with no version in common gets a welcome with `unsupported_version` and the range the server speaks, then the connection closes.
+- **Version 1.** The first negotiated version carries events and ACKs exactly as before, so moving to it only means sending the hello.
+- **Older clients keep working.** A connection whose first frame is an event is treated as version 0. Set the new `server.allow_legacy_clients` to `false` to refuse them with `invalid` / `hello_required`.
+- **Compatibility rules.** The 6-byte frame header is frozen, both sides ignore unknown JSON fields, anything else needs a new version, and each release speaks the current and previous versions. See [Handshake and versioning](wire-protocol.md#handshake-and-versioning).
+- **Client helper.** `wire.Handshake` performs the handshake. The load generator uses it on every connection; `-legacy` skips it.
+- **Metrics.** `fairgate_protocol_connections_total{version}` counts connections per version, and `fairgate_protocol_errors_total` gains `hello_required`, `invalid_hello`, `unsupported_version`, and `unexpected_hello`.
+
 ### 30th October, 2026: WAL failures no longer need manual recovery
 
 - **A failed fsync is never retried on the same file.** After a failed `fsync`, Linux can drop unwritten pages and report a later `fsync` as successful. The writer now cuts the failed segment back to its durable end, writes the unacknowledged batch to a fresh segment, and acknowledges it only once that is synced. Previously any write, rotation, or sync failure made the WAL reject every later append until a restart.

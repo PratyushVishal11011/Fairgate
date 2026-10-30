@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net/http"
 	"runtime"
+	"strconv"
 	"sync/atomic"
 	"time"
 
@@ -11,6 +12,7 @@ import (
 	"FairGate/internal/sched"
 	"FairGate/internal/shipper"
 	"FairGate/internal/wal"
+	"FairGate/internal/wire"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/collectors"
@@ -36,17 +38,18 @@ type Metrics struct {
 	registry *prometheus.Registry
 	labelled map[string]struct{}
 
-	connections prometheus.Gauge
-	accepted    prometheus.Counter
-	rejected    prometheus.Counter
-	invalid     prometheus.Counter
-	duplicates  prometheus.Counter
-	walErrors   prometheus.Counter
-	processed   prometheus.Counter
-	overloaded  *prometheus.CounterVec
-	protocolErr *prometheus.CounterVec
-	walDamage   *prometheus.GaugeVec
-	readiness   atomic.Pointer[func() error]
+	connections   prometheus.Gauge
+	accepted      prometheus.Counter
+	rejected      prometheus.Counter
+	invalid       prometheus.Counter
+	duplicates    prometheus.Counter
+	walErrors     prometheus.Counter
+	processed     prometheus.Counter
+	overloaded    *prometheus.CounterVec
+	protocolErr   *prometheus.CounterVec
+	walDamage     *prometheus.GaugeVec
+	protocolConns *prometheus.CounterVec
+	readiness     atomic.Pointer[func() error]
 
 	producerEvents    *prometheus.CounterVec
 	producerProcessed *prometheus.CounterVec
@@ -124,6 +127,15 @@ func NewWithOptions(opts Options) *Metrics {
 		m.protocolErr.WithLabelValues(reason)
 	}
 
+	m.protocolConns = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "fairgate_protocol_connections_total",
+		Help: "Connections by negotiated wire protocol version; \"legacy\" counts clients that send events without a hello.",
+	}, []string{"version"})
+	m.protocolConns.WithLabelValues(protocolLabel(wire.LegacyProtocolVersion))
+	for version := wire.MinProtocolVersion; version <= wire.ProtocolVersion; version++ {
+		m.protocolConns.WithLabelValues(protocolLabel(version))
+	}
+
 	m.walDamage = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "fairgate_wal_recovery_damage_regions",
 		Help: "Damaged WAL regions startup recovery found, by what it did: truncated_tail, skipped_shipped, or quarantined.",
@@ -175,7 +187,7 @@ func NewWithOptions(opts Options) *Metrics {
 		collectors.NewGoCollector(),
 		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
 		buildInfo,
-		m.connections, m.accepted, m.rejected, m.invalid, m.duplicates, m.walErrors, m.processed, m.overloaded, m.protocolErr, m.walDamage,
+		m.connections, m.accepted, m.rejected, m.invalid, m.duplicates, m.walErrors, m.processed, m.overloaded, m.protocolErr, m.walDamage, m.protocolConns,
 		m.producerEvents, m.producerProcessed,
 		m.ingestDuration, m.walAppendDuration, m.walSyncDuration, m.walBatchRecords, m.walWrittenBytes, m.walRotations,
 		m.shipperBatches, m.shipperEvents, m.shipperFailures, m.shipperInsertDuration,
@@ -236,11 +248,32 @@ const (
 	ProtocolFrameTimeout = "frame_timeout"
 	//an ACK could not be written within server.write_timeout.
 	ProtocolWriteTimeout = "write_timeout"
+	//an event before any hello while server.allow_legacy_clients is false.
+	ProtocolHelloRequired = "hello_required"
+	//a hello that does not parse or offers an impossible version range.
+	ProtocolInvalidHello = "invalid_hello"
+	//a hello sharing no protocol version with the server.
+	ProtocolUnsupportedVersion = "unsupported_version"
+	//a second hello on a connection.
+	ProtocolUnexpectedHello = "unexpected_hello"
 )
 
 var ProtocolErrorReasons = []string{
 	ProtocolMalformedFrame, ProtocolFrameTooLarge, ProtocolUnsupportedFrameType,
 	ProtocolTruncatedFrame, ProtocolIdleTimeout, ProtocolFrameTimeout, ProtocolWriteTimeout,
+	ProtocolHelloRequired, ProtocolInvalidHello, ProtocolUnsupportedVersion, ProtocolUnexpectedHello,
+}
+
+// ProtocolConnection counts a connection whose protocol version was settled.
+func (m *Metrics) ProtocolConnection(version int) {
+	m.protocolConns.WithLabelValues(protocolLabel(version)).Inc()
+}
+
+func protocolLabel(version int) string {
+	if version == wire.LegacyProtocolVersion {
+		return "legacy"
+	}
+	return strconv.Itoa(version)
 }
 
 func (m *Metrics) ProtocolError(reason string) { m.protocolErr.WithLabelValues(reason).Inc() }

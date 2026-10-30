@@ -36,6 +36,7 @@ func main() {
 	flag.DurationVar(&cfg.MaxBackoff, "max-backoff", cfg.MaxBackoff, "cap on retry backoff")
 	flag.DurationVar(&cfg.DrainTimeout, "drain-timeout", cfg.DrainTimeout, "time after sending stops to finish outstanding events")
 	flag.Int64Var(&cfg.Seed, "seed", cfg.Seed, "random seed for jitter and malformed frames")
+	flag.BoolVar(&cfg.Legacy, "legacy", cfg.Legacy, "skip the protocol handshake, like clients that predate protocol versioning")
 	out := flag.String("out", "", "results directory (default: benchmarks/loadgen-<timestamp>)")
 	flag.Parse()
 

@@ -27,6 +27,7 @@ type fakeGateway struct {
 
 	mu     sync.Mutex
 	frames int
+	hellos int
 	stored map[eventKey]wire.Event
 }
 
@@ -56,6 +57,16 @@ func (g *fakeGateway) serve(conn net.Conn) {
 		frame, err := wire.ReadFrame(conn)
 		if err != nil {
 			return
+		}
+		if frame.Type == wire.FrameTypeHello {
+			g.mu.Lock()
+			g.hellos++
+			g.mu.Unlock()
+			payload, _ := json.Marshal(wire.Welcome{Version: wire.ProtocolVersion})
+			if wire.WriteFrame(conn, wire.Frame{Type: wire.FrameTypeWelcome, Payload: payload}) != nil {
+				return
+			}
+			continue
 		}
 		event, err := wire.DecodeEvent(frame.Payload)
 		if err != nil {
@@ -291,5 +302,29 @@ func TestPayloadIsDeterministicAndPadded(t *testing.T) {
 	}
 	if short := Payload("p-1", "e", 7, 0); short != "p-1/e/7" {
 		t.Fatalf("unpadded payload %q", short)
+	}
+}
+
+func TestRunHandshakesUnlessLegacy(t *testing.T) {
+	for _, legacy := range []bool{false, true} {
+		gateway := startFakeGateway(t, 0, 0)
+		cfg := testConfig(gateway.listener.Addr().String())
+		cfg.Producers = 3
+		cfg.Events = 5
+		cfg.Legacy = legacy
+
+		result, err := Run(context.Background(), cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if s := result.Summary(); s.Totals.Accepted != 15 {
+			t.Fatalf("legacy=%v: expected all events accepted, got %+v", legacy, s.Totals)
+		}
+		gateway.mu.Lock()
+		hellos := gateway.hellos
+		gateway.mu.Unlock()
+		if legacy && hellos != 0 || !legacy && hellos != cfg.Producers {
+			t.Fatalf("legacy=%v: gateway saw %d hellos", legacy, hellos)
+		}
 	}
 }

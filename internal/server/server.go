@@ -12,7 +12,6 @@ import (
 	"FairGate/internal/wal"
 	"FairGate/internal/wire"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -36,18 +35,6 @@ const (
 
 	ackStorageUnavailable = "storage_unavailable" // the WAL cannot make events durable right now
 )
-
-func sendAck(conn net.Conn, ack wire.Ack) error {
-	payload, err := json.Marshal(ack)
-	if err != nil {
-		return err
-	}
-	return wire.WriteFrame(conn, wire.Frame{
-		Type:    wire.FrameTypeAck,
-		Flags:   0,
-		Payload: payload,
-	})
-}
 
 func Run(addr string, logger *slog.Logger) error {
 	return RunContext(context.Background(), addr, logger)
