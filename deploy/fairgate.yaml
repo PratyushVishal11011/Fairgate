@@ -28,7 +28,7 @@ admission:
   burst: 1000
 
 queues:
-  # Events buffered per producer before enqueueing blocks and applies backpressure.
+  # Events buffered per producer. New events are refused once a queue reaches overload.queue_high_water.
   capacity: 512
 
 scheduler:
@@ -54,6 +54,23 @@ fairness:
   #   batch-importer:
   #     weight: 0.25
   #     rate: 100
+
+overload:
+  # New events are refused with a retryable `rejected` ACK before they reach the WAL once a backlog
+  # builds up. The ACK message names the backlog. Set a limit to 0 to disable that check.
+  # Refuse a producer's events once its own queue is this full, from 0 to 1. Below 1 it leaves headroom
+  # for events already being appended, which otherwise wait for queue space without an ACK.
+  queue_high_water: 0.9
+  # Events queued across all producers. Past it, only producers holding more than their weighted share
+  # of this total are refused, so a light producer is not held back by a heavy one.
+  max_queued_events: 100000
+  # Durable WAL bytes not yet delivered to ClickHouse (1 GiB). Past it, every new event is refused
+  # until delivery catches up, which bounds WAL disk use during a ClickHouse outage.
+  max_shipper_lag_bytes: 1073741824
+  # A gateway-wide limit clears once its backlog drops below this fraction of it.
+  resume_ratio: 0.8
+  # How often the gateway-wide backlogs are sampled.
+  sample_interval: 100ms
 
 wal:
   # Path of the first WAL segment. Later segments are created next to it.

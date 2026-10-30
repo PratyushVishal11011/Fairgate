@@ -73,6 +73,7 @@ func TestTCPIngestionPersistsEventsToWAL(t *testing.T) {
 			walLog,
 			metrics,
 			dedupManager,
+			nil,
 		)
 	}()
 

@@ -63,6 +63,7 @@ func TestTCPIngestionIdempotency(t *testing.T) {
 			walLog,
 			metrics,
 			dedupManager,
+			nil,
 		)
 	}()
 

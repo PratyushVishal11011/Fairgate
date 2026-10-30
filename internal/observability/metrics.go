@@ -6,6 +6,7 @@ import (
 	"runtime"
 	"time"
 
+	"FairGate/internal/overload"
 	"FairGate/internal/sched"
 	"FairGate/internal/shipper"
 	"FairGate/internal/wal"
@@ -41,6 +42,7 @@ type Metrics struct {
 	duplicates  prometheus.Counter
 	walErrors   prometheus.Counter
 	processed   prometheus.Counter
+	overloaded  *prometheus.CounterVec
 
 	producerEvents    *prometheus.CounterVec
 	producerProcessed *prometheus.CounterVec
@@ -101,6 +103,14 @@ func NewWithOptions(opts Options) *Metrics {
 	m.duplicates = counter("fairgate_events_duplicate_total", "Identical retries acknowledged without a second WAL append.")
 	m.walErrors = counter("fairgate_wal_append_errors_total", "WAL append failures.")
 	m.processed = counter("fairgate_events_processed_total", "Events processed by the scheduler.")
+	m.overloaded = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "fairgate_events_overloaded_total",
+		Help: "Events refused before the WAL append because a backlog was over its limit, by reason.",
+	}, []string{"reason"})
+	//start every reason at zero so rate() and alerts see the series before the first refusal.
+	for _, reason := range overload.Reasons {
+		m.overloaded.WithLabelValues(reason)
+	}
 
 	m.producerEvents = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "fairgate_producer_events_total",
@@ -145,7 +155,7 @@ func NewWithOptions(opts Options) *Metrics {
 		collectors.NewGoCollector(),
 		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
 		buildInfo,
-		m.connections, m.accepted, m.rejected, m.invalid, m.duplicates, m.walErrors, m.processed,
+		m.connections, m.accepted, m.rejected, m.invalid, m.duplicates, m.walErrors, m.processed, m.overloaded,
 		m.producerEvents, m.producerProcessed,
 		m.ingestDuration, m.walAppendDuration, m.walSyncDuration, m.walBatchRecords, m.walWrittenBytes, m.walRotations,
 		m.shipperBatches, m.shipperEvents, m.shipperFailures, m.shipperInsertDuration,
@@ -191,6 +201,12 @@ func (m *Metrics) EventDuplicate(producer string) {
 func (m *Metrics) EventRejected(producer string) {
 	m.rejected.Inc()
 	m.producerEvents.WithLabelValues(m.producer(producer), outcomeRateLimited).Inc()
+}
+
+// EventOverloaded counts an event refused for reason, one of overload.Reasons.
+func (m *Metrics) EventOverloaded(producer, reason string) {
+	m.overloaded.WithLabelValues(reason).Inc()
+	m.producerEvents.WithLabelValues(m.producer(producer), reason).Inc()
 }
 
 func (m *Metrics) EventConflict(producer string) {
@@ -288,6 +304,42 @@ func (m *Metrics) RegisterShipper(s *shipper.Shipper, w *wal.WAL) {
 		}
 		return float64(lag)
 	}))
+}
+
+// RegisterOverload reports which gateway-wide backlog signals are active at scrape time.
+func (m *Metrics) RegisterOverload(c *overload.Controller) {
+	m.registry.MustRegister(&overloadCollector{
+		controller: c,
+		active: prometheus.NewDesc("fairgate_overload_active",
+			"1 while a gateway-wide backlog is over its limit and new events are being refused, else 0.",
+			[]string{"signal"}, nil),
+	})
+}
+
+// Signals reported by fairgate_overload_active.
+const (
+	signalGatewayQueue = "gateway_queue"
+	signalStorage      = "storage"
+)
+
+type overloadCollector struct {
+	controller *overload.Controller
+	active     *prometheus.Desc
+}
+
+func (c *overloadCollector) Describe(ch chan<- *prometheus.Desc) { ch <- c.active }
+
+func (c *overloadCollector) Collect(ch chan<- prometheus.Metric) {
+	status := c.controller.Status()
+	ch <- prometheus.MustNewConstMetric(c.active, prometheus.GaugeValue, boolValue(status.GatewayBacklogged), signalGatewayQueue)
+	ch <- prometheus.MustNewConstMetric(c.active, prometheus.GaugeValue, boolValue(status.StorageBacklogged), signalStorage)
+}
+
+func boolValue(value bool) float64 {
+	if value {
+		return 1
+	}
+	return 0
 }
 
 type walCollector struct {

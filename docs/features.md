@@ -12,6 +12,7 @@
 - **Producer epochs.** The epoch is part of event identity, so identity stays unambiguous across producer restarts.
 - **Per-producer queues.** Keeps producer events in separate bounded channels (512 events each by default, configurable per producer). Queues also track event identities so duplicates are not enqueued twice.
 - **Weighted DRR scheduling.** Serves backlogged producers in rounds, giving each `quantum × weight` events per round. Fractional weights are supported, and idle producers don't bank credit.
+- **Backlog-aware overload handling.** Refuses new events with a retryable `rejected` ACK before the WAL append when the producer's queue reaches a high-water mark, when the gateway's total queued events pass a limit (only producers above their weighted share), or when delivery to ClickHouse falls too far behind. Identical retries are still accepted. See [Overload handling](scheduling.md#overload-handling).
 - **Producer fairness controls.** Per-producer overrides for DRR weight, admission rate and burst, and queue capacity, set under `fairness.producers` in the config file. See [Backpressure, scheduling, and fairness](scheduling.md).
 - **Segmented Write-Ahead Log.** Appends events with length and CRC metadata across multiple segment files, rotating to a new segment when the configured segment size would be exceeded.
 - **Group commit.** A dedicated writer goroutine batches concurrent append requests and issues a single `Sync()` per batch, bounded by a maximum request count and a short collection delay.

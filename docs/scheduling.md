@@ -7,12 +7,43 @@ FairGate keeps producers isolated at three stages: admission, buffering, and sch
 | Stage | Default | Per-producer override | Effect |
 |---|---|---|---|
 | Admission | `admission.rate`, `admission.burst` | `rate`, `burst` | Token-bucket limit on incoming events. Excess events get a `rejected` ACK with `rate_limited`. |
-| Buffering | `queues.capacity` | `queue_capacity` | Events buffered for the producer before enqueueing blocks. |
+| Buffering | `queues.capacity` | `queue_capacity` | Events buffered for the producer. Past `overload.queue_high_water` of it, new events get a `rejected` ACK with `queue_backlogged`. |
 | Scheduling | `fairness.default_weight` | `weight` | The producer's share of each DRR round. |
 
 ## Backpressure
 
-Each producer has its own bounded queue, sized by `queues.capacity` (512 events by default) or by the producer's `queue_capacity`. Enqueueing blocks when a producer's queue is full, applying backpressure to the caller instead of allowing the queue to grow without bound. In the connection handler the wait is context-aware (`EnqueueContext`), so a blocked handler can stop waiting if shutdown is forced. Queues also track event identities so that a duplicate is not enqueued twice.
+Each producer has its own bounded queue, sized by `queues.capacity` (512 events by default) or by the producer's `queue_capacity`. Before a queue fills, [overload handling](#overload-handling) refuses the producer's new events with a retryable rejection, so the producer backs off instead of growing the queue. If a queue fills anyway, for example because several connections of one producer appended at once, enqueueing blocks until there is space. In the connection handler that wait is context-aware (`EnqueueContext`), so a blocked handler can stop waiting if shutdown is forced. Queues also track event identities so that a duplicate is not enqueued twice.
+
+## Overload handling
+
+Before appending an event to the WAL, the gateway checks three backlogs. If one is over its limit, the event gets a `rejected` ACK and is not persisted. The ACK's message names the backlog:
+
+| Message | Backlog | Who is refused |
+|---|---|---|
+| `storage_backlogged` | The shipper trails the durable WAL end by at least `overload.max_shipper_lag_bytes`. | Every producer. |
+| `queue_backlogged` | The producer's own queue holds at least `overload.queue_high_water` of its capacity. | That producer only. |
+| `gateway_backlogged` | All producer queues together hold at least `overload.max_queued_events`. | Producers holding at least their weighted share of that total. |
+
+```mermaid
+flowchart TD
+    E["Admitted event,<br/>not a duplicate"] --> S{"Storage<br/>backlogged?"}
+    S -->|"Yes"| RS["rejected: storage_backlogged"]
+    S -->|"No"| Z{"Producer has<br/>queued events?"}
+    Z -->|"No"| W["Append to WAL, enqueue, accept"]
+    Z -->|"Yes"| Q{"Queue at<br/>high-water mark?"}
+    Q -->|"Yes"| RQ["rejected: queue_backlogged"]
+    Q -->|"No"| G{"Gateway backlogged and producer<br/>at or above its share?"}
+    G -->|"Yes"| RG["rejected: gateway_backlogged"]
+    G -->|"No"| W
+```
+
+- **Refused before the WAL.** A refused event is never persisted, so it does not add to the backlog it was refused for, and retrying it is always safe. Without this check, an event for a full queue was appended and then held without an ACK until space freed up.
+- **Identical retries are still accepted.** The check runs only for new identities. A retry of an event that is already durable is acknowledged as a duplicate even while the gateway is backlogged, so a producer whose ACK was lost is not told to retry forever.
+- **The gateway-wide queue limit is fair.** Producer IDs are chosen by clients, so the per-producer capacities alone do not bound the gateway's total. Past `max_queued_events`, a producer of weight `w` is refused only while it holds at least `w / W × max_queued_events` events, where `W` is the total weight of producers with queued events. A producer with a small backlog keeps being accepted while a heavy one is pushed back.
+- **The storage limit bounds the WAL.** While ClickHouse is unavailable, the WAL keeps growing because segments are reclaimed only after delivery. `max_shipper_lag_bytes` caps that growth: past it, the gateway refuses all new events until delivery catches up.
+- **Gateway-wide limits use hysteresis.** The total queued events and the shipper lag are sampled every `overload.sample_interval`. Each signal turns on at its limit and turns off only once its backlog drops below `overload.resume_ratio` of it, so a backlog hovering at the limit does not flap. A producer's own queue depth is read on every event.
+
+Producers should treat `rejected` as a signal to back off and retry, as they already do for `rate_limited`. The `fairgate_events_overloaded_total` and `fairgate_overload_active` metrics show how often and why events are being refused. See [Observability](observability.md).
 
 ## Weighted deficit round robin
 

@@ -64,6 +64,7 @@ func TestAcknowledgment(t *testing.T) {
 			walLog,
 			metrics,
 			dedupManager,
+			nil,
 		)
 	}()
 

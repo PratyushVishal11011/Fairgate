@@ -4,6 +4,14 @@
 
 ## Recent updates
 
+### 30th October, 2026: Backlog-aware overload handling
+
+- **Events are refused before the WAL when work backs up.** A new `overload` stage runs before the WAL append and sends a `rejected` ACK, which producers already treat as retry-after-backoff. Its message names the backlog: `queue_backlogged` when the producer's queue reaches `overload.queue_high_water` (90%) of its capacity, `gateway_backlogged` when all queues together hold `overload.max_queued_events` (100,000) and the producer holds at least its weighted share, and `storage_backlogged` when the shipper trails the WAL by `overload.max_shipper_lag_bytes` (1 GiB). Previously an event for a full queue was appended to the WAL and then held without an ACK until space freed up, and the WAL grew without limit during a ClickHouse outage.
+- **Identical retries are still accepted.** The check runs inside the deduplication step, so an event that is already durable is acknowledged as a duplicate while the gateway is backlogged.
+- **Hysteresis.** The total queued events and the shipper lag are sampled every `overload.sample_interval` (100 ms). Each signal clears only when its backlog falls below `overload.resume_ratio` (80%) of its limit.
+- **Metrics and alerting.** `fairgate_events_overloaded_total{reason}` counts refusals, `fairgate_overload_active{signal}` shows the gateway-wide signals, and `fairgate_producer_events_total` gains the three reasons as outcomes. The new `FairGateOverloaded` warning fires when a signal stays active for 2 minutes.
+- **Configuration.** The new `overload` section holds the settings above. Set a limit to `0` to disable that check. See [Configuration](configuration.md#overload).
+
 ### 26th October, 2026: Oversized events no longer reported as WAL failures
 
 - **Oversized events are rejected as invalid.** An event larger than the WAL's 1 MiB record limit but within the 5 MiB frame limit used to fail inside the WAL. The handler counted that in `fairgate_wal_append_errors_total`, which fired the critical `FairGateWALAppendErrors` alert, sent `error` / `wal_append_failed`, and closed the connection, though the WAL was healthy. In the [EC2 benchmark](results/2026-10-26-ec2-benchmark.md) this happened 62 times, all from the oversized-event anomaly producers. These events now get `invalid` / `payload_too_large`, count in `fairgate_events_invalid_total`, and the connection stays open.
