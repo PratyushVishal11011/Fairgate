@@ -1,0 +1,48 @@
+# Route producers through the fault proxy and degrade the network in phases: latency with
+# jitter, fragmented writes, random connection resets, a partition, and a mass disconnect.
+# Producers retry with the same identity, so every event must still be accepted and stored once.
+# Needs only the gateway and ClickHouse; nothing is restarted.
+name: network-faults
+load:
+  addr: 127.0.0.1:9001
+  producers: 40
+  duration: 40s
+  rate: 40
+  window: 8
+  ramp: 2s
+  ack_timeout: 3s
+  drain_timeout: 60s
+proxy:
+  listen: 127.0.0.1:9101
+  faults:
+    latency: 20ms
+    jitter: 30ms
+steps:
+  - name: fragment writes
+    at: 5s
+    faults: {latency: 5ms, fragment: 64, fragment_delay: 1ms}
+  - name: random resets
+    at: 12s
+    faults: {reset_probability: 0.002}
+  - name: partition
+    at: 20s
+    faults: {blackhole: true}
+  - name: heal partition
+    at: 25s
+    faults: {}
+    always: true
+  - name: disconnect everyone
+    at: 30s
+    disconnect: true
+  - name: refuse connections
+    at: 32s
+    faults: {refuse: true}
+  - name: accept connections
+    at: 34s
+    faults: {}
+    always: true
+reconcile:
+  timeout: 2m
+  verify_content: true
+expect:
+  min_accepted_ratio: 1.0

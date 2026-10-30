@@ -2,7 +2,7 @@
 
 **A fair-share event ingestion gateway written in Go.**
 
-FairGate accepts framed event streams over TCP and keeps producers isolated from one another. Each producer has its own admission limit and its own bounded queue, and a weighted Deficit Round Robin (DRR) scheduler gives each producer its share. Accepted events are persisted in a segmented Write-Ahead Log (WAL) before they are acknowledged. A checkpointed shipper then delivers them to ClickHouse exactly once per event identity.
+FairGate accepts framed event streams over TCP and keeps producers isolated from one another. Each producer has its own admission limit and its own bounded queue, and a weighted Deficit Round Robin (DRR) scheduler gives each producer its share. When queues or delivery fall behind, new events are refused with a retryable rejection instead of piling up. Accepted events are persisted in a segmented Write-Ahead Log (WAL) before they are acknowledged. A checkpointed shipper then delivers them to ClickHouse exactly once per event identity.
 
 > [!IMPORTANT]
 > **Beta status.** FairGate is under active development. Interfaces, protocol details, configuration, and storage semantics may change. See [Limitations](docs/limitations.md) before relying on it.
@@ -10,10 +10,12 @@ FairGate accepts framed event streams over TCP and keeps producers isolated from
 ## Highlights
 
 - **Producer isolation and fairness.** Per-producer token-bucket admission and bounded queues, plus weighted DRR scheduling. Weights, rate limits, and queue sizes can be set per producer. [More](docs/scheduling.md)
+- **Backlog-aware overload handling.** Before the WAL append, events get a retryable `rejected` ACK when the producer's queue is near full, when the gateway's total queue is over its limit (only producers above their weighted share), or when delivery to ClickHouse is too far behind. Identical retries are still accepted. [More](docs/scheduling.md#overload-handling)
 - **Durable before acknowledged.** Events are written to the WAL and synced (with group commit) before the ACK is sent. Recovery replays them after a crash. [More](docs/wal.md)
 - **Safe producer retries.** Each event has a stable identity. An identical retry is acknowledged without being stored twice, and reuse of an identity with different content is rejected. [More](docs/event-model.md)
 - **Exactly-once delivery to ClickHouse.** Each event identity is stored once, through crashes, replays, and lost checkpoints. [More](docs/delivery-semantics.md)
 - **One config file.** Optional YAML config with strict validation. Environment variables override it for secrets. [More](docs/configuration.md)
+- **Load, reconcile, and chaos tools.** `loadgen` drives the gateway with simulated producers, `reconcile` checks that every accepted event reached ClickHouse exactly once, and `chaos` injects network faults and runs crash and outage scenarios. [More](docs/tooling.md)
 - **Observable.** Prometheus metrics for every pipeline stage, ready-made alert rules with Alertmanager, a provisioned Grafana dashboard, and optional `pprof` profiling. [More](docs/observability.md)
 
 ## Quick start
@@ -45,6 +47,19 @@ go test -race ./...
 
 The ClickHouse integration tests run only when `CLICKHOUSE_ADDR` is set. See [Development](docs/development.md).
 
+To load the running stack and check that every accepted event was stored exactly once:
+
+```bash
+go run ./cmd/loadgen -producers 100 -events 1000 -rate 100 -out benchmarks/run1
+go run ./cmd/reconcile -manifest benchmarks/run1/manifest.json
+```
+
+To kill the gateway mid-load and check the same thing, run a chaos scenario. See [Load, reconcile, and chaos tools](docs/tooling.md).
+
+```bash
+go run ./cmd/chaos run deploy/chaos/gateway-crash.yaml
+```
+
 ## Configuration
 
 Pass a YAML file with `-config` or `FAIRGATE_CONFIG`. Without one, FairGate runs with built-in defaults. [`deploy/fairgate.yaml`](deploy/fairgate.yaml) lists every setting with its default:
@@ -61,6 +76,10 @@ fairness:
     payments-service:
       weight: 4
       rate: 2000
+overload:
+  queue_high_water: 0.9
+  max_queued_events: 100000
+  max_shipper_lag_bytes: 1073741824
 ```
 
 See [Configuration](docs/configuration.md) for all settings and environment overrides.
@@ -71,12 +90,13 @@ See [Configuration](docs/configuration.md) for all settings and environment over
 |---|---|
 | [Documentation index](docs/README.md) | Every document, grouped by topic. |
 | [Deployment](docs/deployment.md) | Docker Compose, ports, remote access, Apple Container. |
-| [Configuration](docs/configuration.md) | Config file, settings, fairness overrides, environment variables. |
-| [Backpressure, scheduling, and fairness](docs/scheduling.md) | Queues, weighted DRR, per-producer limits. |
+| [Configuration](docs/configuration.md) | Config file, settings, fairness overrides, overload limits, environment variables. |
+| [Backpressure, scheduling, and fairness](docs/scheduling.md) | Queues, overload handling, weighted DRR, per-producer limits. |
 | [Observability](docs/observability.md) | Metrics, dashboard, alerting, profiling. |
 | [Delivery semantics](docs/delivery-semantics.md) | ACK meaning and the exactly-once guarantee. |
 | [Event model and identity](docs/event-model.md) | Event fields, identity, idempotent retries. |
 | [Wire protocol](docs/wire-protocol.md) | Frame format and acknowledgments. |
+| [Load, reconcile, and chaos tools](docs/tooling.md) | Load generator, exactly-once reconciliation, fault proxy, chaos scenarios. |
 | [Architecture](docs/architecture.md) | Design goals, components, event lifecycle. |
 | [Write-Ahead Log](docs/wal.md) | Segments, group commit, reclamation, recovery. |
 | [Storage integration](docs/storage.md) | Shipper, batch identity, ClickHouse schema. |

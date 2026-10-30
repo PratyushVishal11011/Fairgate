@@ -5,6 +5,7 @@ import (
 	"FairGate/internal/config"
 	"FairGate/internal/deduplication"
 	"FairGate/internal/observability"
+	"FairGate/internal/overload"
 	"FairGate/internal/sched"
 	"FairGate/internal/shipper"
 	"FairGate/internal/store"
@@ -296,6 +297,38 @@ func runContext(ctx context.Context, cfg config.Config, logger *slog.Logger, new
 		"restored_events", len(events),
 	)
 
+	// Refuse new events before the WAL append once producer queues or delivery fall behind.
+	overloadCtl, err := overload.New(overload.Config{
+		QueueHighWater:     cfg.Overload.QueueHighWater,
+		MaxQueuedEvents:    cfg.Overload.MaxQueuedEvents,
+		MaxShipperLagBytes: cfg.Overload.MaxShipperLagBytes,
+		ResumeRatio:        cfg.Overload.ResumeRatio,
+		SampleInterval:     cfg.Overload.SampleInterval,
+		DefaultWeight:      cfg.Fairness.DefaultWeight,
+		Weights:            cfg.Fairness.Weights(),
+		Logger:             logger,
+	}, queues, func() (int64, error) {
+		return walLog.BytesAfter(eventShipper.Committed())
+	})
+	if err != nil {
+		return err
+	}
+	metrics.RegisterOverload(overloadCtl)
+
+	// Sample once so a restart with a large backlog refuses events from the first connection.
+	overloadCtl.Sample()
+	overloadCtx, stopOverload := context.WithCancel(context.Background())
+	overloadDone := make(chan struct{})
+	go func() {
+		defer close(overloadDone)
+		overloadCtl.Run(overloadCtx)
+	}()
+	// Stop sampling before the deferred WAL cleanup.
+	defer func() {
+		stopOverload()
+		<-overloadDone
+	}()
+
 	// The handler context is canceled only if the grace period expires.
 	handlerCtx, cancelHandler := context.WithCancel(context.Background())
 	defer cancelHandler()
@@ -402,6 +435,7 @@ func runContext(ctx context.Context, cfg config.Config, logger *slog.Logger, new
 				walLog,
 				metrics,
 				dedupManager,
+				overloadCtl,
 			)
 		}(conn)
 	}
@@ -454,6 +488,7 @@ func handleConn(
 	walLog *wal.WAL,
 	metrics *observability.Metrics,
 	dedupManager *deduplication.Manager,
+	overloadCtl *overload.Controller,
 ) {
 	defer conn.Close()
 
@@ -510,13 +545,37 @@ func handleConn(
 			continue
 		}
 
+		// The overload check runs inside the persist step, so an identical retry of an event
+		// that is already durable is still acknowledged while the gateway is backlogged.
 		duplicate, err := dedupManager.PersistIfNew(event, func() error {
+			if overloadCtl != nil {
+				if err := overloadCtl.Check(event.ProducerId); err != nil {
+					return err
+				}
+			}
 			appendStart := time.Now()
 			err := walLog.Append(event)
 			metrics.ObserveWALAppend(time.Since(appendStart))
 			return err
 		})
 		if err != nil {
+			//a backlogged gateway refuses the event before the WAL append; the producer retries after backoff.
+			var rejection *overload.Rejection
+			if errors.As(err, &rejection) {
+				metrics.EventOverloaded(event.ProducerId, rejection.Reason)
+				if err := sendAck(conn, wire.Ack{
+					ProducerId: event.ProducerId,
+					Seq:        event.Seq,
+					Idx:        event.Idx,
+					Status:     ackRejected,
+					Message:    rejection.Reason,
+				}); err != nil {
+					logger.Warn("Failed to send NACK", "error", err)
+					return
+				}
+				continue
+			}
+
 			if errors.Is(err, deduplication.ErrConflict) ||
 				errors.Is(err, deduplication.ErrInvalid) {
 				metrics.EventConflict(event.ProducerId)

@@ -8,7 +8,7 @@ FairGate reads an optional YAML config file. Settings are resolved in three laye
 2. The config file, passed with `-config` or `FAIRGATE_CONFIG`. `-config` wins if both are set.
 3. Environment variables (see [Environment overrides](#environment-overrides)).
 
-Without a config file, the gateway runs with the defaults below, which match its behavior before the file existed. Every key in the file is optional, and a key you leave out keeps its default.
+Without a config file, the gateway runs with the defaults below, which match its behavior before the file existed, except that the [overload](#overload) limits are on by default. Every key in the file is optional, and a key you leave out keeps its default.
 
 ```bash
 fairgate -config /etc/fairgate/fairgate.yaml
@@ -28,13 +28,18 @@ Unknown keys are rejected, so a misspelled setting stops startup instead of bein
 | `server.shutdown_grace_period` | `5s` | Time active handlers get to finish before their connections are closed. |
 | `admission.rate` | `500` | Token-bucket refill rate per producer, in events per second. |
 | `admission.burst` | `1000` | Token-bucket capacity per producer. |
-| `queues.capacity` | `512` | Events buffered per producer before enqueueing blocks. |
+| `queues.capacity` | `512` | Events buffered per producer. See also `overload.queue_high_water`. |
 | `scheduler.quantum` | `8` | Events served per DRR round to a producer of weight 1. |
 | `fairness.default_weight` | `1` | DRR weight for producers without an entry under `fairness.producers`. |
 | `fairness.producers.<id>.weight` | `default_weight` | The producer's share of each DRR round: `quantum × weight` events. Fractions are allowed. |
 | `fairness.producers.<id>.rate` | `admission.rate` | Admission rate for the producer, in events per second. |
 | `fairness.producers.<id>.burst` | `admission.burst` | Admission burst for the producer. |
 | `fairness.producers.<id>.queue_capacity` | `queues.capacity` | Events buffered for the producer before enqueueing blocks. |
+| `overload.queue_high_water` | `0.9` | Refuse a producer's events once its queue holds this fraction of its capacity, from 0 to 1. `0` disables the check. |
+| `overload.max_queued_events` | `100000` | Events queued across all producers. Past it, producers holding more than their weighted share of this total are refused. `0` disables the check. |
+| `overload.max_shipper_lag_bytes` | `1073741824` (1 GiB) | Durable WAL bytes not yet delivered to ClickHouse. Past it, every new event is refused. `0` disables the check. |
+| `overload.resume_ratio` | `0.8` | A gateway-wide limit clears once its backlog drops below this fraction of it. Greater than 0 and at most 1. |
+| `overload.sample_interval` | `100ms` | How often the total queued events and the shipper lag are sampled. |
 | `wal.path` | `data/fairgate.wal` | Path of the first WAL segment. Later segments are created next to it. |
 | `wal.segment_size` | `67108864` (64 MiB) | Segment size in bytes before the writer rotates. Reclamation deletes whole segments, so smaller segments free disk space sooner. |
 | `shipper.checkpoint_path` | `data/checkpoint.json` | Checkpoint file. Keep it on the same persistent volume as the WAL. |
@@ -74,6 +79,21 @@ fairness:
 See [Backpressure, scheduling, and fairness](scheduling.md) for how weights translate into each producer's share.
 
 Producers listed under `fairness.producers` also get their own `producer` label in the per-producer metrics. Every other producer is reported as `other`, so list a producer here (even with no overrides, as `my-producer: {}`) to monitor it individually. See [Observability](observability.md#per-producer-labels).
+
+## Overload
+
+The `overload` section sets when the gateway refuses new events because work is backing up. A refused event gets a `rejected` ACK whose message names the backlog, and it is never appended to the WAL, so the producer can retry it after backing off. See [Overload handling](scheduling.md#overload-handling) for how each check works.
+
+```yaml
+overload:
+  queue_high_water: 0.9
+  max_queued_events: 100000
+  max_shipper_lag_bytes: 1073741824
+  resume_ratio: 0.8
+  sample_interval: 100ms
+```
+
+Set a limit to `0` to turn that check off. With all three at `0`, a full queue blocks the handler after the WAL append, as it did before this section existed.
 
 ## Paths and durations
 

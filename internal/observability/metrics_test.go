@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"FairGate/internal/overload"
 	"FairGate/internal/sched"
 	"FairGate/internal/shipper"
 	"FairGate/internal/wal"
@@ -81,6 +82,12 @@ func fullyWired(t *testing.T) (*Metrics, *wal.WAL) {
 	}
 	m.RegisterShipper(s, w)
 
+	controller, err := overload.New(overload.Config{QueueHighWater: 0.9, ResumeRatio: 0.8}, queues, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.RegisterOverload(controller)
+
 	for _, producer := range []string{"vip", "anyone"} {
 		m.EventAccepted(producer)
 		m.EventDuplicate(producer)
@@ -88,6 +95,7 @@ func fullyWired(t *testing.T) (*Metrics, *wal.WAL) {
 		m.EventConflict(producer)
 		m.WALAppendError(producer)
 		m.EventProcessed(producer)
+		m.EventOverloaded(producer, overload.ReasonQueueBacklogged)
 	}
 	m.EventInvalid()
 	m.ObserveIngest(time.Millisecond)
