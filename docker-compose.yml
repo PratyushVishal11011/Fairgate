@@ -21,6 +21,8 @@ services:
     depends_on:
       clickhouse:
         condition: service_healthy
+    # Covers server.shutdown_grace_period plus server.drain_timeout before Docker sends SIGKILL.
+    stop_grace_period: 30s
     healthcheck:
       test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:9100/health"]
       interval: 10s

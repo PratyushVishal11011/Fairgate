@@ -21,6 +21,19 @@ server:
   metrics_addr: ":9100"
   # Time active handlers get to finish on shutdown before their connections are closed.
   shutdown_grace_period: 5s
+  # Then time to empty the producer queues and ship every WAL record to ClickHouse before exiting.
+  # Whatever is left stays in the WAL and is shipped after the next start. 0 skips the drain.
+  drain_timeout: 10s
+  # Largest frame accepted, in bytes, counting the type and flags bytes (1 KiB to 64 MiB).
+  # A larger frame is skipped and answered invalid / frame_too_large. Events over the WAL's
+  # 1 MiB record limit are refused as payload_too_large whatever this is.
+  max_frame_bytes: 5242880
+  # Close a connection that starts no new frame for this long. 0 keeps idle producers connected.
+  idle_timeout: 0s
+  # Time to receive the rest of a frame once its first byte arrives; stalled frames close the connection.
+  frame_timeout: 30s
+  # Time to write one ACK; a client that stops reading ACKs is disconnected.
+  write_timeout: 10s
 
 admission:
   # Token-bucket limit per producer: refill rate in events per second, and bucket capacity.

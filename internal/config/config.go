@@ -32,6 +32,13 @@ type Config struct {
 	Profiling  Profiling  `yaml:"profiling"`
 }
 
+// Bounds on server.max_frame_bytes. Events larger than the WAL's 1 MiB record limit are refused
+// anyway, so a much larger frame limit only costs memory.
+const (
+	MinMaxFrameBytes = 1 << 10
+	MaxMaxFrameBytes = 64 << 20
+)
+
 type Server struct {
 	//TCP address for event ingestion.
 	ListenAddr string `yaml:"listen_addr"`
@@ -39,6 +46,16 @@ type Server struct {
 	MetricsAddr string `yaml:"metrics_addr"`
 	//time active handlers get to finish before their connections are closed.
 	ShutdownGracePeriod time.Duration `yaml:"shutdown_grace_period"`
+	//after handlers stop, time to empty the producer queues and ship the WAL to ClickHouse; 0 skips the drain.
+	DrainTimeout time.Duration `yaml:"drain_timeout"`
+	//largest frame accepted, counting the type and flags bytes; larger frames are answered and skipped.
+	MaxFrameBytes int `yaml:"max_frame_bytes"`
+	//close a connection that starts no new frame for this long; 0 keeps idle connections open.
+	IdleTimeout time.Duration `yaml:"idle_timeout"`
+	//time to receive the rest of a frame once its first byte has arrived.
+	FrameTimeout time.Duration `yaml:"frame_timeout"`
+	//time to write one ACK before the connection is closed.
+	WriteTimeout time.Duration `yaml:"write_timeout"`
 }
 
 type Admission struct {
@@ -167,6 +184,10 @@ func Default() Config {
 			ListenAddr:          ":9001",
 			MetricsAddr:         ":9100",
 			ShutdownGracePeriod: 5 * time.Second,
+			DrainTimeout:        10 * time.Second,
+			MaxFrameBytes:       5 << 20,
+			FrameTimeout:        30 * time.Second,
+			WriteTimeout:        10 * time.Second,
 		},
 		Admission: Admission{
 			Rate:  500,
@@ -305,6 +326,12 @@ func (c Config) Validate() error {
 	check(c.Server.ListenAddr != "", "server.listen_addr is required")
 	check(c.Server.MetricsAddr != "", "server.metrics_addr is required")
 	check(c.Server.ShutdownGracePeriod > 0, "server.shutdown_grace_period must be greater than zero")
+	check(c.Server.DrainTimeout >= 0, "server.drain_timeout cannot be negative")
+	check(c.Server.MaxFrameBytes >= MinMaxFrameBytes && c.Server.MaxFrameBytes <= MaxMaxFrameBytes,
+		"server.max_frame_bytes must be between %d and %d", MinMaxFrameBytes, MaxMaxFrameBytes)
+	check(c.Server.IdleTimeout >= 0, "server.idle_timeout cannot be negative")
+	check(c.Server.FrameTimeout > 0, "server.frame_timeout must be greater than zero")
+	check(c.Server.WriteTimeout > 0, "server.write_timeout must be greater than zero")
 
 	check(c.Admission.Rate > 0, "admission.rate must be greater than zero")
 	check(c.Admission.Burst > 0, "admission.burst must be greater than zero")

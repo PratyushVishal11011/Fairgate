@@ -4,6 +4,29 @@
 
 ## Recent updates
 
+### 30th October, 2026: Protocol hardening
+
+- **Every frame gets an answer.** A frame of an unsupported type used to be logged and dropped without an ACK, which left a pipelining client waiting and its later ACKs out of step. It is now answered `invalid` / `unsupported_frame_type` and the connection is kept.
+- **Oversized frames.** A frame over the limit used to close the connection silently. It is now answered `invalid` / `frame_too_large`. If it is up to four times the limit, its body is discarded without being buffered and the connection kept; a larger one closes the connection without reading the body.
+- **Malformed frames.** A length prefix of 0 or 1 is answered `invalid` / `malformed_frame` before the connection closes.
+- **Memory follows the bytes received.** Frame bodies are read into a buffer that starts at 64 KiB and doubles, instead of allocating the claimed length up front. A client that announces 5 MiB and sends 10 bytes no longer costs 5 MiB.
+- **Timeouts.** `server.frame_timeout` (30 s) closes a connection whose frame stops arriving partway, so a stalled client no longer holds its handler forever. `server.write_timeout` (10 s) disconnects a client that stops reading ACKs. `server.idle_timeout` optionally closes idle connections; it is off by default.
+- **Configurable frame limit.** `server.max_frame_bytes` (5 MiB, from 1 KiB to 64 MiB) replaces the fixed limit.
+- **Identifier limits.** `producer_id`, `producer_epoch`, and `event_type` longer than 256 bytes are refused as `invalid_payload`, because the gateway keeps them in memory for every event it tracks.
+- **Metrics and alerting.** `fairgate_protocol_errors_total{reason}` counts each case, and the new `FairGateProtocolErrors` info alert fires when they pass one per second for 10 minutes.
+- **Wire package.** `ReadFrameLimit`, `ReadFrameLength`, `CheckFrameLength`, and `ReadFrameBody` expose the steps of reading a frame, with `ErrMalformedFrame` and `*FrameTooLargeError` for the two kinds of bad length prefix. A stream that ends inside a frame returns `io.ErrUnexpectedEOF`.
+- **Roadmap.** Load shedding has been removed from the roadmap. With protocol hardening, every planned phase is implemented.
+
+See [Error handling](wire-protocol.md#error-handling).
+
+### 30th October, 2026: Queue-drain confirmation on shutdown
+
+- **Shutdown drains the pipeline before stopping it.** Once handlers have exited, the gateway waits until the scheduler has emptied every producer queue, then wakes the shipper until its checkpoint reaches the durable WAL end, so a clean stop leaves every acknowledged event in ClickHouse. Previously the scheduler and shipper were canceled as soon as the handlers exited, and events accepted since the shipper's last poll waited in the WAL for the next start.
+- **Explicit result.** The outcome is logged once: `Shutdown drain complete` with the queued events processed and bytes shipped, or a `Shutdown drain incomplete` warning with each stage's outcome (`timed_out` or `stopped`) and the queued events and unshipped bytes left. Nothing is lost either way; leftovers are replayed from the WAL on the next start.
+- **Configuration.** The new `server.drain_timeout` (10 s) bounds both stages together. `0` restores the previous behavior. See [Queue-drain confirmation](server-lifecycle.md#queue-drain-confirmation).
+- **Shipper wake-up.** `Shipper.Wake` lets a shipper waiting at the WAL end check for new records at once, instead of at its next `shipper.poll_interval`.
+- **Compose.** The gateway service gets `stop_grace_period: 30s`, so Docker does not kill it during the grace period and drain.
+
 ### 30th October, 2026: Load, reconcile, and chaos tools
 
 The load generator, reconciliation, and chaos tooling now ship with FairGate as Go commands, so correctness under load and failure can be checked from a FairGate checkout alone.

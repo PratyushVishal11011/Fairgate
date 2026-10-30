@@ -8,15 +8,14 @@ The roadmap lists planned work in dependency order. Items are subject to change.
 flowchart TD
     P1["Phase 1: Core ingestion (implemented)<br/>TCP server, wire protocol, admission control<br/>Event identity and idempotent ingestion<br/>Per-producer queues, weighted DRR scheduling<br/>Segmented WAL with group commit and ordered recovery<br/>Context-aware lifecycle and graceful shutdown<br/>Store interface, ClickHouse adapter<br/>Health endpoint, Prometheus metrics, Grafana overview"]
     P2["Phase 2: Durable delivery (implemented)<br/>WAL shipping, checkpoints, retry and backoff<br/>Always-on runtime wiring<br/>Checkpoint-based WAL segment reclamation with durable-end guard<br/>End-to-end exactly-once delivery to ClickHouse"]
-    P3["Phase 3: Fairness and overload control (in progress)<br/>Producer weights and per-producer limits (implemented)<br/>Backlog-aware overload handling (implemented)<br/>Load shedding (planned)"]
-    P4["Phase 4: Operability and hardening (in progress)<br/>Profiling, pipeline metrics, alerting (implemented)<br/>Packaged load, reconcile, and chaos tools (implemented)<br/>Protocol hardening (planned)"]
+    P3["Phase 3: Fairness and overload control (implemented)<br/>Producer weights and per-producer limits<br/>Backlog-aware overload handling"]
+    P4["Phase 4: Operability and hardening (implemented)<br/>Profiling, pipeline metrics, alerting<br/>Packaged load, reconcile, and chaos tools<br/>Explicit queue-drain confirmation on shutdown<br/>Protocol hardening"]
 
     P1 --> P2 --> P3 --> P4
 
     classDef done stroke-width:3px;
     classDef planned stroke-dasharray: 5 5,stroke-width:2px;
-    class P1,P2 done;
-    class P3,P4 planned;
+    class P1,P2,P3,P4 done;
 ```
 
 A solid border marks implemented work. Dashed borders mark planned work.
@@ -50,5 +49,5 @@ A solid border marks implemented work. Dashed borders mark planned work.
 | Backlog-aware overload handling | Implemented |
 | Profiling, pipeline metrics, alerting | Implemented |
 | Packaged load generator, reconciliation, chaos tooling | Implemented |
-| Explicit queue-drain confirmation on shutdown | Planned |
-| Protocol hardening (malformed and oversized frame handling) | Planned |
+| Explicit queue-drain confirmation on shutdown | Implemented |
+| Protocol hardening (malformed and oversized frame handling) | Implemented |

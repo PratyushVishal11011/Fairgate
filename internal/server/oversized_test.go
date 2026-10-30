@@ -58,7 +58,7 @@ func TestOversizedEventIsInvalidNotWALFailure(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		handleConn(context.Background(), serverConn, logger, admission, queues, walLog, metrics, dedupManager, nil)
+		handleConn(context.Background(), serverConn, logger, admission, queues, walLog, metrics, dedupManager, nil, protocolLimits{})
 	}()
 
 	send := func(event wire.Event) wire.Ack {

@@ -20,7 +20,7 @@
 | Recovered events replayed into queues on restart | Yes, from segments still on disk |
 | WAL write or sync failure surfaced to callers | Yes |
 | WAL kept open until all handlers and the shipper exit during shutdown | Yes |
-| Explicit queue-drain confirmation on shutdown | No |
+| Explicit queue-drain confirmation on shutdown | Yes, within `server.drain_timeout`: queues emptied and the shipper caught up to the durable WAL end, with the outcome logged |
 | Shipper and ClickHouse adapter available | Yes |
 | Shipper started by the gateway runtime | Yes; always enabled |
 | Shipper stopped and joined before the store and WAL close | Yes |

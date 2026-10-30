@@ -64,6 +64,7 @@ func TestTCPIngestionIdempotency(t *testing.T) {
 			metrics,
 			dedupManager,
 			nil,
+			protocolLimits{},
 		)
 	}()
 

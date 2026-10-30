@@ -15,7 +15,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -192,6 +191,11 @@ func runContext(ctx context.Context, cfg config.Config, logger *slog.Logger, new
 	}
 	metrics.RegisterShipper(eventShipper, walLog)
 
+	//durable WAL bytes the shipper has not committed to the store yet.
+	shipperLag := func() (int64, error) {
+		return walLog.BytesAfter(eventShipper.Committed())
+	}
+
 	shipperCtx, stopShipper := context.WithCancel(context.Background())
 	cancelShipper = stopShipper
 
@@ -307,9 +311,7 @@ func runContext(ctx context.Context, cfg config.Config, logger *slog.Logger, new
 		DefaultWeight:      cfg.Fairness.DefaultWeight,
 		Weights:            cfg.Fairness.Weights(),
 		Logger:             logger,
-	}, queues, func() (int64, error) {
-		return walLog.BytesAfter(eventShipper.Committed())
-	})
+	}, queues, shipperLag)
 	if err != nil {
 		return err
 	}
@@ -328,6 +330,8 @@ func runContext(ctx context.Context, cfg config.Config, logger *slog.Logger, new
 		stopOverload()
 		<-overloadDone
 	}()
+
+	protocol := protocolLimitsFrom(cfg.Server)
 
 	// The handler context is canceled only if the grace period expires.
 	handlerCtx, cancelHandler := context.WithCancel(context.Background())
@@ -436,6 +440,7 @@ func runContext(ctx context.Context, cfg config.Config, logger *slog.Logger, new
 				metrics,
 				dedupManager,
 				overloadCtl,
+				protocol,
 			)
 		}(conn)
 	}
@@ -472,11 +477,60 @@ func runContext(ctx context.Context, cfg config.Config, logger *slog.Logger, new
 		<-handlersDone
 	}
 
-	// All handlers have stopped. The scheduler can now exit.
-	cancelScheduler()
-	<-schedulerDone
+	// All handlers have stopped, so nothing new reaches the queues or the WAL.
+	report := drainPipeline(cfg.Server.DrainTimeout, queues, schedulerDone, cancelScheduler, eventShipper, shipperDone, shipperLag)
+	report.log(logger)
 
 	return runErr
+}
+
+// drainPipeline confirms the pipeline is empty before the scheduler and shipper stop.
+// It waits for the scheduler to empty every producer queue, stops the scheduler, then wakes the
+// shipper until its checkpoint reaches the durable WAL end. Both stages share one timeout.
+func drainPipeline(
+	timeout time.Duration,
+	queues *sched.Queues,
+	schedulerDone <-chan struct{},
+	cancelScheduler context.CancelFunc,
+	eventShipper interface{ Wake() },
+	shipperDone <-chan struct{},
+	shipperLag func() (int64, error),
+) drainReport {
+	start := time.Now()
+	deadline := start.Add(timeout)
+	unshipped := func() int64 {
+		lag, err := shipperLag()
+		if err != nil {
+			return -1
+		}
+		return lag
+	}
+
+	report := drainReport{
+		queue:            drainSkipped,
+		shipper:          drainSkipped,
+		queuedAtStart:    queues.Len(),
+		unshippedAtStart: unshipped(),
+	}
+
+	if timeout > 0 {
+		report.queue = waitDrained(deadline, schedulerDone, func() bool {
+			return queues.Len() == 0
+		})
+	}
+	cancelScheduler()
+	<-schedulerDone
+	report.queuedLeft = queues.Len()
+
+	if timeout > 0 {
+		report.shipper = waitDrained(deadline, shipperDone, func() bool {
+			eventShipper.Wake()
+			return unshipped() == 0
+		})
+	}
+	report.unshippedLeft = unshipped()
+	report.elapsed = time.Since(start)
+	return report
 }
 
 func handleConn(
@@ -489,30 +543,22 @@ func handleConn(
 	metrics *observability.Metrics,
 	dedupManager *deduplication.Manager,
 	overloadCtl *overload.Controller,
+	limits protocolLimits,
 ) {
 	defer conn.Close()
 
 	remoteAddr := conn.RemoteAddr().String()
 	logger.Info("Client connected", "remote_addr", remoteAddr)
 
-	for {
-		frame, err := wire.ReadFrame(conn)
-		if err != nil {
-			if !errors.Is(err, io.EOF) {
-				logger.Warn("Error reading frame",
-					"remote_addr", remoteAddr,
-					"error", err,
-				)
-			}
-			return
-		}
+	acks := &ackWriter{conn: conn, timeout: limits.writeTimeout, metrics: metrics}
+	frames := newFrameReader(conn, limits, acks, logger, metrics)
 
-		if frame.Type != 1 {
-			logger.Warn("Unsupported frame type",
-				"remote_addr", remoteAddr,
-				"type", frame.Type,
-			)
-			continue
+	for {
+		//next answers and skips frames that are oversized or of another type,
+		//and reports false once the connection cannot continue.
+		frame, ok := frames.next()
+		if !ok {
+			return
 		}
 
 		received := time.Now()
@@ -520,7 +566,7 @@ func handleConn(
 		event, err := wire.DecodeEvent(frame.Payload)
 		if err != nil {
 			metrics.EventInvalid()
-			if err := sendAck(conn, wire.Ack{
+			if err := acks.send(wire.Ack{
 				Status:  ackInvalid,
 				Message: "invalid_payload",
 			}); err != nil {
@@ -532,7 +578,7 @@ func handleConn(
 
 		if !admission.Allow(event.ProducerId) {
 			metrics.EventRejected(event.ProducerId)
-			if err := sendAck(conn, wire.Ack{
+			if err := acks.send(wire.Ack{
 				ProducerId: event.ProducerId,
 				Seq:        event.Seq,
 				Idx:        event.Idx,
@@ -563,7 +609,7 @@ func handleConn(
 			var rejection *overload.Rejection
 			if errors.As(err, &rejection) {
 				metrics.EventOverloaded(event.ProducerId, rejection.Reason)
-				if err := sendAck(conn, wire.Ack{
+				if err := acks.send(wire.Ack{
 					ProducerId: event.ProducerId,
 					Seq:        event.Seq,
 					Idx:        event.Idx,
@@ -579,7 +625,7 @@ func handleConn(
 			if errors.Is(err, deduplication.ErrConflict) ||
 				errors.Is(err, deduplication.ErrInvalid) {
 				metrics.EventConflict(event.ProducerId)
-				if err := sendAck(conn, wire.Ack{
+				if err := acks.send(wire.Ack{
 					ProducerId: event.ProducerId,
 					Seq:        event.Seq,
 					Idx:        event.Idx,
@@ -596,7 +642,7 @@ func handleConn(
 			//so reject the event and keep the connection open.
 			if errors.Is(err, wal.ErrRecordTooLarge) {
 				metrics.EventInvalid()
-				if err := sendAck(conn, wire.Ack{
+				if err := acks.send(wire.Ack{
 					ProducerId: event.ProducerId,
 					Seq:        event.Seq,
 					Idx:        event.Idx,
@@ -615,7 +661,7 @@ func handleConn(
 				"seq", event.Seq,
 				"error", err,
 			)
-			if err := sendAck(conn, wire.Ack{
+			if err := acks.send(wire.Ack{
 				ProducerId: event.ProducerId,
 				Seq:        event.Seq,
 				Idx:        event.Idx,
@@ -628,7 +674,7 @@ func handleConn(
 		}
 
 		if duplicate {
-			if err := sendAck(conn, wire.Ack{
+			if err := acks.send(wire.Ack{
 				ProducerId: event.ProducerId,
 				Seq:        event.Seq,
 				Idx:        event.Idx,
@@ -659,7 +705,7 @@ func handleConn(
 			continue
 		}
 
-		if err := sendAck(conn, wire.Ack{
+		if err := acks.send(wire.Ack{
 			ProducerId: event.ProducerId,
 			Seq:        event.Seq,
 			Idx:        event.Idx,

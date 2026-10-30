@@ -42,7 +42,7 @@ sudo docker compose up --build -d --force-recreate fairgate
 
 Allow inbound TCP traffic on port `9001` through the host firewall, restricted to the client IP range that needs access. Connect to the host's reachable IP or DNS name on port `9001`; this is FairGate's length-prefixed TCP protocol, not an HTTP endpoint.
 
-The Compose file uses development ClickHouse credentials. Replace them before exposing a non-development deployment. `docker compose down` keeps the named volumes; `docker compose down -v` removes them, including the WAL, checkpoint, and database data.
+The Compose file uses development ClickHouse credentials. Replace them before exposing a non-development deployment. Stopping the gateway waits up to `server.shutdown_grace_period` plus `server.drain_timeout` while it ships its backlog, so the Compose file gives it `stop_grace_period: 30s`; keep that above the sum if you raise either setting. `docker compose down` keeps the named volumes; `docker compose down -v` removes them, including the WAL, checkpoint, and database data.
 
 If you already have a `fairgate.events` table from an earlier version, migrate it to the current schema before starting this version; see [Schema](storage.md#schema). Keeping the existing `clickhouse` volume does not apply schema changes.
 

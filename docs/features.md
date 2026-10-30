@@ -5,7 +5,8 @@
 ## Currently implemented
 
 - **TCP event ingestion.** Accepts client connections and reads length-prefixed frames.
-- **Framed wire protocol.** Identifies event and acknowledgment frames using frame types. The maximum frame size is 5 MiB.
+- **Framed wire protocol.** Identifies event and acknowledgment frames using frame types. The maximum frame size is configurable (5 MiB by default).
+- **Protocol hardening.** Every frame the gateway cannot handle gets exactly one `invalid` ACK, so pipelining clients stay in step: an unsupported frame type or an oversized frame is skipped and the connection kept, while a malformed length prefix closes the connection. Frame bodies are buffered as they arrive, never at the size a client claims. A frame that stalls past `server.frame_timeout`, an idle connection past `server.idle_timeout`, and a client that stops reading ACKs past `server.write_timeout` are disconnected. Identifier fields are limited to 256 bytes. Each case is counted in `fairgate_protocol_errors_total`. See [Error handling](wire-protocol.md#error-handling).
 - **JSON event decoding.** Decodes events and checks required fields, including `producer_epoch`.
 - **Admission control.** Applies token-bucket limits to incoming events per producer (500 events per second with a burst of 1,000 by default), with optional per-producer rate and burst.
 - **Event idempotency.** A deduplication manager identifies each event by producer ID, producer epoch, sequence number, and index. An identical retry is acknowledged without being appended to the WAL again. Reusing an identity with a different event time, type, or payload is rejected. A new identity is recorded only after the event has been persisted to the WAL.
@@ -44,14 +45,15 @@
   - Go runtime and process metrics.
 
   Producers listed in `fairness.producers` get their own `producer` label, and all others share `other`. See [Observability](observability.md#metrics).
-- **Alerting.** Twelve Prometheus alert rules cover availability, durability, delivery, pipeline stalls, and producer behavior. An Alertmanager service with commented receiver examples is included. See [Observability](observability.md#alerting).
+- **Alerting.** Fourteen Prometheus alert rules cover availability, durability, delivery, pipeline stalls, and producer behavior. An Alertmanager service with commented receiver examples is included. See [Observability](observability.md#alerting).
 - **Profiling.** Optional `pprof` endpoints on their own listener, with configurable block and mutex sampling. Off by default. See [Observability](observability.md#profiling).
 - **Docker deployment.** A `Dockerfile` and Compose stack run FairGate with ClickHouse, Prometheus, Alertmanager, and Grafana. Prometheus scrapes the gateway and evaluates the alert rules, and Grafana provisions its Prometheus datasource and the FairGate Overview dashboard, which has panels for every pipeline stage. `install-docker-ubuntu.sh` installs Docker Engine and the Compose plugin on Ubuntu.
 - **Acknowledgments.** Sends an accepted acknowledgment after the event has been appended to the WAL and enqueued, and also for an identical retry of an event that was already accepted.
 - **Concurrent connections.** Handles client connections in separate goroutines and tracks them for coordinated shutdown.
 - **Context-aware lifecycle.** `RunContext` lets the caller control server lifetime through a `context.Context`.
 - **Config file.** An optional YAML file sets addresses, admission limits, queue capacity, DRR quantum, producer fairness overrides, WAL path and segment size, shipper batching and retry, the ClickHouse connection, and the log level. Environment variables override it, and unknown keys or invalid values stop startup. See [Configuration](configuration.md).
-- **Graceful shutdown.** Stops accepting clients, waits for active handlers within a grace period, forces closure of blocked connections afterward, stops the scheduler and shipper, and then closes the store and WAL.
+- **Graceful shutdown.** Stops accepting clients, waits for active handlers within a grace period, forces closure of blocked connections afterward, drains the pipeline, stops the scheduler and shipper, and then closes the store and WAL.
+- **Queue-drain confirmation.** After handlers stop, shutdown waits up to `server.drain_timeout` for the scheduler to empty every producer queue and for the shipper, woken instead of polling, to ship the WAL up to its durable end. It logs whether the drain completed or what was left; anything left stays in the WAL for the next start. See [Queue-drain confirmation](server-lifecycle.md#queue-drain-confirmation).
 - **Cancelable enqueueing.** A handler blocked on a full producer queue can be interrupted during shutdown.
 - **Scheduler error propagation.** An unexpected scheduler failure is reported to the caller instead of being silently lost.
 - **Load generator.** `cmd/loadgen` simulates producers that pipeline events, pace themselves, retry rejections with backoff, and reconnect and resend after dropped connections, always with the same event identity. Hot producers and malformed frames can be mixed in. It writes a summary with latency percentiles and fairness, per-producer and per-second CSVs, and a manifest of every event's outcome. See [Load generator](tooling.md#load-generator).

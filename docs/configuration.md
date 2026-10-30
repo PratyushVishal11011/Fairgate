@@ -26,6 +26,11 @@ Unknown keys are rejected, so a misspelled setting stops startup instead of bein
 | `server.listen_addr` | `:9001` | TCP address for event ingestion. |
 | `server.metrics_addr` | `:9100` | HTTP address for `/health` and `/metrics`. If you change it, update the Compose port mapping, healthcheck, and Prometheus target to match. |
 | `server.shutdown_grace_period` | `5s` | Time active handlers get to finish before their connections are closed. |
+| `server.max_frame_bytes` | `5242880` (5 MiB) | Largest frame accepted, counting the type and flags bytes, from 1 KiB to 64 MiB. A larger frame is answered `invalid` / `frame_too_large`: skipped if it is up to four times this size, otherwise the connection is closed. Events over the WAL's 1 MiB record limit are refused as `payload_too_large` whatever this is. See [Error handling](wire-protocol.md#error-handling). |
+| `server.idle_timeout` | `0s` | Close a connection that starts no new frame for this long. `0` keeps idle connections open. |
+| `server.frame_timeout` | `30s` | Time to receive the rest of a frame once its first byte arrives. A stalled frame closes the connection. |
+| `server.write_timeout` | `10s` | Time to write one ACK. A client that stops reading ACKs is disconnected. |
+| `server.drain_timeout` | `10s` | After handlers stop, time to empty the producer queues and ship every WAL record to ClickHouse before exiting. Whatever is left stays in the WAL for the next start. `0` skips the drain. See [Queue-drain confirmation](server-lifecycle.md#queue-drain-confirmation). |
 | `admission.rate` | `500` | Token-bucket refill rate per producer, in events per second. |
 | `admission.burst` | `1000` | Token-bucket capacity per producer. |
 | `queues.capacity` | `512` | Events buffered per producer. See also `overload.queue_high_water`. |

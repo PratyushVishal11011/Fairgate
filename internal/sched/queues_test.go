@@ -152,3 +152,26 @@ func TestQueueCapacityOverride(t *testing.T) {
 		t.Fatal("expected negative capacity to be rejected")
 	}
 }
+
+func TestLenCountsEventsAcrossProducers(t *testing.T) {
+	q, err := NewQueues(8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if q.Len() != 0 {
+		t.Fatalf("expected empty queues, got %d", q.Len())
+	}
+	for _, producer := range []string{"a", "a", "b"} {
+		seq := uint64(q.Len() + 1)
+		if !q.Enqueue(wire.Event{ProducerId: producer, ProducerEpoch: "1", Seq: seq}) {
+			t.Fatal("enqueue failed")
+		}
+	}
+	if q.Len() != 3 {
+		t.Fatalf("expected 3 queued events, got %d", q.Len())
+	}
+	<-q.Queue("a")
+	if q.Len() != 2 {
+		t.Fatalf("expected 2 queued events after a dequeue, got %d", q.Len())
+	}
+}
