@@ -1,14 +1,14 @@
-[FairGate](../README.md) › [Docs](README.md) › Development status and limitations
+[FairGate](../README.md) › [Docs](README.md) › Limitations
 
-# Development status and limitations
+# Limitations
 
-FairGate is an experimental beta. Interfaces, protocol details, configuration, and storage semantics may change. The project has tests for implemented components, but its end-to-end durability and fairness goals still require broader load, crash-recovery, and downstream-outage validation.
+These are known, documented behaviors of FairGate 1.x. Validate FairGate under your own load and failure modes before relying on it in production; the [load, reconcile, and chaos tools](tooling.md) are built for that.
 
-Known limitations of the current beta:
+Known limitations:
 
 - The gateway always constructs the ClickHouse store and starts the shipper; there is no mode that runs without storage. `FAIRGATE_SHIPPER_ENABLED` is no longer read.
 - Events must now include `producer_epoch`. Producers built against the earlier event format will have their events rejected until they send it.
-- Exactly-once storage assumes a single writer per event identity. The adapter's existence check reads before it inserts, so two gateways shipping the same identity at the same moment could both insert it. Route each producer to one gateway.
+- Exactly-once storage assumes a single writer per event identity. The adapter's existence check reads before it inserts, so two gateways shipping the same identity at the same moment could both insert it. Route each producer to one gateway; see [Running more than one gateway](deployment.md#running-more-than-one-gateway).
 - Each batch costs one extra checkpoint write (the pending intent) and one `event_id` lookup query in ClickHouse before the insert.
 - Existing ClickHouse tables created from an earlier schema must be migrated to the current `deploy/clickhouse/schema.sql` before this version writes to them. The schema file uses `CREATE TABLE IF NOT EXISTS`, so it does not add `producer_epoch` or change the sorting key on an existing table.
 - Reuse of an identity with different content is rejected only while the original event is still in the WAL. After its segment is reclaimed, a conflicting event is acknowledged and then dropped by the adapter (the first stored version wins).

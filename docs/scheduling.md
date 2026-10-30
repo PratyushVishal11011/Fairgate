@@ -54,7 +54,7 @@ The scheduler visits producer queues in rounds. On each visit to a backlogged pr
 - **Idle producers bank nothing.** A producer whose queue is empty has its credit reset to zero, as in classic DRR, so it cannot save up credit and later burst ahead of others.
 - **Weights only matter under contention.** A producer alone in the gateway is served as fast as its queue fills, whatever its weight.
 
-Each event costs one unit of credit regardless of its size. The scheduler is independent of event meaning, and its callback is responsible for downstream handling. At this beta stage, the callback only logs events; database delivery is handled by the separate WAL shipper.
+Each event costs one unit of credit regardless of its size. The scheduler is independent of event meaning, and its callback is responsible for downstream handling. The gateway's callback only counts and logs events; database delivery is handled by the separate WAL shipper.
 
 ```mermaid
 flowchart TD

@@ -4,6 +4,14 @@
 
 ## Recent updates
 
+### 30th October, 2026: FairGate 1.0.0
+
+FairGate is out of beta. Version 1.0.0 follows [Semantic Versioning](https://semver.org/): within 1.x, the wire protocol (under its [compatibility rules](wire-protocol.md#compatibility-rules)), the configuration keys, the WAL format, and the metric names stay backward compatible.
+
+- **Version.** `server.Version`, `fairgate_build_info`, and the welcome frame now report `1.0.0`.
+- **One gateway per producer.** The README now states up front that exactly-once delivery needs each producer to use a single gateway at a time. The new [Running more than one gateway](deployment.md#running-more-than-one-gateway) section explains how to partition producers, how to get high availability by restarting a gateway on its own volume, and how readers can deduplicate with `FINAL` if a producer may reach two gateways.
+- **Docs.** Beta notices are removed. [Limitations](limitations.md) lists the known behaviors of 1.x, and [Security](SECURITY.md) now says fixes go to the latest 1.x release.
+
 ### 30th October, 2026: Wire protocol versioning
 
 - **Handshake.** A connection now opens with a hello frame (type `3`) carrying the range of protocol versions the client speaks. The server answers with a welcome frame (type `4`) naming the highest version both speak, plus its `max_frame_bytes` and `max_identifier_bytes`. A hello with no version in common gets a welcome with `unsupported_version` and the range the server speaks, then the connection closes.

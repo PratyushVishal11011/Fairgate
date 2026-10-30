@@ -37,4 +37,4 @@ These are acceptable only when every client that can connect is trusted, for exa
 
 Please report security problems privately rather than in a public issue. Use [GitHub's private vulnerability reporting](https://github.com/PratyushVishal11011/Fairgate/security/advisories/new) for this repository. Include the FairGate version, how to reproduce the problem, and its impact. You will get an acknowledgement as soon as the report has been read.
 
-FairGate is in beta, and only the latest commit on `main` receives fixes.
+Security fixes are made on `main` and released in the latest 1.x version. Older versions do not receive fixes.

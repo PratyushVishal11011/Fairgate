@@ -56,7 +56,7 @@ sequenceDiagram
     participant P as Producer
     participant S as FairGate
     P->>S: Hello {min_version: 1, max_version: 1, client: "my-producer/2.3"}
-    S->>P: Welcome {version: 1, server: "fairgate/0.1.0", max_frame_bytes: 5242880, max_identifier_bytes: 256}
+    S->>P: Welcome {version: 1, server: "fairgate/1.0.0", max_frame_bytes: 5242880, max_identifier_bytes: 256}
     P->>S: Event
     S->>P: ACK
 ```

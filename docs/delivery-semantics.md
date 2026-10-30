@@ -2,7 +2,7 @@
 
 # Delivery semantics
 
-| Property | Current beta |
+| Property | Status |
 |---|---|
 | Event persisted to the WAL before acknowledgment | Yes |
 | Disk synchronization completed (per batch) before acknowledgment | Yes |
@@ -56,8 +56,8 @@ Exactly-once here means that every acknowledged event identity (`producer_id`, `
 
 The guarantee holds under these conditions:
 
-- **Single writer per identity.** Each event identity is written by a single gateway, with one WAL and one shipper. The existence check reads before it inserts, so two gateways shipping the same identity at the same moment could both insert it. Route each producer to one gateway.
+- **Single writer per identity.** Each event identity is written by a single gateway, with one WAL and one shipper. The existence check reads before it inserts, so two gateways shipping the same identity at the same moment could both insert it. Route each producer to one gateway; see [Running more than one gateway](deployment.md#running-more-than-one-gateway).
 - **First write wins for identity reuse after reclamation.** Identity reuse with different content is rejected only while the original is still in the WAL. After reclamation, a conflicting event is acknowledged and then dropped by the adapter, because the first stored version wins.
 - **TTL expiry.** Rows removed by the table's 30-day TTL no longer count as stored. A resend of an expired event would be stored again, and then expire on the same TTL.
 
-FairGate is still a beta. Validate it under your own load and failure modes before production use.
+Validate these conditions under your own load and failure modes before relying on them in production, the single-writer condition in particular.
