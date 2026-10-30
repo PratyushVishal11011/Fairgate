@@ -92,6 +92,15 @@ wal:
   # Segment size in bytes before the writer rotates. Shipped segments are reclaimed whole,
   # so smaller segments free disk space sooner. 67108864 is 64 MiB.
   segment_size: 67108864
+  # What startup does with damaged records the shipper has not delivered yet. "refuse" stops
+  # startup so you can run "fairgate wal inspect"; "quarantine" copies the segment to
+  # quarantine/, cuts it at the damage, and starts. A torn final record, or damage to records
+  # already shipped, is handled automatically either way.
+  on_corruption: refuse
+  # If a write or fsync fails and moving to a fresh segment fails too, the gateway refuses events
+  # (rejected / storage_unavailable) and reports not ready. After this long it exits with status 3
+  # so a supervisor can restart it. 0 never exits.
+  degraded_exit_after: 1m
 
 shipper:
   # Where the shipper keeps its delivery position. Keep it on the same persistent volume as the WAL.

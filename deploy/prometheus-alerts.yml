@@ -148,3 +148,21 @@ groups:
         annotations:
           summary: "Clients are breaking the wire protocol"
           description: "{{ $labels.instance }} is refusing more than one frame or connection per second for malformed, oversized, unsupported, truncated, or stalled frames, or for ACKs clients do not read. Check fairgate_protocol_errors_total by reason."
+
+      - alert: FairGateWALDegraded
+        expr: fairgate_wal_degraded == 1
+        for: 30s
+        labels:
+          severity: critical
+        annotations:
+          summary: "FairGate cannot write to its WAL"
+          description: "A write or fsync failed on {{ $labels.instance }} and moving to a fresh segment failed too. Events are refused with rejected / storage_unavailable, /ready reports not ready, and the gateway exits with status 3 after wal.degraded_exit_after. Check the disk under wal.path."
+
+      - alert: FairGateWALDataQuarantined
+        expr: fairgate_wal_recovery_damage_regions{action="quarantined"} > 0
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: "FairGate quarantined damaged WAL records that were not shipped"
+          description: "Startup recovery on {{ $labels.instance }} found damaged records the shipper had not delivered and set the segment aside under quarantine/. Events in the damaged bytes are lost. The startup log names the segment and byte range; the quarantined copy is kept for investigation."

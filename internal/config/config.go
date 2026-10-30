@@ -136,6 +136,10 @@ type WAL struct {
 	Path string `yaml:"path"`
 	//segment size in bytes before the writer rotates to a new segment.
 	SegmentSize int64 `yaml:"segment_size"`
+	//what startup recovery does with damaged records the shipper has not delivered: refuse or quarantine.
+	OnCorruption string `yaml:"on_corruption"`
+	//how long the WAL may stay unable to accept appends before the gateway exits for a restart; 0 never exits.
+	DegradedExitAfter time.Duration `yaml:"degraded_exit_after"`
 }
 
 type Shipper struct {
@@ -210,8 +214,10 @@ func Default() Config {
 			SampleInterval:     100 * time.Millisecond,
 		},
 		WAL: WAL{
-			Path:        "data/fairgate.wal",
-			SegmentSize: 64 << 20,
+			Path:              "data/fairgate.wal",
+			SegmentSize:       64 << 20,
+			OnCorruption:      "refuse",
+			DegradedExitAfter: time.Minute,
 		},
 		Shipper: Shipper{
 			CheckpointPath: "data/checkpoint.json",
@@ -359,6 +365,8 @@ func (c Config) Validate() error {
 
 	check(c.WAL.Path != "", "wal.path is required")
 	check(c.WAL.SegmentSize > 0, "wal.segment_size must be greater than zero")
+	check(c.WAL.OnCorruption == "refuse" || c.WAL.OnCorruption == "quarantine", "wal.on_corruption must be refuse or quarantine")
+	check(c.WAL.DegradedExitAfter >= 0, "wal.degraded_exit_after cannot be negative")
 
 	check(c.Shipper.CheckpointPath != "", "shipper.checkpoint_path is required")
 	check(c.Shipper.BatchSize > 0, "shipper.batch_size must be greater than zero")

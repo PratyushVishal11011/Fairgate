@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"hash/crc32"
 	"io"
 	"os"
 )
@@ -29,6 +28,7 @@ type Reader struct {
 	position  Position
 	file      *os.File
 	segmentId uint64
+	format    format
 }
 
 func NewReader(wal *WAL, position Position) *Reader {
@@ -66,9 +66,21 @@ func (reader *Reader) openSegment() error {
 	if err != nil {
 		return err
 	}
+	info, err := file.Stat()
+	if err != nil {
+		_ = file.Close()
+		return err
+	}
+	//an empty segment can only be the active one, and the writer fills it with v2 records.
+	segmentFormat, err := detectFormat(file, info.Size())
+	if err != nil {
+		_ = file.Close()
+		return err
+	}
 
 	reader.file = file
 	reader.segmentId = reader.position.SegmentId
+	reader.format = segmentFormat
 
 	return nil
 }
@@ -86,7 +98,8 @@ func (reader *Reader) Next() (Record, error) {
 		//TODO: Come up with a better solution for this
 		fileInfo, err := reader.file.Stat()
 
-		if reader.position.Offset+8 > fileInfo.Size() {
+		headerSize := reader.format.headerSize()
+		if reader.position.Offset+headerSize > fileInfo.Size() {
 			durable := reader.wal.DurableEnd()
 			if reader.position.SegmentId < durable.SegmentId {
 				segments, err := listSegments(reader.wal.path)
@@ -117,7 +130,7 @@ func (reader *Reader) Next() (Record, error) {
 			return Record{}, io.EOF
 		}
 
-		header := make([]byte, 8)
+		header := make([]byte, headerSize)
 		_, err = reader.file.ReadAt(header, reader.position.Offset)
 		if err != nil {
 			if errors.Is(err, io.EOF) {
@@ -126,7 +139,18 @@ func (reader *Reader) Next() (Record, error) {
 			return Record{}, err
 		}
 
-		payloadLength := binary.BigEndian.Uint32(header[0:4])
+		lengthAt, checksumAt := 0, 4
+		if reader.format == formatV2 {
+			if binary.BigEndian.Uint32(header[0:4]) != recordMagic {
+				return Record{}, fmt.Errorf(
+					"WAL record magic missing at segment %d Offset %d",
+					reader.position.SegmentId,
+					reader.position.Offset,
+				)
+			}
+			lengthAt, checksumAt = 4, 8
+		}
+		payloadLength := binary.BigEndian.Uint32(header[lengthAt : lengthAt+4])
 
 		if payloadLength > maxRecordSize {
 			return Record{}, fmt.Errorf(
@@ -136,16 +160,16 @@ func (reader *Reader) Next() (Record, error) {
 			)
 		}
 
-		recordSize := int64(8 + payloadLength)
+		recordSize := headerSize + int64(payloadLength)
 
 		if !reader.canRead(recordSize) {
 			return Record{}, io.EOF
 		}
 
-		expectedCRC := binary.BigEndian.Uint32(header[4:8])
+		expectedCRC := binary.BigEndian.Uint32(header[checksumAt : checksumAt+4])
 
 		payload := make([]byte, payloadLength)
-		payloadOffset := reader.position.Offset + 8
+		payloadOffset := reader.position.Offset + headerSize
 
 		_, err = reader.file.ReadAt(payload, payloadOffset)
 
@@ -160,7 +184,7 @@ func (reader *Reader) Next() (Record, error) {
 			return Record{}, err
 		}
 
-		actualCRC := crc32.ChecksumIEEE(payload)
+		actualCRC := recordChecksum(reader.format, header, payload)
 		if actualCRC != expectedCRC {
 			return Record{}, fmt.Errorf(
 				"WAL checksum mismatch at segment %d Offset %d",
@@ -181,7 +205,7 @@ func (reader *Reader) Next() (Record, error) {
 
 		end := Position{
 			SegmentId: reader.position.SegmentId,
-			Offset:    reader.position.Offset + 8 + int64(payloadLength),
+			Offset:    reader.position.Offset + recordSize,
 		}
 
 		reader.position = end

@@ -44,19 +44,23 @@ func TestAppend(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if len(data) < 8 {
+	if len(data) < v2HeaderSize {
 		t.Fatal("WAL record is too short")
 	}
 
-	length := binary.BigEndian.Uint32(data[:4])
-	checksum := binary.BigEndian.Uint32(data[4:8])
-	payload := data[8:]
+	//v2 record: magic, length, crc32(length || payload), payload.
+	if binary.BigEndian.Uint32(data[:4]) != recordMagic {
+		t.Fatal("record does not start with the magic")
+	}
+	length := binary.BigEndian.Uint32(data[4:8])
+	checksum := binary.BigEndian.Uint32(data[8:12])
+	payload := data[12:]
 
 	if uint32(len(payload)) != length {
 		t.Fatal("record length mismatch")
 	}
 
-	if crc32.ChecksumIEEE(payload) != checksum {
+	if crc32.Update(crc32.ChecksumIEEE(data[4:8]), crc32.IEEETable, payload) != checksum {
 		t.Fatal("checksum mismatch")
 	}
 

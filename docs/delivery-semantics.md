@@ -16,9 +16,11 @@
 | WAL split into segments with rotation | Yes |
 | Persisted records scanned across segments on restart | Yes |
 | Sparse segment set (after reclamation) handled on restart | Yes |
-| Incomplete record in a non-final segment rejected on restart | Yes |
+| Damaged records that were not shipped refused on restart | Yes, unless `wal.on_corruption` is `quarantine` or `fairgate wal repair` is run |
+| Torn final record, and damage to records already shipped, handled on restart without intervention | Yes |
 | Recovered events replayed into queues on restart | Yes, from segments still on disk |
-| WAL write or sync failure surfaced to callers | Yes |
+| WAL write or sync failure surfaced to callers | Only if failover to a fresh segment also fails; then as a retryable `rejected` / `storage_unavailable` |
+| Failed fsync retried on the same file | No; the batch is rewritten to a fresh segment |
 | WAL kept open until all handlers and the shipper exit during shutdown | Yes |
 | Explicit queue-drain confirmation on shutdown | Yes, within `server.drain_timeout`: queues emptied and the shipper caught up to the durable WAL end, with the outcome logged |
 | Shipper and ClickHouse adapter available | Yes |

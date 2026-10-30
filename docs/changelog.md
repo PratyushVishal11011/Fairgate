@@ -4,6 +4,20 @@
 
 ## Recent updates
 
+### 30th October, 2026: WAL failures no longer need manual recovery
+
+- **A failed fsync is never retried on the same file.** After a failed `fsync`, Linux can drop unwritten pages and report a later `fsync` as successful. The writer now cuts the failed segment back to its durable end, writes the unacknowledged batch to a fresh segment, and acknowledges it only once that is synced. Previously any write, rotation, or sync failure made the WAL reject every later append until a restart.
+- **Degraded mode.** If the failover fails too, events get a retryable `rejected` / `storage_unavailable` ACK instead of `error` and a closed connection. The writer retries a fresh segment every second, the shipper keeps freeing space, and after `wal.degraded_exit_after` (1 minute) the gateway exits with status `3` so a supervisor restarts it.
+- **Readiness.** The new `/ready` endpoint returns `503` while the WAL is degraded; `/health` still reports liveness only.
+- **Directory sync on new segments.** Rotation now syncs the WAL directory after creating a segment, so a crash cannot lose a segment whose records were acknowledged.
+- **Record magic.** Records now start with a 4-byte magic, and the checksum covers the length too. Existing segments stay readable; the gateway starts a new segment instead of mixing formats.
+- **Recovery handles damage.** A torn record at the end of the newest segment is truncated, now including one with a bad checksum. Damage to records the shipper already delivered is skipped. Other damage still stops startup by default, now with the segment, byte range, and reason, unless `wal.on_corruption: quarantine` is set: the segment is then copied to `quarantine/`, cut at the damage, and the valid records after it are appended again. Previously any incomplete record in an earlier segment, or any checksum mismatch, stopped startup.
+- **`fairgate wal inspect` and `fairgate wal repair`.** Inspect reports every damaged region and what startup would do with it. Repair quarantines unshipped damage so the gateway can start.
+- **Metrics and alerts.** `fairgate_wal_degraded`, `fairgate_wal_failovers_total`, and `fairgate_wal_recovery_damage_regions{action}`, with the critical `FairGateWALDegraded` and `FairGateWALDataQuarantined` alerts.
+- **Security policy.** [`SECURITY.md`](SECURITY.md) states the trust model (no authentication or TLS; `producer_id` is trusted), what a connected client can do, how to deploy safely, and how to report a vulnerability.
+
+See [Write-Ahead Log](wal.md).
+
 ### 30th October, 2026: Protocol hardening
 
 - **Every frame gets an answer.** A frame of an unsupported type used to be logged and dropped without an ACK, which left a pipelining client waiting and its later ACKs out of step. It is now answered `invalid` / `unsupported_frame_type` and the connection is kept.

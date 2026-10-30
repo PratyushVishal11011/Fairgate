@@ -6,7 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"hash/crc32"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -24,14 +24,37 @@ const (
 	maxRecordSize      = 1 << 20
 	defaultSegmentSize = int64(64 << 20)
 	batchDelay         = 2 * time.Millisecond
+	//how often a degraded WAL tries to move to a fresh segment.
+	defaultResumeInterval = time.Second
 )
 
 // ErrRecordTooLarge reports an event whose encoded record exceeds the WAL's record limit.
 // It is a property of the event, not a WAL failure: the WAL stays usable.
 var ErrRecordTooLarge = errors.New("wal: record exceeds maximum size")
 
+// ErrUnavailable reports a WAL that cannot make appends durable: a write or sync failed and moving
+// to a fresh segment failed too. Appends are refused until a retry succeeds; nothing acknowledged
+// earlier is affected.
+var ErrUnavailable = errors.New("wal: unavailable")
+
+// File is the part of *os.File the WAL writes segments through.
+type File interface {
+	io.Writer
+	Sync() error
+	Truncate(size int64) error
+	Close() error
+}
+
+// Options configure OpenWithOptions.
+type Options struct {
+	//segment size in bytes before the writer rotates; 0 uses 64 MiB.
+	SegmentSize int64
+	//opens segment files for writing; nil uses os.OpenFile. Tests use it to inject write and sync failures.
+	OpenFile func(name string, flag int, perm os.FileMode) (File, error)
+}
+
 type appendRequest struct {
-	header  [8]byte
+	header  [v2HeaderSize]byte
 	payload []byte
 	done    chan error
 }
@@ -49,19 +72,25 @@ type WAL struct {
 	done     chan struct{}
 	closeErr error
 
-	//protects durableEnd
+	//protects durableEnd and health
 	//separate mutex because the write goroutine updates durableEnd while future WAL will need to read it
 	stateMu    sync.RWMutex
 	durableEnd Position
-	segmentMu  sync.Mutex
+	//non-nil while the WAL is degraded; wraps ErrUnavailable.
+	health    error
+	segmentMu sync.Mutex
 
 	//owned exclusively by the writer goroutine
-	file           *os.File
+	file           File
 	path           string
 	segmentId      uint64
 	size           int64
 	maxSegmentSize int64
-	fatalError     error
+	openFile       func(name string, flag int, perm os.FileMode) (File, error)
+	resumeInterval time.Duration
+	resumeAt       time.Time
+
+	failovers atomic.Int64
 
 	//optional instrumentation hooks; read by the writer goroutine.
 	observer atomic.Pointer[observerBox]
@@ -88,13 +117,30 @@ func (w *WAL) SetObserver(observer Observer) {
 }
 
 func Open(path string) (*WAL, error) {
-	return OpenWithSegmentSize(path, defaultSegmentSize)
+	return OpenWithOptions(path, Options{})
 }
 
 // OpenWithSegmentSize opens the WAL and rotates segments once they would exceed segmentSize bytes.
 func OpenWithSegmentSize(path string, segmentSize int64) (*WAL, error) {
 	if segmentSize <= 0 {
 		return nil, errors.New("segment size must be greater than zero")
+	}
+	return OpenWithOptions(path, Options{SegmentSize: segmentSize})
+}
+
+// OpenWithOptions opens the WAL for appending. If the newest segment holds legacy records,
+// appends go to a new segment so each segment has one record format.
+func OpenWithOptions(path string, opts Options) (*WAL, error) {
+	if opts.SegmentSize < 0 {
+		return nil, errors.New("segment size must be greater than zero")
+	}
+	if opts.SegmentSize == 0 {
+		opts.SegmentSize = defaultSegmentSize
+	}
+	if opts.OpenFile == nil {
+		opts.OpenFile = func(name string, flag int, perm os.FileMode) (File, error) {
+			return os.OpenFile(name, flag, perm)
+		}
 	}
 
 	segments, err := listSegments(path)
@@ -110,35 +156,63 @@ func OpenWithSegmentSize(path string, segmentSize int64) (*WAL, error) {
 		activePath = last.path
 	}
 
-	//O_CREATE - Create the file if it does not exist
-	//O_APPEND - Write new data at the end of the file
-	//O_WRONLY - Open the file for writing only
-	//0600 - Give the file owner read / write permissions
-	file, err := os.OpenFile(activePath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
-	if err != nil {
-		return nil, err
-	}
-
-	info, err := file.Stat()
-	if err != nil {
-		_ = file.Close()
+	var size int64
+	legacy := false
+	info, err := os.Stat(activePath)
+	switch {
+	case err == nil:
+		size = info.Size()
+		f, err := os.Open(activePath)
+		if err != nil {
+			return nil, err
+		}
+		segmentFormat, err := detectFormat(f, size)
+		_ = f.Close()
+		if err != nil {
+			return nil, err
+		}
+		legacy = segmentFormat == formatLegacy
+	case !os.IsNotExist(err):
 		return nil, err
 	}
 
 	w := &WAL{
-		file:           file,
 		path:           path,
 		segmentId:      segmentId,
-		size:           info.Size(),
-		maxSegmentSize: segmentSize,
+		size:           size,
+		maxSegmentSize: opts.SegmentSize,
+		openFile:       opts.OpenFile,
+		resumeInterval: defaultResumeInterval,
 		requests:       make(chan appendRequest, maxRecordSize),
 		done:           make(chan struct{}),
 
 		//update for new fields added
 		durableEnd: Position{
 			SegmentId: segmentId,
-			Offset:    info.Size(),
+			Offset:    size,
 		},
+	}
+
+	if legacy {
+		//keep the legacy segment as written and start the next one in the current format.
+		if err := w.openSegment(segmentId + 1); err != nil {
+			return nil, err
+		}
+	} else {
+		//O_CREATE - Create the file if it does not exist
+		//O_APPEND - Write new data at the end of the file
+		//O_WRONLY - Open the file for writing only
+		//0600 - Give the file owner read / write permissions
+		file, err := w.openFile(activePath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
+		if err != nil {
+			return nil, err
+		}
+		w.file = file
+		//a newly created segment is not durable until its directory entry is.
+		if err := syncDir(filepath.Dir(path)); err != nil {
+			_ = file.Close()
+			return nil, err
+		}
 	}
 
 	go w.writerLoop()
@@ -166,7 +240,25 @@ func (w *WAL) Append(event wire.Event) error {
 	return <-req.done
 }
 
-// encodeRecord converts an event into a WAL record: an 8-byte header followed by the JSON payload.
+// Health returns nil while the WAL accepts appends, and an error wrapping ErrUnavailable while it is degraded.
+func (w *WAL) Health() error {
+	w.stateMu.RLock()
+	defer w.stateMu.RUnlock()
+	return w.health
+}
+
+// Failovers returns how many times the writer moved to a fresh segment after a write or sync failure.
+func (w *WAL) Failovers() int64 {
+	return w.failovers.Load()
+}
+
+func (w *WAL) setHealth(err error) {
+	w.stateMu.Lock()
+	w.health = err
+	w.stateMu.Unlock()
+}
+
+// encodeRecord converts an event into a v2 WAL record: a 12-byte header followed by the JSON payload.
 func encodeRecord(event wire.Event) (appendRequest, error) {
 	// Convert the event struct into JSON so it can be stored
 	// persistently and reconstructed during WAL recovery.
@@ -183,15 +275,17 @@ func encodeRecord(event wire.Event) (appendRequest, error) {
 
 	req := appendRequest{payload: payload, done: make(chan error, 1)}
 
-	// Store the payload length in the first four bytes of the header
-	// using big-endian byte order. Recovery uses this value to
-	// determine how many bytes belong to the record.
-	binary.BigEndian.PutUint32(req.header[:4], uint32(len(payload)))
+	// The magic marks the start of a record, so recovery can find the next
+	// record after a damaged one.
+	binary.BigEndian.PutUint32(req.header[0:4], recordMagic)
 
-	// Calculate a CRC32 checksum of the payload and store it in
-	// the final four bytes of the header. Recovery recalculates
-	// this checksum to detect corrupted records.
-	binary.BigEndian.PutUint32(req.header[4:8], crc32.ChecksumIEEE(payload))
+	// Store the payload length using big-endian byte order. Recovery uses
+	// this value to determine how many bytes belong to the record.
+	binary.BigEndian.PutUint32(req.header[4:8], uint32(len(payload)))
+
+	// The checksum covers the length and the payload, so recovery detects a
+	// corrupted length as well as a corrupted payload.
+	binary.BigEndian.PutUint32(req.header[8:12], recordChecksum(formatV2, req.header[:], payload))
 
 	return req, nil
 }
@@ -215,10 +309,29 @@ func (w *WAL) writerLoop() {
 	closing := false
 
 	for !closing {
+		// While degraded, wake up periodically to retry a fresh segment
+		// even when no appends arrive.
+		var resume <-chan time.Time
+		var resumeTimer *time.Timer
+		if w.Health() != nil {
+			resumeTimer = time.NewTimer(time.Until(w.resumeAt))
+			resume = resumeTimer.C
+		}
+
 		// Wait for the first append request. The previous WAL handled
 		// individual appends; now requests are received by this
 		// dedicated goroutine for batching.
-		first, ok := <-w.requests
+		var first appendRequest
+		var ok bool
+		select {
+		case first, ok = <-w.requests:
+		case <-resume:
+			w.tryResume()
+			continue
+		}
+		if resumeTimer != nil {
+			resumeTimer.Stop()
+		}
 		if !ok {
 			break
 		}
@@ -308,22 +421,34 @@ func (w *WAL) writerLoop() {
 // writeBatch writes a group of append requests to the WAL and performs
 // a single Sync() for the entire batch.
 //
-// Previously, each Append() call wrote its event directly to the WAL
-// and called Sync() individually. With group commit, the writer goroutine
-// collects multiple requests and passes them here, reducing the number
-// of disk synchronization operations.
+// If a write, rotation, or Sync() fails, the batch is written again to a
+// fresh segment (see failover). Callers are told about a failure only if
+// that fails too, and then with an error wrapping ErrUnavailable.
 //
 // The writer goroutine is the sole owner of the WAL file, so this
 // function does not need a mutex to protect file operations.
 func (w *WAL) writeBatch(batch []appendRequest) {
-
-	//If a previous write or Sync() failed, the WAL is considered unusable for further appends.
-	//Notify every request in this batch of the existing error without attempting additional writes.
-	if w.fatalError != nil {
-		for _, req := range batch {
-			req.done <- w.fatalError
+	// A degraded WAL refuses appends at once; the resume timer in
+	// writerLoop retries a fresh segment.
+	err := w.Health()
+	if err == nil {
+		if err = w.writeAndSync(batch); err != nil {
+			err = w.failover(batch, err)
 		}
-		return
+	}
+
+	// Notify every request in the batch.
+	// A nil error indicates that the batch was written and synced.
+	for _, item := range batch {
+		item.done <- err
+	}
+}
+
+// writeAndSync writes the batch to the active segment, rotating as needed,
+// and makes it durable with one Sync().
+func (w *WAL) writeAndSync(batch []appendRequest) error {
+	if w.file == nil {
+		return errors.New("no active WAL segment")
 	}
 
 	// Records arrive already encoded and validated by Append().
@@ -339,11 +464,7 @@ func (w *WAL) writeBatch(batch []appendRequest) {
 		// used in tests without creating an empty segment repeatedly.
 		if w.size > 0 && w.size+item.size() > w.maxSegmentSize {
 			if err := w.rotate(); err != nil {
-				// A rotation failure prevents the batch from being
-				// safely completed. Store the error so future batches
-				// are rejected as well.
-				w.fatalError = err
-				break
+				return err
 			}
 		}
 
@@ -352,17 +473,14 @@ func (w *WAL) writeBatch(batch []appendRequest) {
 		// writeFull() ensures all bytes are written, even if an
 		// individual file.Write() call writes only part of the data.
 		if err := writeFull(w.file, item.header[:]); err != nil {
-			w.fatalError = err
-			break
+			return err
 		}
 
 		// Write the JSON payload immediately after its header.
-		// If this write fails, the record may be incomplete.
-		// Recovery handles incomplete trailing records by truncating
-		// the final segment to the last valid record boundary.
+		// If this write fails, the record may be incomplete; failover
+		// cuts the segment back to its durable end.
 		if err := writeFull(w.file, item.payload); err != nil {
-			w.fatalError = err
-			break
+			return err
 		}
 
 		// Update the active segment's size only after the complete
@@ -371,35 +489,92 @@ func (w *WAL) writeBatch(batch []appendRequest) {
 		bytes += item.size()
 	}
 
-	// Only synchronize the file if all records were written without
-	// an error. One Sync() makes the entire successfully written batch
-	// durable before the callers receive successful acknowledgements.
-	if w.fatalError == nil {
-		syncStart := time.Now()
-		if err := w.file.Sync(); err != nil {
-			//A Sync() failure means the durability of the batch cannot be confirmed. Treat the WAL as failed.
-			w.fatalError = err
-		} else {
-			w.stateMu.Lock()
-			w.durableEnd = Position{
-				SegmentId: w.segmentId,
-				Offset:    w.size,
-			}
-			w.stateMu.Unlock()
-
-			if box := w.observer.Load(); box != nil {
-				box.BatchCommitted(len(batch), bytes, time.Since(syncStart))
-			}
-		}
+	// One Sync() makes the entire batch durable before the callers
+	// receive successful acknowledgements.
+	syncStart := time.Now()
+	if err := w.file.Sync(); err != nil {
+		return err
 	}
 
-	// Notify every request in the batch.
-	// A nil error indicates that the batch was written and synced.
-	// If any write, rotation, or Sync() operation failed, return
-	// the WAL's fatal error rather than confirming success.
-	for _, item := range batch {
-		item.done <- w.fatalError
+	w.stateMu.Lock()
+	w.durableEnd = Position{
+		SegmentId: w.segmentId,
+		Offset:    w.size,
 	}
+	w.stateMu.Unlock()
+
+	if box := w.observer.Load(); box != nil {
+		box.BatchCommitted(len(batch), bytes, time.Since(syncStart))
+	}
+	return nil
+}
+
+// failover recovers from a failed write or Sync() without trusting the failed file again.
+//
+// After a failed fsync, Linux may drop the unwritten pages and report a later fsync of the same
+// file as successful, so retrying the Sync() could acknowledge data that is not on disk. Instead,
+// the failed segment is cut back to its durable end and the whole batch, which no caller has seen
+// acknowledged, is written to a fresh segment. If any step fails, the WAL becomes degraded.
+func (w *WAL) failover(batch []appendRequest, cause error) error {
+	if err := w.cutBack(); err != nil {
+		return w.degrade(cause, err)
+	}
+	if err := w.openSegment(w.segmentId + 1); err != nil {
+		return w.degrade(cause, err)
+	}
+	if err := w.writeAndSync(batch); err != nil {
+		return w.degrade(cause, err)
+	}
+	w.failovers.Add(1)
+	return nil
+}
+
+// cutBack truncates the active segment to its durable end and closes it. Records past the
+// durable end were never acknowledged. Copies of them that a rotation already synced are
+// harmless: replay and the store treat an identical record as a duplicate.
+func (w *WAL) cutBack() error {
+	if w.file == nil {
+		return nil
+	}
+	durable := w.DurableEnd()
+	end := int64(0)
+	if durable.SegmentId == w.segmentId {
+		end = durable.Offset
+	}
+	if err := w.file.Truncate(end); err != nil {
+		return err
+	}
+	if err := w.file.Sync(); err != nil {
+		return err
+	}
+	if err := w.file.Close(); err != nil {
+		return err
+	}
+	w.file = nil
+	w.size = end
+	return nil
+}
+
+// degrade marks the WAL unavailable. Appends are refused until tryResume succeeds.
+func (w *WAL) degrade(cause, err error) error {
+	unavailable := fmt.Errorf("%w: %v; moving to a fresh segment failed: %v", ErrUnavailable, cause, err)
+	w.resumeAt = time.Now().Add(w.resumeInterval)
+	w.setHealth(unavailable)
+	return unavailable
+}
+
+// tryResume moves a degraded WAL to a fresh segment, so appends can resume.
+func (w *WAL) tryResume() {
+	err := w.cutBack()
+	if err == nil {
+		err = w.openSegment(w.segmentId + 1)
+	}
+	if err != nil {
+		w.resumeAt = time.Now().Add(w.resumeInterval)
+		return
+	}
+	w.failovers.Add(1)
+	w.setHealth(nil)
 }
 
 func (w *WAL) rotate() error {
@@ -416,16 +591,35 @@ func (w *WAL) rotate() error {
 	}
 	w.file = nil
 
-	nextId := w.segmentId + 1
-	nextPath := segmentPath(w.path, nextId)
+	return w.openSegmentLocked(w.segmentId + 1)
+}
 
-	file, err := os.OpenFile(nextPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
+// openSegment creates segment id and makes it the active segment.
+func (w *WAL) openSegment(id uint64) error {
+	w.segmentMu.Lock()
+	defer w.segmentMu.Unlock()
+	return w.openSegmentLocked(id)
+}
+
+func (w *WAL) openSegmentLocked(id uint64) error {
+	nextPath := segmentPath(w.path, id)
+
+	// O_TRUNC: a segment past the active one was never acknowledged into, so anything an
+	// earlier failed attempt left in it can be discarded.
+	file, err := w.openFile(nextPath, os.O_CREATE|os.O_TRUNC|os.O_APPEND|os.O_WRONLY, 0600)
 	if err != nil {
 		return err
 	}
 
+	// Without a directory sync, a crash can lose the new segment's directory entry
+	// even after its records were synced and acknowledged.
+	if err := syncDir(filepath.Dir(w.path)); err != nil {
+		_ = file.Close()
+		return err
+	}
+
 	w.file = file
-	w.segmentId = nextId
+	w.segmentId = id
 	w.size = 0
 
 	if box := w.observer.Load(); box != nil {
@@ -556,7 +750,7 @@ func (w *WAL) Close() error {
 	return w.closeErr
 }
 
-func writeFull(file *os.File, data []byte) error {
+func writeFull(file io.Writer, data []byte) error {
 	//loop continues as long as there are bytes left to write.
 	for len(data) > 0 {
 		//file.Write() attempts to write the bytes to the file.
