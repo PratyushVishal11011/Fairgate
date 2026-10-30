@@ -34,7 +34,7 @@ The examples below assume the Compose stack from the [quick start](../README.md#
 go run ./cmd/loadgen -producers 200 -events 2000 -rate 100 -window 4
 ```
 
-Each producer opens one TCP connection and sends events with the wire protocol. The producers share one `producer_epoch`, unique per run, so the events of one run never collide with another's. Event `seq` numbers start at 1 for each producer, and `idx` is always 0.
+Each producer opens one TCP connection, negotiates the protocol version with a hello (or skips it with `-legacy`, to act like an older client), and sends events. The producers share one `producer_epoch`, unique per run, so the events of one run never collide with another's. Event `seq` numbers start at 1 for each producer, and `idx` is always 0.
 
 How a producer behaves:
 
@@ -71,6 +71,7 @@ A run ends when every producer has sent `-events` events, or when `-duration` pa
 | `-max-backoff` | `2s` | Cap on retry and reconnect backoff. |
 | `-drain-timeout` | `60s` | Time after sending stops to finish outstanding events. |
 | `-seed` | `1` | Seed for jitter and malformed frames. |
+| `-legacy` | `false` | Skip the protocol handshake, as clients written before protocol versioning do. |
 | `-out` | `benchmarks/loadgen-<timestamp>` | Results directory. |
 
 ### Output

@@ -171,14 +171,14 @@ func TestProxyResetsAndRefusesConnections(t *testing.T) {
 	if err := p.SetFaults(Faults{Refuse: true}); err != nil {
 		t.Fatal(err)
 	}
+	//the reset can arrive while the client is still connecting, or on its first read or write.
 	conn, err = net.Dial("tcp", p.Addr())
-	if err != nil {
-		t.Fatal(err)
+	if err == nil {
+		if _, err := roundTrip(t, conn, "boom"); err == nil {
+			t.Fatal("expected a refused connection")
+		}
+		_ = conn.Close()
 	}
-	if _, err := roundTrip(t, conn, "boom"); err == nil {
-		t.Fatal("expected a refused connection")
-	}
-	_ = conn.Close()
 
 	stats := p.Stats()
 	if stats.Resets != 1 || stats.Refused != 1 {

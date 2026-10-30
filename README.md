@@ -105,8 +105,13 @@ See [Configuration](docs/configuration.md) for all settings and environment over
 | [Features](docs/features.md) | Everything currently implemented. |
 | [Development](docs/development.md) | Project structure, building, testing. |
 | [Limitations](docs/limitations.md) | Known limitations of the beta. |
+| [Security](docs/SECURITY.md) | Trust model, safe deployment, reporting a vulnerability. |
 | [Roadmap](docs/roadmap.md) | Implemented and planned work. |
 | [Changelog](docs/changelog.md) | Dated updates. |
+
+## Security
+
+FairGate has no built-in authentication or TLS and trusts the `producer_id` in every event, so it must run on a trusted network or behind a system that authenticates producers. See [Security](docs/SECURITY.md) for the trust model and how to report a vulnerability privately.
 
 ## Contributing
 

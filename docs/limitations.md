@@ -26,8 +26,9 @@ Known limitations of the current beta:
 - Overload handling refuses new events but never drops events that were already accepted. If a queue fills despite the high-water mark (several connections of one producer appending at once), enqueueing still blocks, cancelable during shutdown.
 - The gateway-wide overload signals are sampled every `overload.sample_interval`, so a sudden burst can pass `max_queued_events` or `max_shipper_lag_bytes` by up to one interval's worth of events before refusals start.
 - Overload limits, like the other settings, are read at startup.
-- A WAL write, rotation, or sync failure is fatal: later appends are rejected until the WAL is reopened.
-- Startup recovery fails on an incomplete record in any non-final segment, rather than repairing it.
+- A WAL write or sync failure is retried once on a fresh segment. If that fails, the gateway refuses events until a retry works or `wal.degraded_exit_after` passes and it exits for a restart; it does not move the WAL to another disk.
+- Startup recovery refuses damaged records that have not been shipped unless `wal.on_corruption` is `quarantine` or `fairgate wal repair` is run, and quarantining loses the events inside the damaged bytes. Damage inside a legacy segment, written before the record magic, cannot be resynchronized, so everything after it in that segment is treated as damaged.
+- Recovery reads records only at startup. Damage that appears in an unshipped segment while the gateway runs still stops the shipper with an error.
 - A handler stuck in an operation that ignores connection closure and context cancellation can delay shutdown beyond the grace period.
 - The shutdown drain waits for the shipper only up to `server.drain_timeout`. During a ClickHouse outage it times out and the backlog stays in the WAL for the next start; it confirms queue processing by the scheduler, not by any downstream consumer of the queues.
 - The Compose file ships with development credentials and publishes the FairGate, ClickHouse, Prometheus, Alertmanager, and Grafana ports; restrict inbound access to trusted addresses as described in [Docker deployment](deployment.md) and replace the credentials before any non-development use.
@@ -37,6 +38,7 @@ Known limitations of the current beta:
 - `loadgen` always sends `idx` 0, and a count-bound run without `-duration` keeps redialling a gateway that never comes up until it is stopped.
 - The fault proxy delays, fragments, and resets per chunk read from a socket, not per frame or per TCP segment, and it cannot drop or reorder bytes within a connection.
 - Chaos scenario `exec` steps run shell commands with the caller's permissions, and the shipped scenarios assume the container names from `docker-compose.yml`.
+- `server.allow_legacy_clients` is `true` by default, so clients that never send a hello are still accepted as protocol version 0.
 - Per-producer metrics label only the producers listed in `fairness.producers`; all other producers share the `other` series.
 - Alertmanager sends no notifications until a receiver is configured, and the alert thresholds are generic starting points.
 - There is no metric for time spent waiting in the scheduler queue, or for events the ClickHouse adapter skipped as already stored.

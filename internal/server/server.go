@@ -12,7 +12,6 @@ import (
 	"FairGate/internal/wal"
 	"FairGate/internal/wire"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -33,19 +32,9 @@ const (
 	ackRejected = "rejected" // refused by the gateway, retryable after backoff
 	ackError    = "error"    // server-side failure, retryable
 	ackInvalid  = "invalid"  // malformed request, do not retry unchanged
-)
 
-func sendAck(conn net.Conn, ack wire.Ack) error {
-	payload, err := json.Marshal(ack)
-	if err != nil {
-		return err
-	}
-	return wire.WriteFrame(conn, wire.Frame{
-		Type:    wire.FrameTypeAck,
-		Flags:   0,
-		Payload: payload,
-	})
-}
+	ackStorageUnavailable = "storage_unavailable" // the WAL cannot make events durable right now
+)
 
 func Run(addr string, logger *slog.Logger) error {
 	return RunContext(context.Background(), addr, logger)
@@ -132,13 +121,46 @@ func runContext(ctx context.Context, cfg config.Config, logger *slog.Logger, new
 		return err
 	}
 
-	events, err := wal.Recover(walPath)
+	// The committed checkpoint tells recovery which damaged records are already in the store.
+	checkpoint := shipper.NewCheckpointStore(cfg.Shipper.CheckpointPath)
+	shipped, err := checkpoint.Load()
+	if err != nil {
+		return fmt.Errorf("load shipper checkpoint: %w", err)
+	}
+
+	recovery, err := wal.RecoverWithOptions(walPath, wal.RecoverOptions{
+		Shipped:      wal.Position{SegmentId: shipped.Segment, Offset: shipped.Offset},
+		OnCorruption: wal.CorruptionPolicy(cfg.WAL.OnCorruption),
+	})
 	if err != nil {
 		return err
+	}
+	events := recovery.Events
+	metrics.RecordWALDamage(recovery.Damage)
+	for _, damage := range recovery.Damage {
+		if damage.Action == wal.DamageQuarantined {
+			logger.Error("Quarantined a damaged WAL segment; records in the damaged bytes are lost",
+				"segment", damage.SegmentId,
+				"start", damage.Region.Start,
+				"end", damage.Region.End,
+				"reason", damage.Region.Reason,
+				"copy", damage.QuarantinePath,
+			)
+			continue
+		}
+		logger.Warn("Recovered past a damaged WAL region",
+			"segment", damage.SegmentId,
+			"start", damage.Region.Start,
+			"end", damage.Region.End,
+			"reason", damage.Region.Reason,
+			"action", damage.Action,
+		)
 	}
 
 	logger.Info("WAL recovery complete",
 		"recovered_events", len(events),
+		"salvaged_events", len(recovery.Salvaged),
+		"damaged_regions", len(recovery.Damage),
 	)
 
 	//create a deduplication manager instance
@@ -154,6 +176,29 @@ func runContext(ctx context.Context, cfg config.Config, logger *slog.Logger, new
 	defer walLog.Close()
 	walLog.SetObserver(metrics)
 	metrics.RegisterWAL(walLog)
+	metrics.SetReadiness(walLog.Health)
+
+	// Records cut out of a quarantined segment are written again, so they are still shipped.
+	for _, event := range recovery.Salvaged {
+		if err := walLog.Append(event); err != nil {
+			return fmt.Errorf("append salvaged WAL record: %w", err)
+		}
+	}
+
+	// A WAL that stays degraded for wal.degraded_exit_after stops the gateway, so a supervisor
+	// restarts it; startup recovery is the best-tested path back to a healthy WAL.
+	walErr := make(chan error, 1)
+	walWatchCtx, stopWALWatch := context.WithCancel(context.Background())
+	defer stopWALWatch()
+	if cfg.WAL.DegradedExitAfter > 0 {
+		go watchWAL(walWatchCtx, logger, walLog.Health, cfg.WAL.DegradedExitAfter, time.Second, func(err error) {
+			select {
+			case walErr <- err:
+			default:
+			}
+			_ = listener.Close()
+		})
+	}
 
 	shipperErr := make(chan error, 1)
 	shipperDone := make(chan struct{})
@@ -165,7 +210,6 @@ func runContext(ctx context.Context, cfg config.Config, logger *slog.Logger, new
 	}
 	defer storage.Close()
 
-	checkpoint := shipper.NewCheckpointStore(cfg.Shipper.CheckpointPath)
 	retry := cfg.Shipper.Retry
 	backoff := shipper.NewBackoff(
 		retry.InitialDelay,
@@ -386,6 +430,8 @@ func runContext(ctx context.Context, cfg config.Config, logger *slog.Logger, new
 			select {
 			case schedulerError := <-schedulerErr:
 				runErr = fmt.Errorf("scheduler error: %v", schedulerError)
+			case walError := <-walErr:
+				runErr = fmt.Errorf("WAL unavailable for %s: %w", cfg.WAL.DegradedExitAfter, walError)
 			case shippingError := <-shipperErr:
 				runErr = fmt.Errorf("shipper error: %w", shippingError)
 			default:
@@ -615,6 +661,22 @@ func handleConn(
 					Idx:        event.Idx,
 					Status:     ackRejected,
 					Message:    rejection.Reason,
+				}); err != nil {
+					logger.Warn("Failed to send NACK", "error", err)
+					return
+				}
+				continue
+			}
+
+			//a degraded WAL persisted nothing; the producer retries after backoff, possibly on another gateway.
+			if errors.Is(err, wal.ErrUnavailable) {
+				metrics.WALAppendError(event.ProducerId)
+				if err := acks.send(wire.Ack{
+					ProducerId: event.ProducerId,
+					Seq:        event.Seq,
+					Idx:        event.Idx,
+					Status:     ackRejected,
+					Message:    ackStorageUnavailable,
 				}); err != nil {
 					logger.Warn("Failed to send NACK", "error", err)
 					return

@@ -6,7 +6,8 @@ FairGate exports Prometheus metrics for every pipeline stage, ships alert rules 
 
 | Endpoint | Default address | Setting |
 |---|---|---|
-| `/health` | `:9100` | `server.metrics_addr` |
+| `/health` (liveness: the process is up) | `:9100` | `server.metrics_addr` |
+| `/ready` (readiness: events are accepted; `503` while the WAL is degraded) | `:9100` | `server.metrics_addr` |
 | `/metrics` (Prometheus) | `:9100` | `server.metrics_addr` |
 | `/debug/pprof/` | `127.0.0.1:6060`, off by default | `profiling.enabled`, `profiling.addr` |
 
@@ -31,7 +32,8 @@ Metrics with a `producer` label give each producer listed under [`fairness.produ
 | `fairgate_events_overloaded_total{reason}` | counter | Events refused before the WAL append because a backlog was over its limit. `reason` is `queue_backlogged`, `gateway_backlogged`, or `storage_backlogged`. See [Overload handling](scheduling.md#overload-handling). |
 | `fairgate_overload_active{signal}` | gauge | `1` while a gateway-wide backlog is over its limit, else `0`. `signal` is `gateway_queue` or `storage`. |
 | `fairgate_events_invalid_total` | counter | Events rejected as malformed payloads or as identity conflicts. |
-| `fairgate_protocol_errors_total{reason}` | counter | Frames or connections refused or closed for breaking the wire protocol. `reason` is `malformed_frame`, `frame_too_large`, `unsupported_frame_type`, `truncated_frame`, `idle_timeout`, `frame_timeout`, or `write_timeout`. See [Error handling](wire-protocol.md#error-handling). |
+| `fairgate_protocol_errors_total{reason}` | counter | Frames or connections refused or closed for breaking the wire protocol. `reason` is `malformed_frame`, `frame_too_large`, `unsupported_frame_type`, `truncated_frame`, `idle_timeout`, `frame_timeout`, `write_timeout`, `hello_required`, `invalid_hello`, `unsupported_version`, or `unexpected_hello`. See [Error handling](wire-protocol.md#error-handling). |
+| `fairgate_protocol_connections_total{version}` | counter | Connections by negotiated protocol version. `legacy` counts clients that send events without a hello. See [Handshake and versioning](wire-protocol.md#handshake-and-versioning). |
 | `fairgate_producer_events_total{producer, outcome}` | counter | Ingestion outcome per producer. `outcome` is `accepted`, `duplicate`, `rate_limited`, `queue_backlogged`, `gateway_backlogged`, `storage_backlogged`, `conflict`, or `wal_error`. Malformed payloads have no producer and appear only in `fairgate_events_invalid_total`. |
 | `fairgate_ingest_duration_seconds` | histogram | Time from reading an event frame to sending its accepted ACK, including the WAL append. |
 
@@ -46,7 +48,10 @@ Metrics with a `producer` label give each producer listed under [`fairness.produ
 | `fairgate_wal_segment_rotations_total` | counter | Segment rotations. |
 | `fairgate_wal_segments` | gauge | Segment files on disk. |
 | `fairgate_wal_disk_bytes` | gauge | Total size of the segment files on disk. |
-| `fairgate_wal_append_errors_total` | counter | Append failures. A write or sync failure is fatal, and later appends are rejected until restart. |
+| `fairgate_wal_append_errors_total` | counter | Events refused because the WAL could not append them, including every event refused while the WAL is degraded. |
+| `fairgate_wal_degraded` | gauge | `1` while the WAL cannot make appends durable and events are refused as `storage_unavailable`, else `0`. See [Write and sync failures](wal.md#write-and-sync-failures). |
+| `fairgate_wal_failovers_total` | counter | Times the writer moved to a fresh segment after a write or sync failure. |
+| `fairgate_wal_recovery_damage_regions{action}` | gauge | Damaged WAL regions the last startup recovery found, by `action`: `truncated_tail`, `skipped_shipped`, or `quarantined`. See [Recovery](wal.md#recovery). |
 
 ### Queues and scheduling
 
@@ -115,6 +120,8 @@ time() - fairgate_shipper_last_checkpoint_timestamp_seconds
 |---|---|---|
 | `FairGateDown` | critical | The gateway's metrics endpoint cannot be scraped for 1 minute. |
 | `FairGateWALAppendErrors` | critical | Any WAL append error in the last 5 minutes. |
+| `FairGateWALDegraded` | critical | The WAL has been unable to accept appends for 30 seconds. |
+| `FairGateWALDataQuarantined` | critical | Startup recovery quarantined damaged records that had not been shipped; those events are lost. |
 | `FairGateShipperStalled` | critical | There is undelivered WAL data and no checkpoint has been committed for 5 minutes, sustained for 5 minutes. |
 | `FairGateSchedulerStalled` | critical | Events are queued but none were processed for 2 minutes, sustained for 2 minutes. |
 | `FairGateWALSyncSlow` | warning | p99 fsync is over 100 ms for 10 minutes. |

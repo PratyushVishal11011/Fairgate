@@ -51,6 +51,8 @@ type Config struct {
 	DrainTimeout time.Duration
 	//seeds jitter and malformed-frame injection.
 	Seed int64
+	//send events without a hello first, as clients written before protocol versioning do.
+	Legacy bool
 }
 
 // DefaultConfig returns settings that suit a local Compose stack.

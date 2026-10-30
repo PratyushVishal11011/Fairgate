@@ -49,6 +49,7 @@ type SummaryConfig struct {
 	AckTimeout     string  `json:"ack_timeout"`
 	DrainTimeout   string  `json:"drain_timeout"`
 	Seed           int64   `json:"seed"`
+	Legacy         bool    `json:"legacy"`
 }
 
 type Totals struct {
@@ -110,6 +111,7 @@ func (r *Result) Summary() Summary {
 			AckTimeout:     cfg.AckTimeout.String(),
 			DrainTimeout:   cfg.DrainTimeout.String(),
 			Seed:           cfg.Seed,
+			Legacy:         cfg.Legacy,
 		},
 		Totals: Totals{
 			Rejected: map[string]int{},

@@ -33,5 +33,6 @@ Detailed documentation for FairGate. For a short overview and a quick start, see
 | [Features](features.md) | Everything currently implemented. |
 | [Development](development.md) | Project structure, requirements, building, and running the tests. |
 | [Limitations](limitations.md) | Development status and known limitations of the beta. |
+| [Security](SECURITY.md) | Trust model, what a connected client can do, safe deployment, and reporting a vulnerability. |
 | [Roadmap](roadmap.md) | Implemented and planned work. |
 | [Changelog](changelog.md) | Dated updates, newest first. |

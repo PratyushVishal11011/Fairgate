@@ -238,6 +238,14 @@ func (p *producer) connect() error {
 	if err != nil {
 		return err
 	}
+	if !p.cfg.Legacy {
+		_ = conn.SetDeadline(time.Now().Add(p.cfg.DialTimeout))
+		if _, err := wire.Handshake(conn, "fairgate-loadgen"); err != nil {
+			_ = conn.Close()
+			return fmt.Errorf("handshake: %w", err)
+		}
+		_ = conn.SetDeadline(time.Time{})
+	}
 	p.conn = &connection{
 		conn:   conn,
 		w:      bufio.NewWriter(conn),

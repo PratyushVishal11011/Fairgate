@@ -3,7 +3,9 @@ package main
 import (
 	"FairGate/internal/config"
 	"FairGate/internal/server"
+	"FairGate/internal/wal"
 	"context"
+	"errors"
 	"flag"
 	"log/slog"
 	"os"
@@ -11,7 +13,19 @@ import (
 	"syscall"
 )
 
+// Exit statuses.
+const (
+	exitError = 1
+	//the WAL stayed unable to accept appends for wal.degraded_exit_after; restart the gateway.
+	exitWALUnavailable = 3
+)
+
 func main() {
+	//"fairgate wal inspect|repair" works on the WAL of a stopped gateway.
+	if len(os.Args) > 1 && os.Args[1] == "wal" {
+		os.Exit(runWAL(os.Args[2:], os.Stdout, os.Stderr))
+	}
+
 	//the config file is optional: -config wins over FAIRGATE_CONFIG, and without either the built-in defaults apply.
 	//environment variables such as CLICKHOUSE_PASSWORD still override values from the file.
 	configPath := flag.String("config", os.Getenv("FAIRGATE_CONFIG"), "path to a FairGate YAML config file")
@@ -38,7 +52,10 @@ func main() {
 	//Start Fairgate on the configured address and the server will keep it running while it waits for a client to connect.
 	if err := run(logger, cfg, *configPath); err != nil {
 		logger.Error("FairGate stopped with an error", "error", err)
-		os.Exit(1)
+		if errors.Is(err, wal.ErrUnavailable) {
+			os.Exit(exitWALUnavailable)
+		}
+		os.Exit(exitError)
 	}
 }
 

@@ -35,6 +35,13 @@ func startProtocolHandler(t *testing.T, limits protocolLimits) *protocolHarness 
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { _ = walLog.Close() })
+	return startProtocolHandlerWithWAL(t, limits, walLog)
+}
+
+// startProtocolHandlerWithWAL runs one connection handler appending to walLog.
+func startProtocolHandlerWithWAL(t *testing.T, limits protocolLimits, walLog *wal.WAL) *protocolHarness {
+	t.Helper()
 	queues, err := sched.NewQueues(100)
 	if err != nil {
 		t.Fatal(err)
@@ -59,7 +66,6 @@ func startProtocolHandler(t *testing.T, limits protocolLimits) *protocolHarness 
 	t.Cleanup(func() {
 		_ = client.Close()
 		<-h.done
-		_ = walLog.Close()
 	})
 	_ = client.SetDeadline(time.Now().Add(5 * time.Second))
 	return h
