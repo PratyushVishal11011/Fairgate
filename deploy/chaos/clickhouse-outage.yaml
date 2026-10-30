@@ -1,0 +1,27 @@
+# Stop ClickHouse for 30 seconds under load. The gateway keeps accepting into the WAL while the
+# shipper retries with backoff, then catches up once ClickHouse returns. Every accepted event
+# must be stored exactly once. A longer outage, or a smaller overload.max_shipper_lag_bytes,
+# also exercises storage_backlogged rejections.
+# Assumes the Compose stack from docker-compose.yml is running.
+name: clickhouse-outage
+load:
+  addr: 127.0.0.1:9001
+  producers: 50
+  duration: 45s
+  rate: 40
+  window: 4
+  ramp: 2s
+  drain_timeout: 90s
+steps:
+  - name: stop clickhouse
+    at: 5s
+    exec: docker stop fairgate-clickhouse
+  - name: start clickhouse
+    at: 35s
+    exec: docker start fairgate-clickhouse
+    always: true
+reconcile:
+  # covers the shipper's retry backoff (up to shipper.retry.max_delay) after ClickHouse returns.
+  timeout: 4m
+expect:
+  min_accepted_ratio: 1.0

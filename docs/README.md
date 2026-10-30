@@ -15,6 +15,7 @@ Detailed documentation for FairGate. For a short overview and a quick start, see
 | [Delivery semantics](delivery-semantics.md) | What an ACK means, the exactly-once guarantee, and the conditions it depends on. |
 | [Event model and identity](event-model.md) | Event fields, validation, event identity, and idempotent retries. |
 | [Wire protocol](wire-protocol.md) | Frame layout, frame types, and acknowledgments. |
+| [Load, reconcile, and chaos tools](tooling.md) | The `loadgen`, `reconcile`, and `chaos` commands, the manifest format, the fault proxy, and chaos scenarios. |
 
 ## How it works
 

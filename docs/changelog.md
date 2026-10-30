@@ -4,6 +4,18 @@
 
 ## Recent updates
 
+### 30th October, 2026: Load, reconcile, and chaos tools
+
+The load generator, reconciliation, and chaos tooling now ship with FairGate as Go commands, so correctness under load and failure can be checked from a FairGate checkout alone.
+
+- **`loadgen`.** Simulated producers, one connection each, pipeline up to `-window` events and optionally pace to `-rate`. Rejected events are retried after jittered exponential backoff, and a dropped connection or an ACK timeout resends every in-flight event. Retries are byte-identical, so the gateway acknowledges an already-persisted event as a duplicate. `-hot` adds noisy-neighbour producers with their own rate and window, and `-malformed-ratio` mixes in undecodable frames. Each run writes `summary.json` (ACK and delivery latency percentiles, throughput, Jain fairness), `producers.csv`, `timeseries.csv`, and `manifest.json`, which records every event as accepted, unacked, or invalid.
+- **`reconcile`.** Waits for the shipper to catch up, then checks a manifest against `fairgate.events`. It reports accepted events that are missing, identities stored more than once, rows that were refused or never sent, and with `-verify-content`, rows whose content differs from what was sent. It exits `1` on any violation. ClickHouse settings come from the gateway config and the `CLICKHOUSE_*` variables.
+- **`chaos proxy`.** A TCP proxy that adds latency and jitter, fragments writes, resets connections, holds traffic as a partition does, and refuses connections. Faults change at runtime through an HTTP admin API.
+- **`chaos run`.** Runs a YAML scenario: load, timed steps (shell commands, health checks, proxy faults, mass disconnects), then reconciliation. `always` steps restore the system even after a failure or Ctrl+C. [`deploy/chaos/`](../deploy/chaos/) has scenarios for killing the gateway with `SIGKILL`, a 30-second ClickHouse outage, and a hostile network.
+- **End-to-end tests.** `internal/server` runs the real gateway with an in-memory store, restarts it under load, and runs a proxy fault scenario against it, reconciling both runs. No Docker is needed.
+
+See [Load, reconcile, and chaos tools](tooling.md).
+
 ### 30th October, 2026: Backlog-aware overload handling
 
 - **Events are refused before the WAL when work backs up.** A new `overload` stage runs before the WAL append and sends a `rejected` ACK, which producers already treat as retry-after-backoff. Its message names the backlog: `queue_backlogged` when the producer's queue reaches `overload.queue_high_water` (90%) of its capacity, `gateway_backlogged` when all queues together hold `overload.max_queued_events` (100,000) and the producer holds at least its weighted share, and `storage_backlogged` when the shipper trails the WAL by `overload.max_shipper_lag_bytes` (1 GiB). Previously an event for a full queue was appended to the WAL and then held without an ACK until space freed up, and the WAL grew without limit during a ClickHouse outage.

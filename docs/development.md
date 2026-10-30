@@ -8,17 +8,25 @@
 FairGate/
 ├── internal/
 │   ├── admit/       # Admission control
+│   ├── chaos/       # Fault-injecting proxy and chaos scenario runner
 │   ├── config/      # Config file, environment overrides, validation
+│   ├── loadgen/     # Simulated producers, run results, and the event manifest
 │   ├── observability/ # Prometheus metrics, collectors, pprof handler
 │   ├── overload/    # Backlog-aware overload control before the WAL append
+│   ├── reconcile/   # Checks a load manifest against stored events
 │   ├── sched/       # Producer queues and DRR scheduler
 │   ├── server/      # TCP listener, connection handling, shipper lifecycle
 │   ├── shipper/     # WAL reader loop, checkpoints, retry/backoff, reclamation trigger
 │   ├── store/       # Storage interface and ClickHouse adapter
 │   ├── wal/         # Segmented WAL, group commit, recovery, and reclamation
 │   └── wire/        # Frame codec, event and ACK types
+├── cmd/
+│   ├── gateway/     # The FairGate server
+│   ├── loadgen/     # Load generator
+│   ├── reconcile/   # Exactly-once reconciliation against ClickHouse
+│   └── chaos/       # Fault proxy and chaos scenario runner
 ├── docs/            # Detailed documentation
-├── deploy/          # Reference config, ClickHouse schema, Prometheus rules, Alertmanager, Grafana
+├── deploy/          # Reference config, ClickHouse schema, Prometheus rules, Alertmanager, Grafana, chaos scenarios
 ├── data/            # Local WAL data and checkpoint (runtime; do not commit)
 ├── Dockerfile
 ├── docker-compose.yml
@@ -63,7 +71,9 @@ CI runs `go test -race -v ./...` on every push through GitHub Actions.
 The graceful-shutdown tests use a no-op `Store` and a temporary checkpoint path, so the suite does not need a live ClickHouse service. The ClickHouse integration tests run only when `CLICKHOUSE_ADDR` is set:
 
 ```bash
-CLICKHOUSE_ADDR=127.0.0.1:9000 go test -race ./internal/store/ ./internal/shipper/
+CLICKHOUSE_ADDR=127.0.0.1:9000 go test -race ./internal/store/ ./internal/shipper/ ./internal/reconcile/
 ```
+
+The load generator, reconciliation, and chaos tools are tested without Docker; `internal/server` runs them end to end against the real gateway with an in-memory store. To run them against a live stack, see [Load, reconcile, and chaos tools](tooling.md).
 
 The repository is being developed as a gateway implementation. A stable command-line interface and client SDK are planned. Check the repository's current entry point and configuration before attempting to launch a server, or use the Compose stack described in [Docker deployment](deployment.md).
