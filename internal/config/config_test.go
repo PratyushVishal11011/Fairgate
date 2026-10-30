@@ -170,6 +170,8 @@ func TestValidateReportsEveryProblem(t *testing.T) {
 	clearEnv(t)
 
 	_, err := Load(writeConfig(t, `
+server:
+  drain_timeout: -1s
 admission:
   rate: 0
 queues:
@@ -187,6 +189,7 @@ log:
 	}
 
 	for _, want := range []string{
+		"server.drain_timeout",
 		"admission.rate",
 		"queues.capacity",
 		"shipper.retry.max_delay",

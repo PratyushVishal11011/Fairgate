@@ -400,3 +400,49 @@ func waitForCheckpoint(
 		}
 	}
 }
+
+// A shipper waiting at the durable WAL end ships a new record as soon as it is woken,
+// instead of at its next poll.
+func TestShipperWakeShipsWithoutWaitingForPoll(t *testing.T) {
+	dir := t.TempDir()
+	w, err := wal.Open(filepath.Join(dir, "events.wal"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+
+	storage := &fakeStore{}
+	shipper, err := New(storage, w, NewCheckpointStore(filepath.Join(dir, "checkpoint.json")), newTestBackoff(),
+		Config{BatchSize: 10, PollInterval: time.Hour})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- shipper.Run(ctx)
+	}()
+	defer func() {
+		cancel()
+		<-done
+	}()
+
+	//let the shipper reach the empty WAL end and start its hourly wait.
+	time.Sleep(50 * time.Millisecond)
+	if err := w.Append(testShipperEvent(1, "late")); err != nil {
+		t.Fatal(err)
+	}
+	shipper.Wake()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for storage.Calls() == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("woken shipper did not ship the new record")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	//Wake never blocks, even when a wake-up is already pending.
+	shipper.Wake()
+	shipper.Wake()
+}

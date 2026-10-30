@@ -192,6 +192,11 @@ func runContext(ctx context.Context, cfg config.Config, logger *slog.Logger, new
 	}
 	metrics.RegisterShipper(eventShipper, walLog)
 
+	//durable WAL bytes the shipper has not committed to the store yet.
+	shipperLag := func() (int64, error) {
+		return walLog.BytesAfter(eventShipper.Committed())
+	}
+
 	shipperCtx, stopShipper := context.WithCancel(context.Background())
 	cancelShipper = stopShipper
 
@@ -307,9 +312,7 @@ func runContext(ctx context.Context, cfg config.Config, logger *slog.Logger, new
 		DefaultWeight:      cfg.Fairness.DefaultWeight,
 		Weights:            cfg.Fairness.Weights(),
 		Logger:             logger,
-	}, queues, func() (int64, error) {
-		return walLog.BytesAfter(eventShipper.Committed())
-	})
+	}, queues, shipperLag)
 	if err != nil {
 		return err
 	}
@@ -472,11 +475,60 @@ func runContext(ctx context.Context, cfg config.Config, logger *slog.Logger, new
 		<-handlersDone
 	}
 
-	// All handlers have stopped. The scheduler can now exit.
-	cancelScheduler()
-	<-schedulerDone
+	// All handlers have stopped, so nothing new reaches the queues or the WAL.
+	report := drainPipeline(cfg.Server.DrainTimeout, queues, schedulerDone, cancelScheduler, eventShipper, shipperDone, shipperLag)
+	report.log(logger)
 
 	return runErr
+}
+
+// drainPipeline confirms the pipeline is empty before the scheduler and shipper stop.
+// It waits for the scheduler to empty every producer queue, stops the scheduler, then wakes the
+// shipper until its checkpoint reaches the durable WAL end. Both stages share one timeout.
+func drainPipeline(
+	timeout time.Duration,
+	queues *sched.Queues,
+	schedulerDone <-chan struct{},
+	cancelScheduler context.CancelFunc,
+	eventShipper interface{ Wake() },
+	shipperDone <-chan struct{},
+	shipperLag func() (int64, error),
+) drainReport {
+	start := time.Now()
+	deadline := start.Add(timeout)
+	unshipped := func() int64 {
+		lag, err := shipperLag()
+		if err != nil {
+			return -1
+		}
+		return lag
+	}
+
+	report := drainReport{
+		queue:            drainSkipped,
+		shipper:          drainSkipped,
+		queuedAtStart:    queues.Len(),
+		unshippedAtStart: unshipped(),
+	}
+
+	if timeout > 0 {
+		report.queue = waitDrained(deadline, schedulerDone, func() bool {
+			return queues.Len() == 0
+		})
+	}
+	cancelScheduler()
+	<-schedulerDone
+	report.queuedLeft = queues.Len()
+
+	if timeout > 0 {
+		report.shipper = waitDrained(deadline, shipperDone, func() bool {
+			eventShipper.Wake()
+			return unshipped() == 0
+		})
+	}
+	report.unshippedLeft = unshipped()
+	report.elapsed = time.Since(start)
+	return report
 }
 
 func handleConn(

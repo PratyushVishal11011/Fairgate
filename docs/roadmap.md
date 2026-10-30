@@ -50,5 +50,5 @@ A solid border marks implemented work. Dashed borders mark planned work.
 | Backlog-aware overload handling | Implemented |
 | Profiling, pipeline metrics, alerting | Implemented |
 | Packaged load generator, reconciliation, chaos tooling | Implemented |
-| Explicit queue-drain confirmation on shutdown | Planned |
+| Explicit queue-drain confirmation on shutdown | Implemented |
 | Protocol hardening (malformed and oversized frame handling) | Planned |
