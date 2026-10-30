@@ -1,0 +1,37 @@
+# Kill the gateway with SIGKILL mid-load, restart it, and check that every accepted event
+# reaches ClickHouse exactly once. Exercises WAL durability, recovery, deduplication of
+# producer retries after the restart, and shipper checkpoint replay.
+# Assumes the Compose stack from docker-compose.yml is running.
+name: gateway-crash
+load:
+  addr: 127.0.0.1:9001
+  producers: 50
+  events: 1000
+  rate: 50
+  window: 4
+  ramp: 2s
+  drain_timeout: 90s
+steps:
+  - name: kill gateway
+    at: 8s
+    exec: docker kill --signal KILL fairgate-server
+  - name: restart gateway
+    at: 10s
+    exec: docker start fairgate-server
+    always: true
+  - name: gateway healthy
+    at: 10s
+    wait_healthy: http://127.0.0.1:9100/health
+    timeout: 90s
+  - name: kill gateway again
+    at: 14s
+    exec: docker kill --signal KILL fairgate-server
+  - name: restart gateway again
+    at: 15s
+    exec: docker start fairgate-server
+    always: true
+reconcile:
+  timeout: 3m
+  verify_content: true
+expect:
+  min_accepted_ratio: 1.0
