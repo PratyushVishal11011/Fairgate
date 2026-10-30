@@ -15,6 +15,7 @@ FairGate accepts framed event streams over TCP and keeps producers isolated from
 - **Safe producer retries.** Each event has a stable identity. An identical retry is acknowledged without being stored twice, and reuse of an identity with different content is rejected. [More](docs/event-model.md)
 - **Exactly-once delivery to ClickHouse.** Each event identity is stored once, through crashes, replays, and lost checkpoints. [More](docs/delivery-semantics.md)
 - **One config file.** Optional YAML config with strict validation. Environment variables override it for secrets. [More](docs/configuration.md)
+- **Load, reconcile, and chaos tools.** `loadgen` drives the gateway with simulated producers, `reconcile` checks that every accepted event reached ClickHouse exactly once, and `chaos` injects network faults and runs crash and outage scenarios. [More](docs/tooling.md)
 - **Observable.** Prometheus metrics for every pipeline stage, ready-made alert rules with Alertmanager, a provisioned Grafana dashboard, and optional `pprof` profiling. [More](docs/observability.md)
 
 ## Quick start
@@ -45,6 +46,19 @@ go test -race ./...
 ```
 
 The ClickHouse integration tests run only when `CLICKHOUSE_ADDR` is set. See [Development](docs/development.md).
+
+To load the running stack and check that every accepted event was stored exactly once:
+
+```bash
+go run ./cmd/loadgen -producers 100 -events 1000 -rate 100 -out benchmarks/run1
+go run ./cmd/reconcile -manifest benchmarks/run1/manifest.json
+```
+
+To kill the gateway mid-load and check the same thing, run a chaos scenario. See [Load, reconcile, and chaos tools](docs/tooling.md).
+
+```bash
+go run ./cmd/chaos run deploy/chaos/gateway-crash.yaml
+```
 
 ## Configuration
 
@@ -82,6 +96,7 @@ See [Configuration](docs/configuration.md) for all settings and environment over
 | [Delivery semantics](docs/delivery-semantics.md) | ACK meaning and the exactly-once guarantee. |
 | [Event model and identity](docs/event-model.md) | Event fields, identity, idempotent retries. |
 | [Wire protocol](docs/wire-protocol.md) | Frame format and acknowledgments. |
+| [Load, reconcile, and chaos tools](docs/tooling.md) | Load generator, exactly-once reconciliation, fault proxy, chaos scenarios. |
 | [Architecture](docs/architecture.md) | Design goals, components, event lifecycle. |
 | [Write-Ahead Log](docs/wal.md) | Segments, group commit, reclamation, recovery. |
 | [Storage integration](docs/storage.md) | Shipper, batch identity, ClickHouse schema. |

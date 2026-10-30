@@ -29,6 +29,11 @@ Known limitations of the current beta:
 - Shutdown has no explicit queue-drain confirmation, and a handler stuck in an operation that ignores connection closure and context cancellation can delay it beyond the grace period.
 - The Compose file ships with development credentials and publishes the FairGate, ClickHouse, Prometheus, Alertmanager, and Grafana ports; restrict inbound access to trusted addresses as described in [Docker deployment](deployment.md) and replace the credentials before any non-development use.
 - The Apple Container launcher script is not tracked in the repository, so the macOS instructions do not work from a clean checkout.
+- `reconcile` counts rows without `FINAL`. A background merge of the `ReplacingMergeTree` can collapse duplicate rows of one identity, so a duplicate merged away before reconciliation is not detected.
+- `reconcile` scans the whole events table for the run's epoch and producers (the table is ordered by `event_id`), so it slows down as the table grows.
+- `loadgen` always sends `idx` 0, and a count-bound run without `-duration` keeps redialling a gateway that never comes up until it is stopped.
+- The fault proxy delays, fragments, and resets per chunk read from a socket, not per frame or per TCP segment, and it cannot drop or reorder bytes within a connection.
+- Chaos scenario `exec` steps run shell commands with the caller's permissions, and the shipped scenarios assume the container names from `docker-compose.yml`.
 - Per-producer metrics label only the producers listed in `fairness.producers`; all other producers share the `other` series.
 - Alertmanager sends no notifications until a receiver is configured, and the alert thresholds are generic starting points.
 - There is no metric for time spent waiting in the scheduler queue, or for events the ClickHouse adapter skipped as already stored.
