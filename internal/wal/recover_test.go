@@ -2,6 +2,7 @@ package wal
 
 import (
 	"encoding/binary"
+	"errors"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -211,7 +212,9 @@ func TestRecoverIncompletePayload(t *testing.T) {
 	}
 }
 
-func TestRecoverChecksumMismatch(t *testing.T) {
+// A legacy record with a bad checksum at the end of the newest segment is an unfinished write:
+// it was never acknowledged, so recovery cuts it off.
+func TestRecoverTruncatesChecksumMismatchAtTail(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "bad_checksum.wal")
 
 	payload := []byte("{}")
@@ -226,8 +229,37 @@ func TestRecoverChecksumMismatch(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	_, err := Recover(path)
-	if err == nil {
-		t.Fatal("expected checksum mismatch error, got nil")
+	events, err := Recover(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 0 {
+		t.Fatalf("expected no events, got %d", len(events))
+	}
+	if info, err := os.Stat(path); err != nil || info.Size() != 0 {
+		t.Fatalf("expected the torn record to be truncated, got %v, %v", info.Size(), err)
+	}
+}
+
+// A legacy record with a bad checksum followed by more data is not an unfinished write; legacy
+// records cannot be resynchronized, so recovery refuses rather than drop what follows.
+func TestRecoverRefusesChecksumMismatchBeforeMoreRecords(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "bad_checksum.wal")
+
+	payload := []byte("{}")
+
+	var header [8]byte
+	binary.BigEndian.PutUint32(header[0:4], uint32(len(payload)))
+	binary.BigEndian.PutUint32(header[4:8], 12345)
+
+	data := append(header[:], payload...)
+	data = append(data, data...)
+
+	if err := os.WriteFile(path, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := Recover(path); !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("expected ErrCorrupt, got %v", err)
 	}
 }

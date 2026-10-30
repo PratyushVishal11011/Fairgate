@@ -164,8 +164,9 @@ func TestReaderDetectsChecksumMismatch(t *testing.T) {
 		t.Fatal("WAL record is too short")
 	}
 
-	checksum := binary.BigEndian.Uint32(data[4:8])
-	binary.BigEndian.PutUint32(data[4:8], checksum+1)
+	//v2 record header: magic (0:4), length (4:8), checksum (8:12).
+	checksum := binary.BigEndian.Uint32(data[8:12])
+	binary.BigEndian.PutUint32(data[8:12], checksum+1)
 
 	if err := os.WriteFile(path, data, 0600); err != nil {
 		t.Fatal(err)

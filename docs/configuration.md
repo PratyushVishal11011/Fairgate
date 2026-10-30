@@ -47,6 +47,8 @@ Unknown keys are rejected, so a misspelled setting stops startup instead of bein
 | `overload.sample_interval` | `100ms` | How often the total queued events and the shipper lag are sampled. |
 | `wal.path` | `data/fairgate.wal` | Path of the first WAL segment. Later segments are created next to it. |
 | `wal.segment_size` | `67108864` (64 MiB) | Segment size in bytes before the writer rotates. Reclamation deletes whole segments, so smaller segments free disk space sooner. |
+| `wal.on_corruption` | `refuse` | What startup does with damaged WAL records the shipper has not delivered yet: `refuse` stops startup, `quarantine` copies the segment to `quarantine/`, cuts it at the damage, and starts. A torn final record, or damage to records already shipped, is handled automatically either way. See [Recovery](wal.md#recovery). |
+| `wal.degraded_exit_after` | `1m` | If a WAL write or sync fails and moving to a fresh segment fails too, events are refused as `rejected` / `storage_unavailable` and `/ready` reports not ready. After this long the gateway exits with status `3` so a supervisor can restart it. `0` never exits. See [Write and sync failures](wal.md#write-and-sync-failures). |
 | `shipper.checkpoint_path` | `data/checkpoint.json` | Checkpoint file. Keep it on the same persistent volume as the WAL. |
 | `shipper.batch_size` | `200` | Maximum events per ClickHouse insert. |
 | `shipper.poll_interval` | `1s` | How often the shipper checks for new durable WAL records once it has caught up. |

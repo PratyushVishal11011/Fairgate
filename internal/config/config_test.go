@@ -180,6 +180,9 @@ admission:
   rate: 0
 queues:
   capacity: -1
+wal:
+  on_corruption: ignore
+  degraded_exit_after: -1s
 shipper:
   retry:
     initial_delay: 10s
@@ -200,6 +203,8 @@ log:
 		"server.write_timeout",
 		"admission.rate",
 		"queues.capacity",
+		"wal.on_corruption",
+		"wal.degraded_exit_after",
 		"shipper.retry.max_delay",
 		"shipper.retry.jitter",
 		"log.level",
