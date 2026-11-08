@@ -151,35 +151,53 @@ func withoutExisting(rows []row, existing map[string]struct{}) []row {
 	return remaining
 }
 
+// existenceQueryIDs caps the event IDs sent in one existence query. The client writes bound values
+// into the query text, and each 64-character ID costs about 67 bytes there, so 1000 IDs keep a query
+// near 67 KB, well under ClickHouse's default max_query_size of 256 KiB (about 3900 IDs).
+const existenceQueryIDs = 1000
+
 func (s *ClickHouseStore) existingEventIDs(ctx context.Context, rows []row) (map[string]struct{}, error) {
-	ids := make([]string, len(rows))
-	for i, row := range rows {
-		ids[i] = row.id
+	existing := make(map[string]struct{})
+
+	for start := 0; start < len(rows); start += existenceQueryIDs {
+		end := min(start+existenceQueryIDs, len(rows))
+		ids := make([]string, 0, end-start)
+		for _, row := range rows[start:end] {
+			ids = append(ids, row.id)
+		}
+
+		if err := s.collectExisting(ctx, ids, existing); err != nil {
+			return nil, err
+		}
 	}
 
+	return existing, nil
+}
+
+// collectExisting adds every id that is already stored to existing.
+func (s *ClickHouseStore) collectExisting(ctx context.Context, ids []string, existing map[string]struct{}) error {
 	result, err := s.conn.Query(ctx,
 		`SELECT DISTINCT event_id FROM fairgate.events
 		WHERE event_id IN (SELECT arrayJoin(?))`,
 		ids,
 	)
 	if err != nil {
-		return nil, fmt.Errorf("query existing events: %w", err)
+		return fmt.Errorf("query existing events: %w", err)
 	}
 	defer result.Close()
 
-	existing := make(map[string]struct{})
 	for result.Next() {
 		var id string
 		if err := result.Scan(&id); err != nil {
-			return nil, fmt.Errorf("scan existing event: %w", err)
+			return fmt.Errorf("scan existing event: %w", err)
 		}
 		existing[id] = struct{}{}
 	}
 	if err := result.Err(); err != nil {
-		return nil, fmt.Errorf("read existing events: %w", err)
+		return fmt.Errorf("read existing events: %w", err)
 	}
 
-	return existing, nil
+	return nil
 }
 
 // insertToken binds the batch token to the exact rows being inserted.

@@ -228,6 +228,7 @@ func runContext(ctx context.Context, cfg config.Config, logger *slog.Logger, new
 			BatchSize:    cfg.Shipper.BatchSize,
 			PollInterval: cfg.Shipper.PollInterval,
 			Observer:     metrics,
+			Logger:       logger,
 		},
 	)
 	if err != nil {
