@@ -260,3 +260,62 @@ func TestClickHouseInsertBatchSkipsStoredEventsIntegration(t *testing.T) {
 		}
 	}
 }
+
+// TestClickHouseInsertBatchLargeBatchIntegration covers batches whose existence check spans several
+// queries. One query for all 5000 IDs would exceed ClickHouse's default max_query_size. A replay
+// under a new token overlaps stored events across query boundaries; each event must be stored once.
+func TestClickHouseInsertBatchLargeBatchIntegration(t *testing.T) {
+	addr, database, username, password := integrationConfig(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	ch, err := NewClickHouseStore([]string{addr}, database, username, password)
+	if err != nil {
+		t.Fatalf("connect to ClickHouse: %v", err)
+	}
+	defer ch.Close()
+
+	now := time.Now().UnixNano()
+	producerID := fmt.Sprintf("large-batch-test-%d", now)
+	eventTime := time.Now().UTC().Truncate(time.Millisecond)
+
+	batch := func(from, to uint64) []wire.Event {
+		events := make([]wire.Event, 0, to-from+1)
+		for seq := from; seq <= to; seq++ {
+			events = append(events, wire.Event{
+				ProducerId:    producerID,
+				ProducerEpoch: "epoch-1",
+				EventTime:     eventTime,
+				Seq:           seq,
+				EventType:     "integration_test",
+				Payload:       fmt.Sprintf("event-%d", seq),
+			})
+		}
+		return events
+	}
+
+	if err := ch.InsertBatch(ctx, batch(1, 5000), "large-a"); err != nil {
+		t.Fatalf("InsertBatch of 5000 events failed: %v", err)
+	}
+	// 2500-5000 are stored, 5001-7500 are new.
+	if err := ch.InsertBatch(ctx, batch(2500, 7500), "large-b"); err != nil {
+		t.Fatalf("overlapping InsertBatch failed: %v", err)
+	}
+
+	var count, distinct uint64
+	err = ch.conn.QueryRow(
+		ctx,
+		fmt.Sprintf(
+			`SELECT count(), uniqExact(seq) FROM %s.events WHERE producer_id = ?`,
+			quoteIdentifier(database),
+		),
+		producerID,
+	).Scan(&count, &distinct)
+	if err != nil {
+		t.Fatalf("count events: %v", err)
+	}
+	if count != 7500 || distinct != 7500 {
+		t.Errorf("expected 7500 events stored once each, got %d rows for %d distinct seqs", count, distinct)
+	}
+}

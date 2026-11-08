@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"sync"
 	"time"
 )
@@ -26,6 +27,8 @@ type Config struct {
 	PollInterval time.Duration
 	//Observer receives instrumentation events; nil disables them.
 	Observer Observer
+	//Logger records failed insert attempts with their error; nil discards them.
+	Logger *slog.Logger
 }
 
 // Observer receives shipper events for instrumentation. Methods run on the shipper goroutine and must be cheap.
@@ -55,6 +58,7 @@ type Shipper struct {
 	checkpoint *CheckpointStore
 	backoff    *Backoff
 	observer   Observer
+	logger     *slog.Logger
 
 	//last committed position, read by metrics while Run advances it.
 	committedMu sync.Mutex
@@ -116,6 +120,10 @@ func New(
 	if observer == nil {
 		observer = noopObserver{}
 	}
+	logger := config.Logger
+	if logger == nil {
+		logger = slog.New(slog.DiscardHandler)
+	}
 
 	return &Shipper{
 		store:      storage,
@@ -124,6 +132,7 @@ func New(
 		backoff:    backoff,
 		config:     config,
 		observer:   observer,
+		logger:     logger,
 		wake:       make(chan struct{}, 1),
 	}, nil
 }
@@ -153,8 +162,6 @@ func (s *Shipper) Run(ctx context.Context) error {
 	start := checkpointPosition(checkpoint)
 	s.setCommitted(start)
 	reader := wal.NewReader(s.wal, start)
-	poll := time.NewTicker(s.config.PollInterval)
-	defer poll.Stop()
 
 	//a pending batch may already be in the store, possibly only partially.
 	//replay exactly that WAL range first so the store sees the same rows under the same token.
@@ -176,31 +183,125 @@ func (s *Shipper) Run(ctx context.Context) error {
 		start = end
 	}
 
+	//the next batch is read and decoded while the current one is being inserted. Inserts stay one at a
+	//time: the existence check before each insert must see every row of the batch before it.
+	readCtx, stopReading := context.WithCancel(ctx)
+	batches := make(chan readResult, 1)
+	var reading sync.WaitGroup
+	reading.Add(1)
+	go func() {
+		defer reading.Done()
+		s.readAhead(readCtx, reader, batches)
+	}()
+	//deferred, so it also runs while a panic unwinds: the reader is never used after Run ends.
+	defer func() {
+		stopReading()
+		reading.Wait()
+	}()
+
+	//next is a batch already read whose range is already recorded as pending.
+	var next *readResult
 	for {
-		batch, end, err := s.readBatch(ctx, reader)
-		if err != nil {
-			if !errors.Is(err, io.EOF) {
-				return err
-			}
-			//readBatch returns io.EOF only when it has no records to return.
-			//keep the same reader so it can observe later durable appends.
+		batch := next
+		next = nil
+		recorded := batch != nil
+		if batch == nil {
 			select {
 			case <-ctx.Done():
 				return ctx.Err()
-			case <-poll.C:
-				continue
-			case <-s.wake:
-				continue
+			case result := <-batches:
+				batch = &result
+			}
+		}
+		if batch.err != nil {
+			return batch.err
+		}
+		end := batch.end
+
+		if !recorded {
+			if err := s.checkpoint.Commit(pendingCheckpoint(start, end)); err != nil {
+				return err
 			}
 		}
 
-		if err := s.shipBatch(ctx, batch, start, end); err != nil {
+		if err := s.writeBatch(ctx, batch.events, start, end); err != nil {
+			return err
+		}
+
+		//when the following batch is already read, one commit records this batch as shipped and that
+		//one as pending, so a restart replays exactly its range under the same token.
+		commit := positionCheckpoint(end)
+		select {
+		case result := <-batches:
+			if result.err == nil {
+				commit = pendingCheckpoint(end, result.end)
+			}
+			next = &result
+		default:
+		}
+
+		if err := s.checkpoint.Commit(commit); err != nil {
+			return err
+		}
+		s.setCommitted(end)
+		s.observer.CheckpointCommitted(end)
+		if err := s.wal.ReclaimBefore(end); err != nil {
 			return err
 		}
 
 		//the next batch starts where this one ended, so its token is derived from its own range.
 		start = end
 	}
+}
+
+// readResult is one batch read ahead of the insert in flight, or the error that stopped reading.
+type readResult struct {
+	events []wire.Event
+	end    wal.Position
+	err    error
+}
+
+// readAhead owns reader: it reads batches and sends them to out until ctx ends or a read fails.
+// At the durable WAL end it waits for the poll interval or a Wake, keeping the same reader so it
+// observes later durable appends.
+func (s *Shipper) readAhead(ctx context.Context, reader *wal.Reader, out chan<- readResult) {
+	poll := time.NewTicker(s.config.PollInterval)
+	defer poll.Stop()
+
+	for {
+		events, end, err := s.readBatch(ctx, reader)
+		if errors.Is(err, io.EOF) {
+			select {
+			case <-ctx.Done():
+				return
+			case <-poll.C:
+			case <-s.wake:
+			}
+			continue
+		}
+		if err != nil && ctx.Err() != nil {
+			return
+		}
+
+		select {
+		case out <- readResult{events: events, end: end, err: err}:
+		case <-ctx.Done():
+			return
+		}
+		if err != nil {
+			return
+		}
+	}
+}
+
+// pendingCheckpoint commits start as shipped and records the batch ending at end as possibly in the store.
+func pendingCheckpoint(start, end wal.Position) Checkpoint {
+	checkpoint := positionCheckpoint(start)
+	checkpoint.Pending = &PendingBatch{
+		Segment: end.SegmentId,
+		Offset:  end.Offset,
+	}
+	return checkpoint
 }
 
 // shipBatch records the batch as pending, inserts it, then commits its end position.
@@ -210,13 +311,7 @@ func (s *Shipper) shipBatch(
 	start wal.Position,
 	end wal.Position,
 ) error {
-	intent := positionCheckpoint(start)
-	intent.Pending = &PendingBatch{
-		Segment: end.SegmentId,
-		Offset:  end.Offset,
-	}
-
-	if err := s.checkpoint.Commit(intent); err != nil {
+	if err := s.checkpoint.Commit(pendingCheckpoint(start, end)); err != nil {
 		return err
 	}
 
@@ -338,6 +433,9 @@ func (s *Shipper) writeBatch(
 			return ctx.Err()
 		}
 
+		//the metric only counts failures; without the error a stuck shipper gives no hint why.
+		s.logger.Warn("WAL shipper insert failed; retrying after backoff",
+			"attempt", attempt+1, "events", len(batch), "error", err)
 		s.observer.InsertFailed(attempt + 1)
 
 		if err := s.backoff.Wait(ctx, attempt); err != nil {

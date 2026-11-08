@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -445,4 +446,77 @@ func TestShipperWakeShipsWithoutWaitingForPoll(t *testing.T) {
 	//Wake never blocks, even when a wake-up is already pending.
 	shipper.Wake()
 	shipper.Wake()
+}
+
+// TestShipperReadAheadShipsEveryRangeOnce appends while the shipper runs, so batches are read ahead of
+// the insert in flight and shipped and pending ranges are often committed together. Every event must
+// reach the store once, in WAL order, under a token derived from exactly its batch's range.
+func TestShipperReadAheadShipsEveryRangeOnce(t *testing.T) {
+	dir := t.TempDir()
+	w, err := wal.Open(filepath.Join(dir, "events.wal"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+
+	const total = 200
+	for seq := uint64(1); seq <= 50; seq++ {
+		if err := w.Append(testShipperEvent(seq, strconv.FormatUint(seq, 10))); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	checkpointStore := NewCheckpointStore(filepath.Join(dir, "checkpoint.json"))
+	storage := &fakeStore{}
+	s, err := New(storage, w, checkpointStore, newTestBackoff(), Config{
+		BatchSize: 7, PollInterval: 2 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- s.Run(ctx) }()
+
+	for seq := uint64(51); seq <= total; seq++ {
+		if err := w.Append(testShipperEvent(seq, strconv.FormatUint(seq, 10))); err != nil {
+			t.Fatal(err)
+		}
+		if seq%25 == 0 {
+			time.Sleep(time.Millisecond)
+		}
+	}
+
+	records := walPositions(t, w)
+	if len(records) != total {
+		t.Fatalf("expected %d WAL records, got %d", total, len(records))
+	}
+	waitForCommittedEnd(t, checkpointStore, records[total-1].End)
+	cancel()
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected context.Canceled, got %v", err)
+	}
+
+	batches, tokens := storage.Batches(), storage.Tokens()
+	next := 0
+	for i, batch := range batches {
+		if len(batch) == 0 || next+len(batch) > total {
+			t.Fatalf("batch %d has %d events after %d of %d were shipped", i, len(batch), next, total)
+		}
+		for j, event := range batch {
+			if want := strconv.Itoa(next + j + 1); event.Payload != want {
+				t.Fatalf("batch %d event %d: got payload %q, want %q", i, j, event.Payload, want)
+			}
+		}
+		first, last := records[next], records[next+len(batch)-1]
+		if want := batchToken(first.Start, last.End); tokens[i] != want {
+			t.Fatalf("batch %d token is not derived from its own range", i)
+		}
+		next += len(batch)
+	}
+	if next != total {
+		t.Fatalf("shipped %d events, want %d", next, total)
+	}
 }
