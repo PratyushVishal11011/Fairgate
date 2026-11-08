@@ -69,7 +69,7 @@ The server's goroutine and context structure, including the shutdown path, is de
 
 ### WAL shipping component
 
-The shipper is always enabled and does not depend on `FAIRGATE_SHIPPER_ENABLED`. It reads durable WAL records from its checkpoint, records each batch as pending, inserts it through the `Store` interface, and commits the checkpoint only after insertion succeeds. It then calls `WAL.ReclaimBefore` with the committed position, which deletes segments older than the checkpoint segment. At the WAL end it polls for new durable records.
+The shipper is always enabled and does not depend on `FAIRGATE_SHIPPER_ENABLED`. It reads durable WAL records from its checkpoint, records each batch as pending, inserts it through the `Store` interface, and commits the checkpoint only after insertion succeeds. The next batch is read and decoded while the current one is inserted; inserts themselves stay one at a time. When the next batch is already read, a single checkpoint commit records the current batch as shipped and the next as pending. It then calls `WAL.ReclaimBefore` with the committed position, which deletes segments older than the checkpoint segment. At the WAL end it polls for new durable records.
 
 ```mermaid
 flowchart LR

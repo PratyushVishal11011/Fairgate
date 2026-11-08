@@ -224,7 +224,7 @@ func Default() Config {
 		},
 		Shipper: Shipper{
 			CheckpointPath: "data/checkpoint.json",
-			BatchSize:      200,
+			BatchSize:      5000,
 			PollInterval:   time.Second,
 			Retry: Retry{
 				InitialDelay: time.Second,

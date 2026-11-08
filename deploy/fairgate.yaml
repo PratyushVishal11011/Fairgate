@@ -108,8 +108,10 @@ wal:
 shipper:
   # Where the shipper keeps its delivery position. Keep it on the same persistent volume as the WAL.
   checkpoint_path: data/checkpoint.json
-  # Maximum events per ClickHouse insert.
-  batch_size: 200
+  # Maximum events per ClickHouse insert. Every batch pays two checkpoint commits (each a file and a
+  # directory fsync), an existence query and a synchronous insert, so small batches cap delivery;
+  # ClickHouse also prefers fewer, larger inserts. A caught-up shipper still ships whatever is available.
+  batch_size: 5000
   # How often the shipper checks for new durable WAL records once it has caught up.
   poll_interval: 1s
   # Failed inserts are retried until they succeed, with capped exponential backoff.
